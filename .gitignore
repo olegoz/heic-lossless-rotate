@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Ignore test files that should not be committed
+heic_rotate_tests/testdata/
+heic_rotate_tests/rotated/
