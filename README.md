@@ -3,11 +3,110 @@
 Repository: https://github.com/olegoz/heic-lossless-rotate
 
 A standalone Python 3 script (`heic_rotate.py`) that **losslessly rotates
-HEIC/HEIF images** by editing container metadata only — never touching the
-encoded image data — and is **fully reversible** back to the exact original
-file, byte for byte.
+HEIC/HEIF images** — the photo format used by default on recent iPhones and
+many Android phones — without re-encoding or losing any quality, and is
+**fully reversible** back to the exact original file, byte for byte.
 
 No third-party dependencies. Python 3 standard library only.
+
+## What it does
+
+- **Rotates HEIC/HEIF photos losslessly.** The actual image data is never
+  touched or re-compressed — only a small "which way is up" tag inside the
+  file is changed, so there's zero quality loss, no matter how many times
+  you rotate.
+- **Fully reversible.** `heic_rotate.py reverse` restores a file to be
+  byte-for-byte identical to the original, even after multiple rotations,
+  with a built-in checksum safety check before it ever writes anything.
+
+## Requirements
+
+- Python 3 (standard library only — no `pip install` needed)
+
+## Installation
+
+Just download the script — there's nothing to build or install.
+
+```bash
+curl -O https://raw.githubusercontent.com/olegoz/heic-lossless-rotate/main/heic_rotate.py
+chmod +x heic_rotate.py
+```
+
+## Usage
+
+```
+heic_rotate.py rotate <0|90|180|270> <input.heic> [output.heic] [-f]
+heic_rotate.py reverse <input.heic> [output.heic] [-f]
+heic_rotate.py info <input.heic>
+heic_rotate.py -V | --version
+```
+
+(See [Options](#options) below for the full list of flags, including a
+couple of less-common ones not shown here.)
+
+The `rotate` subcommand name may be omitted: if the first non-option
+argument is exactly `0`, `90`, `180`, or `270`, `rotate` is assumed.
+
+```bash
+python3 heic_rotate.py 90 photo.heic photo_rotated.heic
+# equivalent to:
+python3 heic_rotate.py rotate 90 photo.heic photo_rotated.heic
+```
+
+If no output path is given, `rotate` writes to `<input>_rotated.heic` and
+`reverse` writes to `<input>_restored.heic`. By default, both refuse to
+overwrite an existing output file — pass `-f`/`--force` to allow it.
+
+Run with no arguments, or with `-h`, for full help; `-h` also works on each
+subcommand (`heic_rotate.py rotate -h`, etc.) for its specific options.
+
+**Rotation direction:** positive angles rotate **counter-clockwise** —
+`rotate 90` turns the image 90° counter-clockwise. Use `rotate 270` for a
+90° **clockwise** turn. `rotate <angle>` also adds on top of whatever
+rotation the file already has, rather than setting an absolute angle —
+rotating 90° twice lands at 180°, not back at 90°, mirroring how you'd
+physically turn a printed photo in your hands.
+
+### Examples
+
+```bash
+# Rotate 90° counter-clockwise, writing to a new file
+python3 heic_rotate.py rotate 90 IMG_0001.heic IMG_0001_rotated.heic
+
+# Same thing, using the implicit-rotate shorthand
+python3 heic_rotate.py 90 IMG_0001.heic IMG_0001_rotated.heic
+
+# Rotate 90° clockwise instead (270° counter-clockwise == 90° clockwise)
+python3 heic_rotate.py 270 IMG_0001.heic IMG_0001_rotated.heic
+
+# Preview what would happen without writing anything
+python3 heic_rotate.py --dry-run 180 IMG_0001.heic
+
+# Check whether/how heic_rotate.py has previously touched a file
+python3 heic_rotate.py info IMG_0001_rotated.heic
+
+# Undo every heic_rotate.py edit, restoring the exact original bytes
+python3 heic_rotate.py reverse IMG_0001_rotated.heic IMG_0001_original.heic
+
+# Overwrite an existing output file
+python3 heic_rotate.py 90 IMG_0001.heic IMG_0001_rotated.heic --force
+```
+
+## Disclaimer
+
+This tool edits container metadata directly rather than going through a
+HEIC/HEIF library, and while it includes CRC-verified reversibility and a
+regression test suite, you should keep a backup of anything irreplaceable
+before rotating it. Always specify a distinct output file (the default)
+rather than editing in place, at least until you've verified the result
+displays correctly in your own image viewer(s).
+
+---
+
+The sections below go into the technical details — how the tool works
+internally, its full flag/exit-code reference, and its known limitations.
+None of this is necessary to just use the tool; skip ahead if you're not
+interested.
 
 ## Why this exists
 
@@ -38,100 +137,50 @@ that instead.
 actual compressed image data) is never read or rewritten, so every edit is
 guaranteed lossless with respect to image content.
 
-## Key features
+## How each command works
 
-- **Counter-clockwise rotation.** Positive angles rotate the image
-  **counter-clockwise**, per the HEIF `irot` box's own definition of its
-  angle field. `rotate 90` turns the image 90° counter-clockwise; use
-  `rotate 270` for a 90° **clockwise** turn.
-- **Relative rotation.** `rotate <angle>` adds `<angle>` on top of whatever
-  rotation the file already has — it does not set an absolute target angle.
-  Rotating 90° twice lands at 180°, not back at 90°, mirroring how you'd
-  physically turn a printed photo in your hands. `rotate 0` is a genuine
-  no-op for the displayed image, useful for adding tracking metadata to a
-  file or making an implicit 0° orientation explicit.
-- **Fully reversible.** Every edit stores a compact provenance record in a
-  private top-level `uuid` box (the standard ISOBMFF mechanism for
-  vendor-private data, silently skipped by compliant readers). This
-  captures the pristine pre-edit bytes needed to reconstruct the original
-  exactly, plus CRC32 checksums used to detect if the file was modified by
-  something else since the last edit. `reverse` restores from this record
-  and does a final CRC self-check before ever writing output — it refuses
-  to write rather than risk producing a silently-wrong file.
-- **Chainable edits.** Rotating an already-edited file updates only the
-  live value and the "current file" checksum; the original pristine
-  snapshot is never overwritten. `reverse` always undoes *all* edits back
-  to the true original, no matter how many times you've rotated it since.
-- **Informational `info` command.** Cheap, read-only reporting of what
-  `heic_rotate.py` has done to a file — the cumulative rotation *this
-  tool* has added, distinct from the file's absolute current orientation
-  (which may include rotation the file already had before you ever ran
-  this script on it).
+### `rotate`
 
-## Requirements
+Applying a rotation stores a compact provenance record in a private
+top-level `uuid` box (the standard ISOBMFF mechanism for vendor-private
+data, silently skipped by compliant readers). This record holds only the
+small handful of container-metadata bytes the edit actually touches (the
+`iprp`/`iloc` boxes, the `meta` box's size field, and the legacy Exif
+orientation byte if present) — not a copy of the image data itself, which
+is never touched — plus CRC32 checksums used to detect if the file is
+modified by something else afterward.
 
-- Python 3 (standard library only — no `pip install` needed)
+Rotating an already-edited file updates only the live rotation value and
+the "current file" checksum; the original pristine snapshot captured on
+the very first edit is never overwritten, so `reverse` can always undo
+every edit made since, no matter how many times you've rotated the file.
 
-## Installation
+### `reverse`
 
-Just download the script — there's nothing to build or install.
+`reverse` restores a file from its provenance record, undoing *all*
+`heic_rotate.py` edits at once and returning the file to be byte-for-byte
+identical to the true original. It does a final CRC self-check before
+ever writing output — it refuses to write rather than risk producing a
+silently-wrong file.
 
-```bash
-curl -O https://raw.githubusercontent.com/olegoz/heic-lossless-rotate/main/heic_rotate.py
-chmod +x heic_rotate.py
-```
+### `info`
 
-## Usage
+`info` is cheap and read-only: it reports the cumulative rotation *this
+tool* has added to a file, distinct from the file's absolute current
+orientation (which may include rotation the file already had before you
+ever ran this script on it).
 
-```
-heic_rotate.py rotate <0|90|180|270> <input.heic> [output.heic] [-f]
-heic_rotate.py reverse <input.heic> [output.heic] [-f] [--ignore-tamper-check]
-heic_rotate.py info <input.heic>
-heic_rotate.py -V | --version
-```
+## How rotation values map to the container format
 
-The `rotate` subcommand name may be omitted: if the first non-option
-argument is exactly `0`, `90`, `180`, or `270`, `rotate` is assumed.
+The rotation angle is interpreted exactly like ExifTool's
+`-n -QuickTime:Rotation=<val>`: the raw quarter-turn value × 90, written
+directly into the ISOBMFF `irot` box's 2-bit angle field, per
+[ISO/IEC 23008-12](https://www.iso.org/standard/83650.html) (HEIF). Per
+that spec, the angle is **counter-clockwise**: `rotate 90` turns the image
+90° counter-clockwise, and `rotate 270` turns it 90° clockwise (270°
+counter-clockwise is the same as 90° clockwise).
 
-```bash
-python3 heic_rotate.py 90 photo.heic photo_rotated.heic
-# equivalent to:
-python3 heic_rotate.py rotate 90 photo.heic photo_rotated.heic
-```
-
-If no output path is given, `rotate` writes to `<input>_rotated.heic` and
-`reverse` writes to `<input>_restored.heic`. By default, both refuse to
-overwrite an existing output file — pass `-f`/`--force` to allow it.
-
-Run with no arguments, or with `-h`, for full help; `-h` also works on each
-subcommand (`heic_rotate.py rotate -h`, etc.) for its specific options.
-
-### Examples
-
-```bash
-# Rotate 90° counter-clockwise, writing to a new file
-python3 heic_rotate.py rotate 90 IMG_0001.heic IMG_0001_rotated.heic
-
-# Same thing, using the implicit-rotate shorthand
-python3 heic_rotate.py 90 IMG_0001.heic IMG_0001_rotated.heic
-
-# Rotate 90° clockwise instead (270° counter-clockwise == 90° clockwise)
-python3 heic_rotate.py 270 IMG_0001.heic IMG_0001_rotated.heic
-
-# Preview what would happen without writing anything
-python3 heic_rotate.py --dry-run 180 IMG_0001.heic
-
-# Check whether/how heic_rotate.py has previously touched a file
-python3 heic_rotate.py info IMG_0001_rotated.heic
-
-# Undo every heic_rotate.py edit, restoring the exact original bytes
-python3 heic_rotate.py reverse IMG_0001_rotated.heic IMG_0001_original.heic
-
-# Overwrite an existing output file
-python3 heic_rotate.py 90 IMG_0001.heic IMG_0001_rotated.heic --force
-```
-
-### Options
+## Options
 
 | Flag | Applies to | Meaning |
 |---|---|---|
@@ -154,7 +203,7 @@ after the subcommand name.
 > that situation could silently discard those other changes, so it's
 > refused unless you explicitly opt in.
 
-### Exit codes
+## Exit codes
 
 `rotate` and `reverse` exit `0` on success. `info` uses its own scheme so a
 script can branch on the result without parsing text output:
@@ -185,16 +234,6 @@ refused with a clear error rather than silently mis-editing the file:
   another item's data, the sync is silently skipped — safe, just
   incomplete.
 
-## How rotation values map to the container format
-
-The rotation angle is interpreted exactly like ExifTool's
-`-n -QuickTime:Rotation=<val>`: the raw quarter-turn value × 90, written
-directly into the ISOBMFF `irot` box's 2-bit angle field, per
-[ISO/IEC 23008-12](https://www.iso.org/standard/83650.html) (HEIF). Per
-that spec, the angle is **counter-clockwise**: `rotate 90` turns the image
-90° counter-clockwise, and `rotate 270` turns it 90° clockwise (270°
-counter-clockwise is the same as 90° clockwise).
-
 ## Testing
 
 A regression suite lives in `heic_rotate_tests/`, covering CLI behavior
@@ -208,15 +247,6 @@ for details.
 cd heic_rotate_tests
 python3 -m unittest test_heic_rotate -v
 ```
-
-## Disclaimer
-
-This tool edits container metadata directly rather than going through a
-HEIC/HEIF library, and while it includes CRC-verified reversibility and a
-regression test suite, you should keep a backup of anything irreplaceable
-before rotating it. Always specify a distinct output file (the default)
-rather than editing in place, at least until you've verified the result
-displays correctly in your own image viewer(s).
 
 ## License
 
