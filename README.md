@@ -197,12 +197,15 @@ counter-clockwise is the same as 90° clockwise).
 
 ## Testing
 
-A regression suite (`test_heic_rotate.py`) is available covering CLI
-behavior and the core rotate/reverse logic against synthetic HEIC files
-(no real photo required), plus any real `.heic` files placed in a
-`testdata/` directory. See that suite's own README for details:
+A regression suite lives in `heic_rotate_tests/`, covering CLI behavior
+and the core rotate/reverse logic against synthetic HEIC files (no real
+photo required), plus any real `.heic` files you place in
+`heic_rotate_tests/testdata/`. See
+[`heic_rotate_tests/README-test.md`](heic_rotate_tests/README-test.md)
+for details.
 
 ```bash
+cd heic_rotate_tests
 python3 -m unittest test_heic_rotate -v
 ```
 
