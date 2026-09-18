@@ -95,6 +95,20 @@ same as `heic_rotate.py` itself. Requires Python 3.
    Exif-sync code path silently unreachable in every synthetic test,
    without failing any assertion - this test would have caught that.
 
+   `TestProvenanceVersionAndSelfCheck` covers the `TVER` (tool version)
+   provenance entry, the one-time migration path that lets an on-disk
+   record written by an older heic_rotate.py grow to fit a newly-added
+   entry tag, and the post-rotate reversibility self-check that `rotate`
+   now always runs before writing output. A helper, `_strip_provenance_
+   tag`, builds a self-consistent "legacy-style" record (missing a given
+   tag, with `iloc` correctly patched to match) to simulate what a file
+   edited by an older tool version genuinely looks like on disk, rather
+   than just deleting bytes and hoping. Includes a `rotate 0` case,
+   confirming that command can be used purely to bring an old file's
+   metadata up to date without touching its displayed rotation, and a
+   mocked-failure case confirming `rotate` writes nothing at all if the
+   self-check ever fails.
+
 3. **CLI-level tests** (`TestCLI`, via `subprocess`) - argument ordering
    (`-q`/`--dry-run`/`-f` before vs after the subcommand), the implicit
    `rotate` shorthand (bare `0`/`90`/`180`/`270` as the first argument),
@@ -102,16 +116,21 @@ same as `heic_rotate.py` itself. Requires Python 3.
    metadata format versions, output-overwrite protection (refused by
    default, allowed with `-f`/`--force`) for both `rotate` and `reverse`,
    `reverse`'s separate `--ignore-tamper-check` flag, `--dry-run` never
-   writing a file, `info`'s exit codes (0/1/2/3/4), and the error exit
-   code (10) staying isolated from those.
+   writing a file, `info`'s exit codes (0/1/2/3/4) and its recorded-
+   tool-version line, `rotate`'s "reversibility self-check passed"
+   message (and that `-q` suppresses it), and the error exit code (10)
+   staying isolated from those.
 
 4. **Real-file tests** (`TestRealFiles`) - round-trips every `.heic` file
    found in `testdata/`, skipped cleanly if that directory is empty. Also
    writes 0/90/180/270 deg rotated copies of each real file found there to
-   a `rotated/` directory (cleared and recreated each run, left in place
-   afterward) for manual visual inspection in an image viewer - structural
-   round-trip checks alone can't confirm the pixels actually display
-   right-side-up.
+   a `rotated/` directory (contents cleared in place and repopulated each
+   run, left as-is afterward) for manual visual inspection in an image
+   viewer - structural round-trip checks alone can't confirm the pixels
+   actually display right-side-up. `testdata/` and `rotated/` may each be
+   a symlink (e.g. pointing at a real photo library or scratch disk
+   outside the repo) rather than a real subdirectory - the suite never
+   calls `rmtree` on either directory itself, only clears what's inside.
 
 ## Adding your own files to `testdata/`
 

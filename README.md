@@ -16,8 +16,10 @@ No third-party dependencies. Python 3 standard library only.
   file is changed, so there's zero quality loss, no matter how many times
   you rotate.
 - **Fully reversible.** `heic_rotate.py reverse` restores a file to be
-  byte-for-byte identical to the original, even after multiple rotations,
-  with a built-in checksum safety check before it ever writes anything.
+  byte-for-byte identical to the original, even after multiple rotations.
+  `rotate` itself also self-checks reversibility before writing anything -
+  it reverses its own output in memory first and refuses to write if that
+  doesn't reconstruct the original exactly.
 
 ## Requirements
 
@@ -85,6 +87,10 @@ python3 heic_rotate.py --dry-run 180 IMG_0001.heic
 # Check whether/how heic_rotate.py has previously touched a file
 python3 heic_rotate.py info IMG_0001_rotated.heic
 
+# Bring an old file's metadata up to date (e.g. add version tracking to
+# a file rotated by an older heic_rotate.py) without changing how it displays
+python3 heic_rotate.py 0 IMG_0001_rotated.heic IMG_0001_updated.heic
+
 # Undo every heic_rotate.py edit, restoring the exact original bytes
 python3 heic_rotate.py reverse IMG_0001_rotated.heic IMG_0001_original.heic
 
@@ -148,12 +154,27 @@ small handful of container-metadata bytes the edit actually touches (the
 `iprp`/`iloc` boxes, the `meta` box's size field, and the legacy Exif
 orientation byte if present) — not a copy of the image data itself, which
 is never touched — plus CRC32 checksums used to detect if the file is
-modified by something else afterward.
+modified by something else afterward, and the `heic_rotate.py` version
+that most recently updated the file (shown by `info`).
 
-Rotating an already-edited file updates only the live rotation value and
-the "current file" checksum; the original pristine snapshot captured on
-the very first edit is never overwritten, so `reverse` can always undo
-every edit made since, no matter how many times you've rotated the file.
+Rotating an already-edited file updates only the live rotation value, the
+"current file" checksum, and the recorded tool version; the original
+pristine snapshot captured on the very first edit is never overwritten,
+so `reverse` can always undo every edit made since, no matter how many
+times you've rotated the file. If the file's existing record predates a
+field the current version adds, it's migrated in place to add it —
+which means **`rotate 0` can be used purely to bring an old file's
+provenance record up to date** (adding version tracking to a file
+rotated by an older `heic_rotate.py`, for instance) without changing how
+the image displays.
+
+Before writing anything, `rotate` also reverses its own freshly-produced
+output in memory and confirms that reconstructs the original exactly —
+refusing to write the output file at all if it doesn't. This is a
+stronger guarantee than checking the *original* file's CRC after the
+fact: it verifies each edit's own reversibility, using the true original
+bytes, at the moment they're still available, rather than waiting to
+find out later that something couldn't be reversed.
 
 ### `reverse`
 
@@ -168,7 +189,10 @@ silently-wrong file.
 `info` is cheap and read-only: it reports the cumulative rotation *this
 tool* has added to a file, distinct from the file's absolute current
 orientation (which may include rotation the file already had before you
-ever ran this script on it).
+ever ran this script on it), plus which `heic_rotate.py` version most
+recently updated the file, e.g. `Rotated with heic_rotate.py v1.6.0,
+provenance format v1.` (omitted for files rotated before version
+tracking was added).
 
 ## How rotation values map to the container format
 

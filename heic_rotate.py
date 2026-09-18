@@ -9,6 +9,32 @@ heic_rotate.py - Losslessly rotate a HEIC/HEIF image by editing container
 metadata only (the 'irot' item property + a synced legacy Exif Orientation
 tag), never touching the encoded HEVC image data. Fully reversible.
 
+USAGE
+-----
+    python3 heic_rotate.py rotate <0|90|180|270> <input.heic> [output.heic] [-f]
+    python3 heic_rotate.py reverse <input.heic> [output.heic] [-f] [--ignore-tamper-check]
+    python3 heic_rotate.py info <input.heic>
+    python3 heic_rotate.py -V | --version
+
+The 'rotate' subcommand name may be omitted: if the first non-option
+argument is exactly '0', '90', '180', or '270', 'rotate' is assumed.
+    python3 heic_rotate.py 90 <input.heic> [output.heic]   # same as above
+
+-q/--quiet, --dry-run, and -f/--force (rotate/reverse only) may be given
+either before or after the subcommand name. `info` is cheap and
+read-only: it reports the file's current rotation and any heic_rotate.py
+provenance record without doing the heavier reconstruction/verification
+`reverse` does.
+
+By default, rotate/reverse refuse to overwrite an existing output file;
+pass -f/--force to allow it. (This is a different flag from `reverse`'s
+--ignore-tamper-check, which controls whether `reverse` proceeds despite
+a CRC mismatch suggesting the file was modified by something else since
+the last edit - that flag used to be named --force, before -f/--force was
+repurposed for output-overwrite as described above.)
+
+Run with no arguments, or with -h, for full help.
+
 ROTATION DIRECTION: COUNTER-CLOCKWISE
 --------------------------------------
 Positive angles rotate the image COUNTER-CLOCKWISE (anticlockwise), per
@@ -29,6 +55,12 @@ true no-op for the visual orientation (adding 0 changes nothing) and is
 useful purely to add heic_rotate.py's tracking metadata to a file, or to
 make an implicit 0 deg orientation explicit, without altering how the
 image displays either way.
+
+-------------------------------------------------------------------------
+Everything below is internals - why this tool exists, how reversibility
+is implemented, and known limitations. None of it is necessary just to
+use the tool.
+-------------------------------------------------------------------------
 
 WHY THIS EXISTS
 ----------------
@@ -77,37 +109,28 @@ file, byte for byte:
   - a 1-byte format VERSION, so a future version of this script can
     detect old-format provenance records and apply the correct legacy
     reverse algorithm instead of misreading a newer/older layout.
+  - the heic_rotate.py version (major.minor.patch) that most recently
+    UPDATED the file - shown by `info` as "Rotated with heic_rotate.py
+    vX.Y.Z". Written by `rotate` only, as part of the same edit whose
+    reversibility it just self-checked (see below). `reverse` verifies
+    reversibility too, but never writes this marker, since reversing
+    isn't an update of its own - it just undoes previous ones. This is
+    a "who last updated this file" marker, not a history of every
+    version that has ever touched it - each `rotate` overwrites it with
+    the version currently running.
 
 Re-running `rotate` on an already-edited file updates only the
-"current file" CRC32 and the live edit - it never overwrites the saved
-pristine snapshot, so `reverse` always undoes ALL edits back to the
-true original, however many times you've rotated it since.
+"current file" CRC32, the tool-version marker, and the live edit - it
+never overwrites the saved pristine snapshot, so `reverse` always
+undoes ALL edits back to the true original, however many times you've
+rotated it since.
 
-USAGE
------
-    python3 heic_rotate.py rotate <0|90|180|270> <input.heic> [output.heic] [-f]
-    python3 heic_rotate.py reverse <input.heic> [output.heic] [-f] [--ignore-tamper-check]
-    python3 heic_rotate.py info <input.heic>
-    python3 heic_rotate.py -V | --version
-
-The 'rotate' subcommand name may be omitted: if the first non-option
-argument is exactly '0', '90', '180', or '270', 'rotate' is assumed.
-    python3 heic_rotate.py 90 <input.heic> [output.heic]   # same as above
-
--q/--quiet, --dry-run, and -f/--force (rotate/reverse only) may be given
-either before or after the subcommand name. `info` is cheap and
-read-only: it reports the file's current rotation and any heic_rotate.py
-provenance record without doing the heavier reconstruction/verification
-`reverse` does.
-
-By default, rotate/reverse refuse to overwrite an existing output file;
-pass -f/--force to allow it. (This is a different flag from `reverse`'s
---ignore-tamper-check, which controls whether `reverse` proceeds despite
-a CRC mismatch suggesting the file was modified by something else since
-the last edit - that flag used to be named --force, before -f/--force was
-repurposed for output-overwrite as described above.)
-
-Run with no arguments, or with -h, for full help.
+Every `rotate` also runs a post-edit self-check before writing
+anything: it reverses its own freshly-produced output in memory and
+confirms the result's CRC32 matches the recorded original. If that
+check fails, `rotate` refuses to write the output file at all - you
+never end up with a file this version of the tool claims to be able
+to reverse but actually can't.
 
 The rotation angle is interpreted exactly like ExifTool's
 `-n -QuickTime:Rotation=<val>` (raw quarter-turn value * 90), i.e. it is
@@ -158,7 +181,7 @@ class ProvenanceError(Exception):
     pass
 
 
-VERSION = '1.5.0'
+VERSION = '1.6.0'
 
 FORMAT_VERSION = 1
 
@@ -169,6 +192,26 @@ FORMAT_VERSION = 1
 # VERSION,)` at each call site) so --version and reverse_rotation()'s check
 # can never drift out of sync with each other.
 SUPPORTED_REVERSE_FORMAT_VERSIONS = (FORMAT_VERSION,)
+
+
+def _version_tuple():
+    """Parse VERSION ('MAJOR.MINOR.PATCH') into three small ints, for
+    compact fixed-width storage in the provenance record's TVER entry
+    (see build_provenance_box). Fixed-width (1 byte each) is deliberate:
+    it lets TVER update in place on every edit as a same-size splice,
+    the same way CCRC already does, rather than needing the general
+    resize/patch path for the routine case of "just re-recording which
+    version last updated this file"."""
+    parts = VERSION.split('.')
+    if len(parts) != 3:
+        raise ValueError(f"VERSION must be MAJOR.MINOR.PATCH, got {VERSION!r}")
+    major, minor, patch = (int(p) for p in parts)
+    for name, val in (('major', major), ('minor', minor), ('patch', patch)):
+        if not (0 <= val <= 255):
+            raise ValueError(
+                f"VERSION component {name}={val} doesn't fit in the "
+                f"provenance record's fixed 1-byte TVER field (0-255)")
+    return major, minor, patch
 
 # Deterministic, tool-specific UUID identifying our private provenance box.
 # (uuid5 over a fixed namespace+name so it's reproducible from source, not
@@ -969,69 +1012,87 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         # PCRC: crc32 of the truly original file (no provenance box existed yet)
         entries[b'PCRC'] = struct.pack('>I', zlib.crc32(data) & 0xffffffff)
 
-    # Insert or replace the provenance box.
-    info_now = locate_structures(bytes(out))
-    if info_now['provenance_hdr'] is not None:
-        # Same-size in-place replacement: OPRP/OILC/OMSZ/OEXO/PCRC never
-        # change size after the first write (only CCRC's 4-byte value
-        # updates), so the box's total size is constant across repeated
-        # edits and no iloc-offset patching is ever needed for this case.
-        prov_start, _, _, prov_end, _ = info_now['provenance_hdr']
-        placeholder_removed = bytes(out[:prov_start]) + bytes(out[prov_end:])
-        ccrc = zlib.crc32(placeholder_removed) & 0xffffffff
-        entries[b'CCRC'] = struct.pack('>I', ccrc)
-        new_prov_box = build_provenance_box(FORMAT_VERSION, entries)
-        if len(new_prov_box) != (prov_end - prov_start):
-            raise BoxParseError(
-                "internal error: provenance box size changed on update - "
-                "this should never happen since only CCRC's fixed-width "
-                "value changes after the first write")
-        out[prov_start:prov_end] = new_prov_box
-    else:
-        # First-time insertion. This box is a TOP-LEVEL SIBLING of 'meta'
-        # (inserted right after it), so unlike the iprp insertion above it
-        # never needs meta's own size field touched - but if 'meta' sits
-        # BEFORE 'mdat' in this file's layout (some vendors do it this way;
-        # others put 'mdat' first), this insertion point precedes mdat and
-        # every iloc absolute offset pointing into mdat needs to shift by
-        # the box's size, exactly like the iprp insertion did above. This
-        # is a SEPARATE insertion with its own delta - the iprp-insertion
-        # patch earlier does not cover it.
-        #
-        # CCRC is a fixed 4-byte field regardless of its value, so we can
-        # build a placeholder-CCRC box purely to learn the real box's size
-        # before we know the real CCRC value (which itself depends on the
-        # fully-patched buffer) - a placeholder of 0 gives the exact same
-        # length as any other 4-byte value.
-        entries[b'CCRC'] = struct.pack('>I', 0)
-        placeholder_prov_box = build_provenance_box(FORMAT_VERSION, entries)
-        prov_delta = len(placeholder_prov_box)
+    # TVER: the heic_rotate.py version performing THIS update, whose
+    # reversibility is about to be self-checked below (in _run()) before
+    # anything is written. Always the CURRENTLY RUNNING tool's version,
+    # regardless of what wrote the entries above - a "who last updated
+    # this file" marker, not a version history, so - unlike the pristine
+    # snapshots above - it is freshly written on every single edit
+    # rather than carried forward. `reverse` never writes this: it only
+    # verifies reversibility, it doesn't perform an update of its own.
+    entries[b'TVER'] = struct.pack('>BBB', *_version_tuple())
 
-        insert_at = info_now['meta_hdr'][3]
+    # Insert, resize, or same-size-update the provenance box. These are
+    # really one operation - splice a possibly-different-size blob in,
+    # patching iloc for the size delta if there is one - so they're
+    # handled uniformly rather than as separate code paths:
+    #   - old_prov_size == 0: first-time insertion.
+    #   - old_prov_size == new_prov_size: the common case for every edit
+    #     after the first (only CCRC's and TVER's fixed-width VALUES
+    #     change, never the box's overall size) - no iloc patching needed.
+    #   - old_prov_size != new_prov_size (both nonzero): a one-time
+    #     migration - e.g. an on-disk record written by an older
+    #     heic_rotate.py that predates an entry tag this version adds
+    #     (such as TVER itself, the first time a pre-1.6.0-edited file is
+    #     rotated again by 1.6.0+) is being resized to fit the new set.
+    info_now = locate_structures(bytes(out))
+    old_prov_hdr = info_now['provenance_hdr']
+    if old_prov_hdr is not None:
+        old_prov_start, _, _, old_prov_end, _ = old_prov_hdr
+    else:
+        old_prov_start = old_prov_end = info_now['meta_hdr'][3]
+    old_prov_size = old_prov_end - old_prov_start
+
+    # CCRC is a fixed 4-byte field regardless of its value, so we can
+    # build a placeholder-CCRC box purely to learn the real box's size
+    # before we know the real CCRC value (which itself depends on the
+    # fully-patched buffer) - a placeholder of 0 gives the exact same
+    # length as any other 4-byte value.
+    entries[b'CCRC'] = struct.pack('>I', 0)
+    placeholder_prov_box = build_provenance_box(FORMAT_VERSION, entries)
+    new_prov_size = len(placeholder_prov_box)
+    prov_delta = new_prov_size - old_prov_size
+
+    if prov_delta != 0:
+        # This box is a TOP-LEVEL SIBLING of 'meta' (positioned right
+        # after it), so unlike the iprp insertion above, changing its
+        # size never needs meta's own size field touched - but if 'meta'
+        # sits BEFORE 'mdat' in this file's layout (some vendors do it
+        # this way; others put 'mdat' first), everything from this box's
+        # current end onward precedes mdat, and every iloc absolute
+        # offset pointing into mdat needs to shift by the size delta.
+        # This is a SEPARATE delta from the iprp-insertion patch earlier
+        # (if any) - that one does not cover this box.
         iloc_hdr_now = info_now['iloc_hdr']
         new_iloc_content, any_changed = patch_iloc_offsets_at_threshold(
-            bytes(out), iloc_hdr_now, insert_at, prov_delta)
+            bytes(out), iloc_hdr_now, old_prov_end, prov_delta)
         if any_changed:
             iloc_c_start, iloc_c_end = iloc_hdr_now[2], iloc_hdr_now[3]
             out[iloc_c_start:iloc_c_end] = new_iloc_content
             if verbose:
                 print("[provenance] patched absolute offsets in 'iloc' "
-                      "for the provenance box's own insertion too "
+                      "for the provenance box's own insertion/resize too "
                       "(metadata precedes media data in this file's "
                       "layout)")
+        if verbose and old_prov_size:
+            print(f"[provenance] existing record predates an entry tag "
+                  f"this tool version writes - migrating it in place "
+                  f"({old_prov_size} -> {new_prov_size} bytes)")
 
-        # Now compute the REAL CCRC over the current buffer (iloc already
-        # patched if it needed to be) - the provenance box doesn't exist
-        # in it yet, which is exactly the "excluded" state CCRC wants.
-        ccrc = zlib.crc32(bytes(out)) & 0xffffffff
-        entries[b'CCRC'] = struct.pack('>I', ccrc)
-        new_prov_box = build_provenance_box(FORMAT_VERSION, entries)
-        if len(new_prov_box) != prov_delta:
-            raise BoxParseError(
-                "internal error: provenance box size changed between "
-                "placeholder and real CCRC - CCRC should always be a "
-                "fixed 4 bytes")
-        out[insert_at:insert_at] = new_prov_box
+    # Now compute the REAL CCRC over the file as it will be immediately
+    # BEFORE the provenance box is (re)written - i.e. with iloc already
+    # patched above if needed, and the provenance box itself excluded -
+    # exactly the "excluded" state CCRC is defined to cover.
+    excluded_view = bytes(out[:old_prov_start]) + bytes(out[old_prov_end:])
+    ccrc = zlib.crc32(excluded_view) & 0xffffffff
+    entries[b'CCRC'] = struct.pack('>I', ccrc)
+    new_prov_box = build_provenance_box(FORMAT_VERSION, entries)
+    if len(new_prov_box) != new_prov_size:
+        raise BoxParseError(
+            "internal error: provenance box size changed between "
+            "placeholder and real CCRC - CCRC should always be a "
+            "fixed 4 bytes")
+    out[old_prov_start:old_prov_end] = new_prov_box
 
     if verbose:
         print(f"[provenance] {'updated' if existing_provenance else 'created'} "
@@ -1178,6 +1239,11 @@ def gather_info(data):
                                 whatever rotation the file started with
       version                : provenance format version (if has_provenance)
       version_supported      : bool - False if newer than FORMAT_VERSION
+      tool_version            : (major, minor, patch) tuple - the
+                                 heic_rotate.py version that most
+                                 recently UPDATED (rotated) the file (if
+                                 present; absent on records written before
+                                 this field existed)
       pcrc                    : int (if has_provenance) - CRC32 of the
                                  TRUE ORIGINAL file, before this tool ever
                                  touched it. Independently verifiable by
@@ -1220,6 +1286,9 @@ def gather_info(data):
     if b'PCRC' in entries:
         result['pcrc'] = struct.unpack('>I', entries[b'PCRC'])[0]
 
+    if b'TVER' in entries and len(entries[b'TVER']) == 3:
+        result['tool_version'] = struct.unpack('>BBB', entries[b'TVER'])
+
     return result
 
 
@@ -1250,7 +1319,11 @@ def format_info(result, quiet=False):
     original_qt = result.get('original_quarter_turns')
     original_degrees = original_qt * 90 if original_qt is not None else None
 
-    lines = [f"Rotated with heic_rotate.py, provenance format v{result['version']}"
+    tool_version = result.get('tool_version')
+    tool_version_str = (f" v{tool_version[0]}.{tool_version[1]}.{tool_version[2]}"
+                         if tool_version is not None else "")
+    lines = [f"Rotated with heic_rotate.py{tool_version_str}, "
+             f"provenance format v{result['version']}"
              + ("" if result['version_supported'] else
                 f" (NEWER than this script's v{FORMAT_VERSION} - shown info "
                 f"may be incomplete)") + "."]
@@ -1513,6 +1586,24 @@ def _run(args, data):
         verify_structure(out)
         if not args.quiet:
             print("[ok] output box structure is internally consistent")
+
+        # Post-rotate reversibility self-check: reverse our own freshly-
+        # produced output, in memory, before writing anything to disk.
+        # reverse_rotation() already raises if the reconstructed file's
+        # CRC32 doesn't match the recorded original (or if anything about
+        # the record is malformed) - we just need to make sure a failure
+        # here aborts the rotate instead of silently producing a file
+        # that this tool claims to be able to reverse but actually can't.
+        try:
+            reverse_rotation(out, ignore_tamper=False, verbose=False)
+        except (BoxParseError, ProvenanceError) as e:
+            raise ProvenanceError(
+                f"post-rotate reversibility self-check failed - refusing "
+                f"to write output: {e}") from e
+        if not args.quiet:
+            print("[ok] reversibility self-check passed - output can be "
+                  "fully reversed back to the original file")
+
         out_path = args.output or (args.input.rsplit('.', 1)[0] + '_rotated.heic')
     else:
         out = reverse_rotation(data, ignore_tamper=args.ignore_tamper_check,

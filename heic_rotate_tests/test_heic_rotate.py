@@ -19,7 +19,10 @@ Covers, in order:
      coverage.
   2. Synthetic-file integration tests (no real photo needed) covering both
      box-layout orders (mdat-before-meta and meta-before-mdat), fast path
-     vs slow path, exif sync, and full rotate/reverse round-trips.
+     vs slow path, exif sync, full rotate/reverse round-trips, the TVER
+     (tool version) provenance entry, migrating an older on-disk record
+     forward to include a newly-added entry tag, and the post-rotate
+     reversibility self-check.
   3. CLI-level tests (subprocess) for argument ordering, help behavior,
      dry-run, and info's exit codes.
   4. Real-file tests, skipped automatically if the referenced files aren't
@@ -38,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))       # for synth_heic
@@ -343,6 +347,146 @@ class TestSyntheticRoundTrips(unittest.TestCase):
             hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
 
 
+def _strip_provenance_tag(data: bytes, tag: bytes) -> bytes:
+    """Return a self-consistent copy of `data` with one entry tag removed
+    from its provenance record - simulating what a file actually edited
+    by an OLDER heic_rotate.py (one that predates that tag, e.g. pre-1.6.0
+    files lacking TVER) looks like on disk: the record is genuinely
+    smaller, and iloc is patched to match, using the same
+    patch_iloc_offsets_at_threshold() machinery apply_rotation itself
+    uses (just with a negative delta, since we're shrinking). Used to
+    test that today's tool can migrate such a record forward - see
+    TestProvenanceVersionAndSelfCheck."""
+    out = bytearray(data)
+    info = hr.locate_structures(bytes(out))
+    prov_hdr = info['provenance_hdr']
+    assert prov_hdr is not None, "no provenance record to strip a tag from"
+    version, entries = hr.parse_provenance(bytes(out), prov_hdr)
+    assert tag in entries, f"{tag!r} not present in this record"
+    del entries[tag]
+    smaller_box = hr.build_provenance_box(version, entries)
+    p_start, _, _, p_end, _ = prov_hdr
+    delta = len(smaller_box) - (p_end - p_start)
+    assert delta < 0, "expected the box to shrink after removing a tag"
+
+    iloc_hdr = info['iloc_hdr']
+    new_iloc_content, changed = hr.patch_iloc_offsets_at_threshold(
+        bytes(out), iloc_hdr, p_end, delta)
+    if changed:
+        ic_s, ic_e = iloc_hdr[2], iloc_hdr[3]
+        out[ic_s:ic_e] = new_iloc_content
+
+    info2 = hr.locate_structures(bytes(out))
+    p2_start, _, _, p2_end, _ = info2['provenance_hdr']
+    out[p2_start:p2_end] = smaller_box
+    result = bytes(out)
+    hr.verify_structure(result)  # the simulated "legacy" file must itself be well-formed
+    return result
+
+
+class TestProvenanceVersionAndSelfCheck(unittest.TestCase):
+    """Covers the TVER (tool version) provenance entry, the one-time
+    migration path that lets an older on-disk record grow to fit a newly
+    added entry tag, and the post-rotate reversibility self-check that
+    was added alongside both."""
+
+    def test_tver_entry_matches_running_version(self):
+        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        info = hr.gather_info(rotated)
+        self.assertEqual(info.get('tool_version'), hr._version_tuple())
+
+    def test_second_edit_keeps_provenance_box_same_size(self):
+        """After the first edit, re-rotating with the SAME tool version
+        must update the provenance box's fixed-width fields (CCRC, TVER)
+        in place without changing the box's total size - the fast path
+        every edit after the first relies on."""
+        original = build_synthetic_heic(layout='meta_first', include_irot=False)
+        step1 = hr.apply_rotation(original, 1, verbose=False)
+        step2 = hr.apply_rotation(step1, 1, verbose=False)
+
+        def prov_size(data):
+            hdr = hr.locate_structures(data)['provenance_hdr']
+            return hdr[3] - hdr[0]
+
+        self.assertEqual(prov_size(step1), prov_size(step2),
+                          "same tool version, second edit: provenance box "
+                          "size must not change")
+
+    def test_rotate_migrates_legacy_record_missing_tver(self):
+        """A record written before TVER existed (simulated by stripping it
+        from an otherwise-normal record) must be grown to include it on
+        the next edit - including via a genuine `rotate 0`, which must be
+        usable purely to bring old files' metadata up to date without
+        changing their displayed rotation."""
+        for layout in ('mdat_first', 'meta_first'):
+            for delta_turns in (0, 1):
+                with self.subTest(layout=layout, delta_turns=delta_turns):
+                    original = build_synthetic_heic(layout=layout, include_irot=False)
+                    once_rotated = hr.apply_rotation(original, 1, verbose=False)
+                    legacy_style = _strip_provenance_tag(once_rotated, b'TVER')
+
+                    before = hr.gather_info(legacy_style)
+                    self.assertNotIn('tool_version', before,
+                                      "fixture sanity check: simulated legacy "
+                                      "record must not already have TVER")
+
+                    migrated = hr.apply_rotation(legacy_style, delta_turns, verbose=False)
+                    hr.verify_structure(migrated)
+
+                    after = hr.gather_info(migrated)
+                    self.assertEqual(after.get('tool_version'), hr._version_tuple(),
+                                      "migrating must add TVER for the "
+                                      "CURRENTLY RUNNING tool version")
+                    self.assertEqual(
+                        after['delta_quarter_turns'],
+                        (before['delta_quarter_turns'] + delta_turns) % 4,
+                        "migrating the record must not silently change the "
+                        "rotation this tool has cumulatively applied - a "
+                        "`rotate 0` migration in particular must leave the "
+                        "displayed rotation untouched")
+
+                    # The post-rotate self-check (added at the CLI layer -
+                    # see test_cli_self_check_aborts_and_writes_nothing_on_
+                    # failure below) is just this: reverse the freshly
+                    # produced output and confirm it's byte-identical to
+                    # the TRUE original, not merely to legacy_style.
+                    restored = hr.reverse_rotation(migrated, verbose=False)
+                    self.assertEqual(restored, original,
+                                      "must still reverse all the way back "
+                                      "to the true original after a "
+                                      "migration edit")
+
+    def test_cli_self_check_aborts_and_writes_nothing_on_failure(self):
+        """If the post-rotate self-check ever fails, `rotate` must refuse
+        to write output at all. Forces the failure via a mock rather than
+        a real unreversible file, since manufacturing a genuinely
+        unreversible file would require a second, independent bug."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            input_path = os.path.join(tmpdir, 'input.heic')
+            out_path = os.path.join(tmpdir, 'out.heic')
+            with open(input_path, 'wb') as f:
+                f.write(build_synthetic_heic(layout='mdat_first', include_irot=False))
+            with open(input_path, 'rb') as f:
+                data = f.read()
+
+            args = hr.build_parser().parse_args(['rotate', '90', input_path, out_path])
+
+            with unittest.mock.patch.object(
+                    hr, 'reverse_rotation',
+                    side_effect=hr.ProvenanceError("simulated failure")):
+                with self.assertRaises(hr.ProvenanceError) as ctx:
+                    hr._run(args, data)
+
+            self.assertIn('self-check', str(ctx.exception).lower())
+            self.assertFalse(os.path.exists(out_path),
+                              "rotate must not write output if the "
+                              "post-rotate self-check fails")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # 3. CLI-level tests
 # ---------------------------------------------------------------------------
@@ -393,6 +537,26 @@ class TestCLI(unittest.TestCase):
             with self.subTest(flag=flag):
                 rc2, out2, err2 = run_cli('rotate', '90', self.input_path, out_path, flag)
                 self.assertEqual(rc2, 0, err2)
+
+    def test_rotate_reports_reversibility_self_check_passed(self):
+        out_path = os.path.join(self.tmpdir, 'out.heic')
+        rc, out, err = run_cli('rotate', '90', self.input_path, out_path)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('reversibility self-check passed', out)
+
+    def test_rotate_quiet_suppresses_self_check_message(self):
+        out_path = os.path.join(self.tmpdir, 'out.heic')
+        rc, out, err = run_cli('rotate', '90', self.input_path, out_path, '-q')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, '')
+
+    def test_info_reports_recorded_tool_version(self):
+        out_path = os.path.join(self.tmpdir, 'out.heic')
+        rc, _, err = run_cli('rotate', '90', self.input_path, out_path, '-q')
+        self.assertEqual(rc, 0, err)
+        rc2, out2, err2 = run_cli('info', out_path)
+        self.assertEqual(rc2, 1, err2)
+        self.assertIn(f"heic_rotate.py v{hr.VERSION}, provenance format", out2)
 
     def test_reverse_force_overwrites_and_ignore_tamper_check_is_separate(self):
         # -f/--force on `reverse` now means "overwrite the output file",
@@ -520,6 +684,28 @@ def _discover_real_test_files():
     return sorted(f for f in os.listdir(TESTDATA) if f.lower().endswith('.heic'))
 
 
+def _clear_dir_contents(path):
+    """Empty a directory in place - creating it first if it doesn't
+    exist yet - without ever removing the directory entry itself. This
+    is deliberate rather than the more obvious `shutil.rmtree(path);
+    os.makedirs(path)`: shutil.rmtree() refuses outright (raises
+    OSError) if `path` is a symlink, which it very reasonably might be
+    here - testdata/ and rotated/ are natural candidates for pointing
+    at a real photo library or scratch disk outside the repo via a
+    symlink rather than copying real files into it. Clearing contents
+    one entry at a time works identically whether `path` is a real
+    directory or a symlink to one, and never touches the link itself."""
+    if not os.path.exists(path):
+        os.makedirs(path)
+        return
+    for entry in os.listdir(path):
+        entry_path = os.path.join(path, entry)
+        if os.path.isdir(entry_path) and not os.path.islink(entry_path):
+            shutil.rmtree(entry_path)
+        else:
+            os.remove(entry_path)
+
+
 class TestRealFiles(unittest.TestCase):
     """Runs the same round-trip check against any real .heic files dropped
     into testdata/ - see README-test.md. Skips cleanly if none are
@@ -555,18 +741,18 @@ class TestRealFiles(unittest.TestCase):
         provenance-insertion bug documented in heic_rotate.py's module
         docstring - structural checks alone missed it.
 
-        rotated/ is cleared and recreated each run, then deliberately left
-        in place afterward - not cleaned up in tearDown - so the files are
-        still there to open once the test finishes. Delete it yourself
-        once you're done looking (e.g. `rm -rf rotated/`).
+        rotated/ is cleared (in place - safe even if it's a symlink to
+        somewhere else, see _clear_dir_contents) and then repopulated
+        each run, then deliberately left as-is afterward - not cleaned
+        up in tearDown - so the files are still there to open once the
+        test finishes. Delete its contents yourself once you're done
+        looking (e.g. `rm -rf rotated/*`).
         """
         files = _discover_real_test_files()
         if not files:
             self.skipTest("no .heic files in testdata/ - see README-test.md")
 
-        if os.path.exists(ROTATED_DIR):
-            shutil.rmtree(ROTATED_DIR)
-        os.makedirs(ROTATED_DIR)
+        _clear_dir_contents(ROTATED_DIR)
 
         for fname in files:
             path = os.path.join(TESTDATA, fname)
