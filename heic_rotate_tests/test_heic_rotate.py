@@ -315,22 +315,77 @@ class TestSyntheticRoundTrips(unittest.TestCase):
         current = hr.get_current_rotation(result)
         self.assertEqual(current, 2, "rotate 0 must not alter an existing rotation")
 
-    def test_tamper_inside_restored_region_recovers_with_force(self):
-        """Tampering somewhere reverse fully overwrites regardless (the
-        current iprp bytes) means --ignore-tamper-check still recovers the
-        true original, since that region gets wholesale-replaced either
-        way."""
-        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
-        rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))
+    def test_tamper_of_saved_irot_byte_recovers_with_force_fast_path(self):
+        """FAST PATH: the ORIGINAL 'irot' byte value is explicitly saved
+        (OIRT) and unconditionally overwritten back into place on
+        reverse, regardless of whatever value is currently sitting
+        there - so tampering specifically with that live byte still
+        recovers cleanly with --ignore-tamper-check."""
+        original = build_synthetic_heic(layout='mdat_first', include_irot=True, irot_value=1)
+        rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))  # fast path, 90->180
 
         info = hr.locate_structures(bytes(rotated))
-        iprp_start = info['iprp_hdr'][0]
-        rotated[iprp_start + 20] ^= 0xFF  # inside the iprp region
+        iprp_hdr = info['iprp_hdr']
+        ipco_hdr = hr.find_unique_child(bytes(rotated), iprp_hdr[2], iprp_hdr[3],
+                                         b'ipco', "'iprp'")
+        ipco_children = hr.parse_ipco_children(bytes(rotated), ipco_hdr[2], ipco_hdr[3])
+        irot_child = next(c for c in ipco_children if c[4] == b'irot')
+        rotated[irot_child[2]] = 0xFF  # garbage - not even a valid 2-bit angle
 
         with self.assertRaises(hr.ProvenanceError):
             hr.reverse_rotation(bytes(rotated), ignore_tamper=False, verbose=False)
         restored = hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
         self.assertEqual(restored, original)
+
+    def test_tamper_of_discarded_irot_box_recovers_with_force_slow_path(self):
+        """SLOW PATH: the inserted 'irot' box is discarded wholesale on
+        reverse (its content was never meaningful pre-insertion - OIRT
+        is just a 0-length marker), so tampering with that box's own
+        bytes (as opposed to anything else in 'iprp') still recovers
+        cleanly with --ignore-tamper-check."""
+        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
+        rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))  # slow path
+
+        info = hr.locate_structures(bytes(rotated))
+        ipco_hdr = hr.find_unique_child(bytes(rotated), info['iprp_hdr'][2],
+                                         info['iprp_hdr'][3], b'ipco', "'iprp'")
+        ipco_children = hr.parse_ipco_children(bytes(rotated), ipco_hdr[2], ipco_hdr[3])
+        last_child = ipco_children[-1]
+        self.assertEqual(last_child[4], b'irot')  # fixture sanity check
+        rotated[last_child[2]] = 0xFF  # garbage, inside the box reverse discards outright
+
+        with self.assertRaises(hr.ProvenanceError):
+            hr.reverse_rotation(bytes(rotated), ignore_tamper=False, verbose=False)
+        restored = hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
+        self.assertEqual(restored, original)
+
+    def test_tamper_elsewhere_in_iprp_still_refused_even_with_force(self):
+        """Everything in 'iprp' OTHER than the 'irot' property itself was
+        never touched by heic_rotate.py in the first place, so - unlike
+        the old full-'iprp'-snapshot format - v2's leaner record does
+        NOT blindly overwrite it on reverse. Tampering with it (here,
+        inside the unrelated 'ispe' property) must still be caught by
+        the final CRC self-check, even with --ignore-tamper-check -
+        this is the accepted trade-off for not storing a full 'iprp'
+        snapshot: reverse can only guarantee recovering what it
+        explicitly tracks, and correctly detects (rather than silently
+        ignoring) that anything else has changed."""
+        for include_irot in (True, False):
+            with self.subTest(fast_path=include_irot):
+                original = build_synthetic_heic(layout='mdat_first',
+                                                  include_irot=include_irot)
+                rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))
+
+                info = hr.locate_structures(bytes(rotated))
+                ipco_hdr = hr.find_unique_child(bytes(rotated), info['iprp_hdr'][2],
+                                                 info['iprp_hdr'][3], b'ipco', "'iprp'")
+                ispe_hdr = hr.find_child(bytes(rotated), ipco_hdr[2], ipco_hdr[3], b'ispe')
+                rotated[ispe_hdr[2]] ^= 0xFF  # inside 'ispe', unrelated to 'irot'
+
+                with self.assertRaises(hr.ProvenanceError):
+                    hr.reverse_rotation(bytes(rotated), ignore_tamper=False, verbose=False)
+                with self.assertRaises(hr.ProvenanceError):
+                    hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
 
     def test_tamper_outside_restored_region_still_refused_even_with_force(self):
         """Tampering somewhere reverse does NOT touch (e.g. 'ftyp') must
@@ -485,6 +540,123 @@ class TestProvenanceVersionAndSelfCheck(unittest.TestCase):
                               "post-rotate self-check fails")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _make_v1_style_record(original: bytes, rotated_v2: bytes) -> bytes:
+    """Given `original` (pre-rotation bytes) and `rotated_v2` (the result
+    of a single hr.apply_rotation() call on it, in the current v2/OIRT
+    format), return an equivalent file whose provenance record uses the
+    OLD v1/OPRP format instead - same PCRC/CCRC/OMSZ/OILC/OEXO/TVER, but
+    with a full pristine 'iprp' snapshot in place of OIRT(+OIPF). Used to
+    test that `reverse` (and the v1->v2 migration path) still correctly
+    handle old-format records written before this optimization existed.
+
+    Only valid for 'mdat_first' layout: since 'mdat' already precedes
+    the provenance box's position there, resizing that box (v1's OPRP is
+    larger than v2's OIRT) never needs any iloc patching - avoiding the
+    need to duplicate that patching logic in a test helper."""
+    info_orig = hr.locate_structures(original)
+    iprp_hdr = info_orig['iprp_hdr']
+    pristine_iprp = original[iprp_hdr[0]:iprp_hdr[3]]
+
+    info_v2 = hr.locate_structures(rotated_v2)
+    prov_hdr = info_v2['provenance_hdr']
+    _, entries = hr.parse_provenance(rotated_v2, prov_hdr)
+    v1_entries = {k: v for k, v in entries.items() if k not in (b'OIRT', b'OIPF')}
+    v1_entries[b'OPRP'] = pristine_iprp
+    v1_box = hr.build_provenance_box(1, v1_entries)
+
+    out = bytearray(rotated_v2)
+    p_start, _, _, p_end, _ = prov_hdr
+    out[p_start:p_end] = v1_box
+    return bytes(out)
+
+
+class TestProvenanceLeanFormat(unittest.TestCase):
+    """Covers the v2 provenance format (FORMAT_VERSION 2): storing only
+    the 'irot' property itself (OIRT, +OIPF for the slow-path case)
+    instead of a full pristine 'iprp' snapshot (v1's OPRP) - and that
+    `reverse` still correctly handles old v1-format records, migrating
+    them to v2 on the next edit rather than requiring them to be
+    reversed immediately."""
+
+    def test_new_records_use_v2_leaner_format(self):
+        for include_irot in (True, False):
+            with self.subTest(fast_path=include_irot):
+                original = build_synthetic_heic(layout='mdat_first',
+                                                  include_irot=include_irot)
+                rotated = hr.apply_rotation(original, 1, verbose=False)
+                info = hr.locate_structures(rotated)
+                version, entries = hr.parse_provenance(rotated, info['provenance_hdr'])
+
+                self.assertEqual(version, 2)
+                self.assertIn(b'OIRT', entries)
+                self.assertNotIn(b'OPRP', entries)
+                self.assertEqual(len(entries[b'OIRT']), 1 if include_irot else 0)
+                self.assertEqual(b'OIPF' in entries, not include_irot)
+
+                restored = hr.reverse_rotation(rotated, verbose=False)
+                self.assertEqual(restored, original)
+
+    def test_v2_record_smaller_than_v1_equivalent(self):
+        """The actual point of the optimization: for a file whose 'iprp'
+        carries properties unrelated to rotation (here, 'ispe'), the v2
+        record must be smaller than the equivalent v1 record would have
+        been - proving the unrelated property is no longer being copied
+        into the provenance box at all."""
+        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        v1_style = _make_v1_style_record(original, rotated)
+
+        v2_prov_hdr = hr.locate_structures(rotated)['provenance_hdr']
+        v1_prov_hdr = hr.locate_structures(v1_style)['provenance_hdr']
+        v2_size = v2_prov_hdr[3] - v2_prov_hdr[0]
+        v1_size = v1_prov_hdr[3] - v1_prov_hdr[0]
+        self.assertLess(v2_size, v1_size)
+
+    def test_reverse_supports_old_v1_records(self):
+        for include_irot in (True, False):
+            with self.subTest(fast_path=include_irot):
+                original = build_synthetic_heic(layout='mdat_first',
+                                                  include_irot=include_irot)
+                rotated = hr.apply_rotation(original, 1, verbose=False)
+                v1_style = _make_v1_style_record(original, rotated)
+
+                version, _ = hr.parse_provenance(
+                    v1_style, hr.locate_structures(v1_style)['provenance_hdr'])
+                self.assertEqual(version, 1)  # fixture sanity check
+
+                restored = hr.reverse_rotation(v1_style, verbose=False)
+                self.assertEqual(restored, original)
+
+                info = hr.gather_info(v1_style)
+                self.assertEqual(info['delta_quarter_turns'], 1)
+
+    def test_apply_rotation_migrates_v1_record_to_v2_on_next_edit(self):
+        for include_irot in (True, False):
+            with self.subTest(fast_path=include_irot):
+                original = build_synthetic_heic(layout='mdat_first',
+                                                  include_irot=include_irot)
+                once_rotated = hr.apply_rotation(original, 1, verbose=False)
+                v1_style = _make_v1_style_record(original, once_rotated)
+
+                twice_rotated = hr.apply_rotation(v1_style, 1, verbose=False)
+                hr.verify_structure(twice_rotated)
+
+                info = hr.locate_structures(twice_rotated)
+                version, entries = hr.parse_provenance(twice_rotated, info['provenance_hdr'])
+                self.assertEqual(version, 2)
+                self.assertIn(b'OIRT', entries)
+                self.assertNotIn(b'OPRP', entries)
+
+                after = hr.gather_info(twice_rotated)
+                self.assertEqual(after['delta_quarter_turns'], 2)
+
+                restored = hr.reverse_rotation(twice_rotated, verbose=False)
+                self.assertEqual(restored, original,
+                                  "must still reverse all the way back to "
+                                  "the TRUE original after a v1->v2 "
+                                  "provenance-format migration edit")
 
 
 # ---------------------------------------------------------------------------

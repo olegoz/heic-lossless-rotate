@@ -149,24 +149,24 @@ guaranteed lossless with respect to image content.
 
 Applying a rotation stores a compact provenance record in a private
 top-level `uuid` box (the standard ISOBMFF mechanism for vendor-private
-data, silently skipped by compliant readers). This record holds only the
-small handful of container-metadata bytes the edit actually touches (the
-`iprp`/`iloc` boxes, the `meta` box's size field, and the legacy Exif
-orientation byte if present) — not a copy of the image data itself, which
-is never touched — plus CRC32 checksums used to detect if the file is
-modified by something else afterward, and the `heic_rotate.py` version
-that most recently updated the file (shown by `info`).
+data, silently skipped by compliant readers). The record holds the
+`irot` property's pristine state (its original byte if one already
+existed, or a marker plus `ipma`'s original flags if it didn't), the
+pristine `iloc` content and `meta` size field, the legacy Exif
+orientation byte if present, CRC32 checksums used to detect if the
+file is modified by something else afterward, and the `heic_rotate.py`
+version that most recently updated the file (shown by `info`).
 
 Rotating an already-edited file updates only the live rotation value, the
 "current file" checksum, and the recorded tool version; the original
 pristine snapshot captured on the very first edit is never overwritten,
 so `reverse` can always undo every edit made since, no matter how many
 times you've rotated the file. If the file's existing record predates a
-field the current version adds, it's migrated in place to add it —
-which means **`rotate 0` can be used purely to bring an old file's
-provenance record up to date** (adding version tracking to a file
-rotated by an older `heic_rotate.py`, for instance) without changing how
-the image displays.
+field the current version adds, or uses an older, larger record format,
+it's migrated in place on the next edit. Which means **`rotate 0` can be
+used purely to bring an old file's provenance record up to date** (adding
+new fields, or shrinking its record to the current format) without
+changing how the image displays.
 
 Before writing anything, `rotate` also reverses its own freshly-produced
 output in memory and confirms that reconstructs the original exactly —
@@ -182,7 +182,10 @@ find out later that something couldn't be reversed.
 `heic_rotate.py` edits at once and returning the file to be byte-for-byte
 identical to the true original. It does a final CRC self-check before
 ever writing output — it refuses to write rather than risk producing a
-silently-wrong file.
+silently-wrong file. This final check is unconditional and never skipped
+by `--ignore-tamper-check`: that flag only affects whether `reverse`
+proceeds past the *earlier* check for whether something else modified
+the file since the last `heic_rotate.py` edit, not this final one.
 
 ### `info`
 
@@ -191,7 +194,7 @@ tool* has added to a file, distinct from the file's absolute current
 orientation (which may include rotation the file already had before you
 ever ran this script on it), plus which `heic_rotate.py` version most
 recently updated the file, e.g. `Rotated with heic_rotate.py v1.6.0,
-provenance format v1.` (omitted for files rotated before version
+provenance format v2.` (omitted for files rotated before version
 tracking was added).
 
 ## How rotation values map to the container format

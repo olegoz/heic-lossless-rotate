@@ -98,7 +98,19 @@ Every edit records enough information - in a private top-level 'uuid'
 box, the standard ISOBMFF mechanism for vendor-private data that
 spec-compliant readers silently skip - to reconstruct the exact original
 file, byte for byte:
-  - the pristine (pre-edit) bytes of the 'iprp' box (ipco+ipma)
+  - the pristine (pre-edit) 'irot' state ONLY - not a snapshot of the
+    whole 'iprp' box, which may hold other properties (an embedded ICC
+    colour profile, say) heic_rotate.py never reads or modifies and so
+    has no need to carry a copy of:
+      * if 'irot' already existed: its original 1 byte, restored by
+        overwriting that byte back in place on `reverse`.
+      * if it didn't: a 0-length marker, plus 'ipma's original 3-byte
+        flags (in case inserting 'irot' needed to set the "wide" index
+        flag bit) - `reverse` removes exactly the property it inserted
+        (always the LAST 'ipco' child, with an association always
+        appended as the LAST entry for the primary item, so no index
+        bookkeeping needs to be saved to find it again) and restores
+        those flags.
   - the pristine bytes of the 'iloc' box content
   - the pristine 4-byte 'meta' box size field
   - the pristine 2-byte legacy Exif Orientation value (if present)
@@ -108,7 +120,11 @@ file, byte for byte:
     refuse rather than silently corrupting it)
   - a 1-byte format VERSION, so a future version of this script can
     detect old-format provenance records and apply the correct legacy
-    reverse algorithm instead of misreading a newer/older layout.
+    reverse algorithm instead of misreading a newer/older layout. v1
+    records (written before this optimization existed) saved the WHOLE
+    pristine 'iprp' box instead of just 'irot' - `reverse` still
+    supports reading those directly, and `rotate` migrates one to the
+    leaner v2 layout the next time it edits such a file.
   - the heic_rotate.py version (major.minor.patch) that most recently
     UPDATED the file - shown by `info` as "Rotated with heic_rotate.py
     vX.Y.Z". Written by `rotate` only, as part of the same edit whose
@@ -183,15 +199,18 @@ class ProvenanceError(Exception):
 
 VERSION = '1.6.0'
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # Which provenance/metadata format versions `reverse` knows how to restore.
-# Currently just the current version - extend this tuple (oldest-first, say)
-# if a future FORMAT_VERSION bump ever adds backward-compat reversal for an
-# older format. Kept as its own constant (rather than inlining `(FORMAT_
-# VERSION,)` at each call site) so --version and reverse_rotation()'s check
-# can never drift out of sync with each other.
-SUPPORTED_REVERSE_FORMAT_VERSIONS = (FORMAT_VERSION,)
+# v1: the pristine 'iprp' box (ipco+ipma) was saved in full (OPRP). v2:
+# only the 'irot' property itself is saved (OIRT, +OIPF for the slow-path
+# case) - see apply_rotation()'s "Update / create the provenance box"
+# section and reverse_rotation()'s "Restore iprp" section for what each
+# format actually stores and how each is reconstructed. Kept as its own
+# constant (rather than inlining a literal at each call site) so
+# --version and reverse_rotation()'s check can never drift out of sync
+# with each other.
+SUPPORTED_REVERSE_FORMAT_VERSIONS = (1, 2)
 
 
 def _version_tuple():
@@ -749,6 +768,40 @@ def _rotation_from_iprp_range(data, iprp_c_start, iprp_c_end, primary_item_id):
     return 0
 
 
+def _extract_irot_state(data, iprp_c_start, iprp_c_end, primary_item_id):
+    """Given an 'iprp' byte range (ipco+ipma) and a primary item id,
+    return (had_irot, irot_byte, ipma_flags):
+      - had_irot=True: the primary item already has an 'irot' property
+        associated with it; irot_byte is that property's raw content
+        byte (unmasked - preserved exactly, not just the 2-bit angle),
+        ipma_flags is None (not needed for this case).
+      - had_irot=False: no such property; irot_byte is None, ipma_flags
+        is the (pre-insertion) 'ipma' box's own flags value, needed to
+        correctly restore 'ipma' on reverse if inserting 'irot' later
+        required setting the 15-bit-index ("wide") flag bit.
+    Works whether `data` is a whole file or a standalone snapshot buffer
+    (e.g. an old-format OPRP snapshot being migrated forward), as long
+    as the offsets given are correct within whichever buffer was
+    passed. Used by apply_rotation() (capturing the OIRT/OIPF entries
+    on a file's first-ever edit) and by the v1->v2 provenance-format
+    migration path (deriving those same entries from an existing v1
+    record's full OPRP snapshot)."""
+    ipco_hdr = find_unique_child(data, iprp_c_start, iprp_c_end, b'ipco', "'iprp'")
+    ipma_hdr = find_unique_child(data, iprp_c_start, iprp_c_end, b'ipma', "'iprp'")
+    if ipco_hdr is None or ipma_hdr is None:
+        raise BoxParseError("'iprp' is missing 'ipco' or 'ipma'")
+    ipco_children = parse_ipco_children(data, ipco_hdr[2], ipco_hdr[3])
+    _, ipma_flags, ipma_entries = parse_ipma(data, ipma_hdr[2], ipma_hdr[3])
+    primary_entry = next((e for e in ipma_entries if e[0] == primary_item_id), None)
+    if primary_entry is not None:
+        for prop_index, essential in primary_entry[1]:
+            if 1 <= prop_index <= len(ipco_children):
+                child = ipco_children[prop_index - 1]
+                if child[4] == b'irot':
+                    return True, data[child[2]], None
+    return False, None, ipma_flags
+
+
 def get_current_rotation(data):
     """Read the CURRENTLY-applied rotation (0-3 quarter turns) from the
     primary item's live 'irot' property, or 0 if it has none. This is
@@ -849,7 +902,12 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
                   "saved original snapshot")
 
     # Pristine snapshots we may need to save (only on the FIRST ever edit).
-    pristine_iprp = bytes(data[iprp_start:iprp_c_end])
+    # NOTE: unlike OMSZ/OILC/OEXO below, the pristine 'irot' state itself
+    # (pristine_irot_byte / pristine_ipma_flags) is captured further down,
+    # inside whichever of the FAST/SLOW PATH branches actually runs below -
+    # we only need whatever that specific property's state was, not a
+    # snapshot of the whole 'iprp' box (see "Update / create the
+    # provenance box" for how OIRT/OIPF are built from these).
     pristine_meta_size = bytes(data[meta_start:meta_start + 4])
     pristine_iloc_content = None
     if iloc_hdr is not None:
@@ -859,6 +917,8 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     if exif_field is not None:
         _, byte_order, cur_value = exif_field
         pristine_exif_orientation = struct.pack(byte_order + 'H', cur_value)
+    pristine_irot_byte = None
+    pristine_ipma_flags = None
 
     # ---- FAST PATH: existing irot already associated with primary item ----
     # New value is the CURRENT value plus the requested delta, mod 4 - so
@@ -875,6 +935,14 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
             if child[4] == b'irot':
                 fast_path = True
                 irot_data_pos = child[2]
+                if existing_provenance is None:
+                    # First-ever edit, and it happens to be fast-path -
+                    # meaning the file already had 'irot' before we ever
+                    # touched it (e.g. a native camera rotation). Save
+                    # the exact original BYTE (not just the masked 2-bit
+                    # angle - preserve any reserved bits exactly) before
+                    # it's overwritten below.
+                    pristine_irot_byte = data[irot_data_pos]
                 current_turns = data[irot_data_pos] & 0x3
                 new_turns = (current_turns + delta_turns) % 4
                 out = bytearray(data)
@@ -894,6 +962,13 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
 
     # ---- SLOW PATH: no irot property associated with primary item; insert one ----
     if not fast_path:
+        if existing_provenance is None:
+            # First-ever edit, no 'irot' existed - the pre-insertion
+            # 'ipma' flags are the pristine value we may need to restore
+            # on reverse (specifically, if inserting 'irot' below ends up
+            # needing to set the "wide" index flag bit that isn't already
+            # set here).
+            pristine_ipma_flags = ipma_flags
         current_turns = 0  # absence of 'irot' implies 0 deg per spec
         new_turns = (current_turns + delta_turns) % 4
         if verbose:
@@ -999,11 +1074,43 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     entries = {}
     if existing_provenance is not None:
         # keep the true-original snapshots untouched
-        for tag in (b'OPRP', b'OILC', b'OMSZ', b'OEXO', b'PCRC'):
+        for tag in (b'OILC', b'OMSZ', b'OEXO', b'PCRC'):
             if tag in existing_provenance:
                 entries[tag] = existing_provenance[tag]
+        if b'OIRT' in existing_provenance:
+            # Already v2 format - carry the leaner entries forward as-is.
+            entries[b'OIRT'] = existing_provenance[b'OIRT']
+            if b'OIPF' in existing_provenance:
+                entries[b'OIPF'] = existing_provenance[b'OIPF']
+        elif b'OPRP' in existing_provenance:
+            # v1 record: it saved the WHOLE pristine 'iprp' box. Migrate
+            # it forward to v2's leaner OIRT(+OIPF) representation now,
+            # by asking the same question apply_rotation itself asks on
+            # a first-ever edit - "did 'irot' already exist?" - of that
+            # OLD snapshot instead of the live file. Once derived, the
+            # full OPRP snapshot is no longer needed and is dropped.
+            old_oprp = existing_provenance[b'OPRP']
+            had_irot, irot_byte, orig_ipma_flags = _extract_irot_state(
+                old_oprp, 8, len(old_oprp), primary_item_id)
+            if had_irot:
+                entries[b'OIRT'] = bytes([irot_byte])
+            else:
+                entries[b'OIRT'] = b''
+                entries[b'OIPF'] = struct.pack('>I', orig_ipma_flags)[1:]
+            if verbose:
+                print("[provenance] migrating v1 record's full 'iprp' "
+                      "snapshot to the leaner v2 format (irot-only)")
+        else:
+            raise ProvenanceError(
+                "existing provenance record has neither 'OIRT' nor "
+                "'OPRP' - don't know how to determine its original "
+                "irot state")
     else:
-        entries[b'OPRP'] = pristine_iprp
+        if fast_path:
+            entries[b'OIRT'] = bytes([pristine_irot_byte])
+        else:
+            entries[b'OIRT'] = b''
+            entries[b'OIPF'] = struct.pack('>I', pristine_ipma_flags)[1:]
         entries[b'OMSZ'] = pristine_meta_size
         if pristine_iloc_content is not None:
             entries[b'OILC'] = pristine_iloc_content
@@ -1138,16 +1245,121 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
 
     out = bytearray(data)
 
-    # Restore iprp (covers both fast- and slow-path edits uniformly - we
-    # always saved the full pristine iprp box, so restoring it is a single
-    # splice regardless of which path the forward edit took).
+    # Restore iprp. Two formats, branched on which entry is present:
+    #   v1 (OPRP): the pristine 'iprp' box was saved in full - restoring
+    #     it is a single splice, covering both fast- and slow-path edits
+    #     uniformly, since we never needed to know which happened.
+    #   v2 (OIRT): only the 'irot' property itself was saved. FAST PATH
+    #     (OIRT length 1) just needs that one byte put back - iprp's
+    #     structure/size never changed. SLOW PATH (OIRT length 0) needs
+    #     the property heic_rotate.py inserted removed again - always
+    #     the LAST child of 'ipco', with an association entry always
+    #     appended as the LAST entry in the primary item's 'ipma' list
+    #     (see apply_rotation's slow path) - so no index bookkeeping
+    #     needs to have been saved to find and remove it again.
     info2 = locate_structures(bytes(out))
     iprp_hdr = info2['iprp_hdr']
     iprp_start, _, _, iprp_c_end, _ = iprp_hdr
-    pristine_iprp = entries[b'OPRP']
-    out[iprp_start:iprp_c_end] = pristine_iprp
-    if verbose:
-        print(f"[reverse] restored pristine 'iprp' ({len(pristine_iprp)} bytes)")
+    primary_item_id = info2['primary_item_id']
+
+    if b'OPRP' in entries:
+        pristine_iprp = entries[b'OPRP']
+        out[iprp_start:iprp_c_end] = pristine_iprp
+        if verbose:
+            print(f"[reverse] restored pristine 'iprp' from full v1 "
+                  f"snapshot ({len(pristine_iprp)} bytes)")
+    elif b'OIRT' in entries:
+        oirt = entries[b'OIRT']
+        ipco_hdr = find_unique_child(bytes(out), iprp_hdr[2], iprp_hdr[3],
+                                      b'ipco', "'iprp'")
+        ipma_hdr = find_unique_child(bytes(out), iprp_hdr[2], iprp_hdr[3],
+                                      b'ipma', "'iprp'")
+        if ipco_hdr is None or ipma_hdr is None:
+            raise ProvenanceError("'iprp' is missing 'ipco' or 'ipma' - "
+                                   "cannot reverse")
+        ipco_start, _, ipco_c_start, ipco_c_end, _ = ipco_hdr
+        ipma_start, _, ipma_c_start, ipma_c_end, _ = ipma_hdr
+        ipco_children = parse_ipco_children(bytes(out), ipco_c_start, ipco_c_end)
+        ipma_version, current_ipma_flags, ipma_entries = parse_ipma(
+            bytes(out), ipma_c_start, ipma_c_end)
+        primary_entry = next((e for e in ipma_entries if e[0] == primary_item_id), None)
+
+        if len(oirt) == 1:
+            # FAST PATH: 'irot' already existed - just put its original
+            # byte value back in place. Nothing else in 'iprp' ever
+            # changed size, so no other restoration is needed here.
+            if primary_entry is None:
+                raise ProvenanceError(
+                    "OIRT indicates the primary item should have an "
+                    "'irot' property, but it now has no 'ipma' entry "
+                    "at all - cannot reverse")
+            irot_pos = None
+            for prop_index, essential in primary_entry[1]:
+                if 1 <= prop_index <= len(ipco_children):
+                    child = ipco_children[prop_index - 1]
+                    if child[4] == b'irot':
+                        irot_pos = child[2]
+                        break
+            if irot_pos is None:
+                raise ProvenanceError(
+                    "OIRT indicates an 'irot' property should exist on "
+                    "the primary item, but none was found - cannot "
+                    "reverse")
+            out[irot_pos] = oirt[0]
+            if verbose:
+                print(f"[reverse] restored original 'irot' byte "
+                      f"({oirt[0]}) at offset {irot_pos}")
+        elif len(oirt) == 0:
+            # SLOW PATH: no 'irot' property existed originally - strip
+            # out exactly the one heic_rotate.py inserted.
+            if not ipco_children or ipco_children[-1][4] != b'irot':
+                raise ProvenanceError(
+                    "OIRT indicates heic_rotate.py appended an 'irot' "
+                    "property as the last 'ipco' child, but that's not "
+                    "what's there now - cannot safely reverse (file may "
+                    "have been modified by something else since)")
+            last_child = ipco_children[-1]
+            new_property_index = len(ipco_children)  # 1-based index of last_child
+
+            if primary_entry is None or not primary_entry[1] or \
+                    primary_entry[1][-1][0] != new_property_index:
+                raise ProvenanceError(
+                    "OIRT indicates the primary item's last 'ipma' "
+                    "association should point at the inserted 'irot' "
+                    "property, but it doesn't - cannot safely reverse")
+
+            new_ipma_entries = []
+            for item_id, assocs in ipma_entries:
+                assocs = list(assocs)
+                if item_id == primary_item_id:
+                    assocs.pop()  # drop the association we appended
+                new_ipma_entries.append([item_id, assocs])
+            original_flags = struct.unpack('>I', b'\x00' + entries[b'OIPF'])[0]
+            new_ipma_box = build_ipma(ipma_version, original_flags, new_ipma_entries)
+
+            new_ipco_content = bytes(out[ipco_c_start:last_child[0]])
+            new_ipco_box = struct.pack('>I4s', len(new_ipco_content) + 8,
+                                        b'ipco') + new_ipco_content
+
+            first_is_ipco = ipco_start < ipma_start
+            new_iprp_content = (new_ipco_box + new_ipma_box) if first_is_ipco \
+                else (new_ipma_box + new_ipco_box)
+            new_iprp_box = struct.pack('>I4s', len(new_iprp_content) + 8,
+                                        b'iprp') + new_iprp_content
+            out[iprp_start:iprp_c_end] = new_iprp_box
+            if verbose:
+                print(f"[reverse] removed inserted 'irot' property and "
+                      f"its 'ipma' association, restored original 'ipma' "
+                      f"flags ({new_iprp_box.__len__()} byte 'iprp' now, "
+                      f"was {iprp_c_end - iprp_start})")
+        else:
+            raise ProvenanceError(
+                f"corrupt provenance record: OIRT has unexpected length "
+                f"{len(oirt)} (expected 0 or 1)")
+    else:
+        raise ProvenanceError(
+            "provenance record has neither 'OPRP' nor 'OIRT' - don't "
+            "know how to restore 'iprp'")
 
     # Restore meta's size field. This overwrites a plain 4-byte field in
     # place, same limitation as apply_rotation's meta-size patch - but we
@@ -1279,6 +1491,16 @@ def gather_info(data):
     if b'OPRP' in entries:
         original_quarter_turns = get_rotation_from_iprp_snapshot(
             entries[b'OPRP'], info['primary_item_id'])
+        result['original_quarter_turns'] = original_quarter_turns
+        result['delta_quarter_turns'] = (
+            (current_quarter_turns - original_quarter_turns) % 4)
+    elif b'OIRT' in entries:
+        oirt = entries[b'OIRT']
+        # length 1: 'irot' already existed originally - its original
+        # value (masked to the 2-bit angle, same as everywhere else this
+        # tool reads a live 'irot' byte) is the original rotation.
+        # length 0: no 'irot' existed - absence implies 0 deg per spec.
+        original_quarter_turns = (oirt[0] & 0x3) if len(oirt) == 1 else 0
         result['original_quarter_turns'] = original_quarter_turns
         result['delta_quarter_turns'] = (
             (current_quarter_turns - original_quarter_turns) % 4)
