@@ -1625,7 +1625,7 @@ ERROR_EXIT_CODE = 10  # kept out of 0-3 so it never collides with `info`'s
 def _version_string():
     supported = ', '.join(str(v) for v in SUPPORTED_REVERSE_FORMAT_VERSIONS)
     return (f"heic_rotate.py {VERSION}\n"
-            f"metadata (provenance) format version: {FORMAT_VERSION} (current)\n"
+            f"metadata (provenance) format version: {FORMAT_VERSION}\n"
             f"metadata format versions supported by reverse: {supported}")
 
 
@@ -1674,7 +1674,9 @@ def build_parser():
                            "orientation explicit if no 'irot' exists yet).")
     rot.add_argument('input', help='input .heic file')
     rot.add_argument('output', nargs='?',
-                      help='output .heic file (default: <input>_rotated.heic)')
+                      help="output .heic file (default: <input>_rotated.heic; "
+                           "or, if <input> ends with '_restored', that "
+                           "suffix is stripped instead of adding '_rotated')")
     rot.add_argument('--no-exif-sync', action='store_true',
                       help="don't sync the legacy embedded Exif Orientation tag")
     rot.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS,
@@ -1826,7 +1828,16 @@ def _run(args, data):
             print("[ok] reversibility self-check passed - output can be "
                   "fully reversed back to the original file")
 
-        out_path = args.output or (args.input.rsplit('.', 1)[0] + '_rotated.heic')
+        if args.output:
+            out_path = args.output
+        else:
+            in_stem = args.input.rsplit('.', 1)[0]
+            if in_stem.endswith('_restored'):
+                # Input looks like reverse's own default output - undo that
+                # suffix instead of piling '_rotated' on top of it.
+                out_path = in_stem[:-len('_restored')] + '.heic'
+            else:
+                out_path = in_stem + '_rotated.heic'
     else:
         out = reverse_rotation(data, ignore_tamper=args.ignore_tamper_check,
                                 verbose=not args.quiet)

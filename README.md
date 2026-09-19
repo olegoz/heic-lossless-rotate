@@ -55,7 +55,10 @@ python3 heic_rotate.py 90 photo.heic photo_rotated.heic
 python3 heic_rotate.py rotate 90 photo.heic photo_rotated.heic
 ```
 
-If no output path is given, `rotate` writes to `<input>_rotated.heic` and
+If no output path is given, `rotate` writes to `<input>_rotated.heic` —
+unless `<input>` itself ends with `_restored` (i.e. it looks like
+`reverse`'s own default output), in which case `rotate` strips that suffix
+instead of adding `_rotated` (`photo_restored.heic` → `photo.heic`).
 `reverse` writes to `<input>_restored.heic`. By default, both refuse to
 overwrite an existing output file — pass `-f`/`--force` to allow it.
 
