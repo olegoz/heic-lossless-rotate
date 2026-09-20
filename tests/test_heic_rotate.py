@@ -7,9 +7,10 @@ Run with:
 or just:
     python3 test_heic_rotate.py
 
-Tests heic_rotate.py at the repo root, i.e. ONE DIRECTORY UP from wherever
-this file lives (this file is meant to sit in a heic_rotate_tests/
-subfolder next to it) - not a local copy. Works from any working
+Tests the heic_rotate package under src/, resolved relative to this
+file's own location (this file is meant to sit in a tests/ subfolder
+at the repo root, next to src/) - not a local copy, and not requiring
+the package to be pip-installed first. Works from any working
 directory, since paths are resolved relative to this file's own location.
 
 Covers, in order:
@@ -44,23 +45,35 @@ import unittest
 import unittest.mock
 import zlib
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))       # for synth_heic
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # for heic_rotate (repo root)
-
-import heic_rotate as hr
-from synth_heic import build_synthetic_heic
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
+SRC_DIR = os.path.join(REPO_ROOT, 'src')
+
+sys.path.insert(0, HERE)      # for synth_heic
+sys.path.insert(0, SRC_DIR)   # for the heic_rotate package (src/ layout)
+
+# heic_rotate is now a package: the box-parsing/rotation functions these
+# tests exercise (patch_iloc_offsets_at_threshold, parse_iloc,
+# find_unique_child, apply_rotation, ...) live in heic_rotate.core, not
+# in heic_rotate/__init__.py, which only re-exports __version__.
+# build_parser/_run are CLI-only and live in heic_rotate.cli instead.
+from heic_rotate import core as hr
+from heic_rotate import cli as hr_cli
+from synth_heic import build_synthetic_heic
+
 TESTDATA = os.path.join(HERE, 'testdata')
-SCRIPT = os.path.join(REPO_ROOT, 'heic_rotate.py')
 ROTATED_DIR = os.path.join(HERE, 'rotated')
 
 
 def run_cli(*args, cwd=None):
-    """Run heic_rotate.py as a subprocess, return (returncode, stdout, stderr)."""
-    proc = subprocess.run([sys.executable, SCRIPT, *args],
-                           capture_output=True, text=True, cwd=cwd)
+    """Run the heic_rotate CLI as a subprocess (`python -m heic_rotate`),
+    return (returncode, stdout, stderr). Runs against the src/ checkout
+    directly via PYTHONPATH, so this works whether or not the package
+    has been pip-installed."""
+    env = os.environ.copy()
+    env['PYTHONPATH'] = SRC_DIR + os.pathsep + env.get('PYTHONPATH', '')
+    proc = subprocess.run([sys.executable, '-m', 'heic_rotate', *args],
+                           capture_output=True, text=True, cwd=cwd, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -526,13 +539,19 @@ class TestProvenanceVersionAndSelfCheck(unittest.TestCase):
             with open(input_path, 'rb') as f:
                 data = f.read()
 
-            args = hr.build_parser().parse_args(['rotate', '90', input_path, out_path])
+            args = hr_cli.build_parser().parse_args(['rotate', '90', input_path, out_path])
 
+            # Patched on hr_cli (heic_rotate.cli), not hr (heic_rotate.core):
+            # cli.py imports reverse_rotation by name (`from .core import
+            # reverse_rotation`), so that's the binding _run() actually
+            # looks up at call time - patching core.reverse_rotation
+            # instead would silently miss, since cli's own copy of the
+            # name would be untouched.
             with unittest.mock.patch.object(
-                    hr, 'reverse_rotation',
+                    hr_cli, 'reverse_rotation',
                     side_effect=hr.ProvenanceError("simulated failure")):
                 with self.assertRaises(hr.ProvenanceError) as ctx:
-                    hr._run(args, data)
+                    hr_cli._run(args, data)
 
             self.assertIn('self-check', str(ctx.exception).lower())
             self.assertFalse(os.path.exists(out_path),

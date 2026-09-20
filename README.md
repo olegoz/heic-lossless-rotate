@@ -2,10 +2,10 @@
 
 Repository: https://github.com/olegoz/heic-lossless-rotate
 
-A standalone Python 3 script (`heic_rotate.py`) that **losslessly rotates
-HEIC/HEIF images** — the photo format used by default on recent iPhones and
-many Android phones — without re-encoding or losing any quality, and is
-**fully reversible** back to the exact original file, byte for byte.
+A Python 3 tool that **losslessly rotates HEIC/HEIF images** — the photo
+format used by default on recent iPhones and many Android phones —
+without re-encoding or losing any quality, and is **fully reversible**
+back to the exact original file, byte for byte.
 
 No third-party dependencies. Python 3 standard library only.
 
@@ -15,33 +15,53 @@ No third-party dependencies. Python 3 standard library only.
   touched or re-compressed — only a small "which way is up" tag inside the
   file is changed, so there's zero quality loss, no matter how many times
   you rotate.
-- **Fully reversible.** `heic_rotate.py reverse` restores a file to be
-  byte-for-byte identical to the original, even after multiple rotations.
-  `rotate` itself also self-checks reversibility before writing anything -
-  it reverses its own output in memory first and refuses to write if that
+- **Fully reversible.** `reverse` restores a file to be byte-for-byte
+  identical to the original, even after multiple rotations. `rotate`
+  itself also self-checks reversibility before writing anything - it
+  reverses its own output in memory first and refuses to write if that
   doesn't reconstruct the original exactly.
 
 ## Requirements
 
-- Python 3 (standard library only — no `pip install` needed)
+- Python 3 (standard library only — no third-party dependencies, whichever
+  way you install it below)
 
 ## Installation
 
-Just download the script — there's nothing to build or install.
+**Option 1 — just download and run, no install step at all.** A single
+self-contained file, a few hundred KB, that runs with nothing but Python
+itself:
 
 ```bash
-curl -O https://raw.githubusercontent.com/olegoz/heic-lossless-rotate/main/heic_rotate.py
-chmod +x heic_rotate.py
+curl -LO https://github.com/olegoz/heic-lossless-rotate/releases/latest/download/heic-lossless-rotate.pyz
+chmod +x heic-lossless-rotate.pyz
+./heic-lossless-rotate.pyz -V
 ```
+
+**Option 2 — install from GitHub with pip**, to get the `heic-lossless-rotate`
+and `heic-rotate` commands on your PATH:
+
+```bash
+pip install git+https://github.com/olegoz/heic-lossless-rotate.git
+```
+
+*A PyPI release (`pip install heic-lossless-rotate`) is planned but not
+published yet — for now, use one of the two options above.*
 
 ## Usage
 
 ```
-heic_rotate.py rotate <0|90|180|270> <input.heic> [output.heic] [-f]
-heic_rotate.py reverse <input.heic> [output.heic] [-f]
-heic_rotate.py info <input.heic>
-heic_rotate.py -V | --version
+heic-lossless-rotate rotate <0|90|180|270> <input.heic> [output.heic] [-f]
+heic-lossless-rotate reverse <input.heic> [output.heic] [-f]
+heic-lossless-rotate info <input.heic>
+heic-lossless-rotate -V | --version
 ```
+
+(A shorter `heic-rotate` alias installs alongside the full command name —
+the two are identical, just pick whichever you prefer to type. If you're
+running the standalone `.pyz` instead, substitute
+`./heic-lossless-rotate.pyz` for `heic-lossless-rotate` in every example
+below.)
 
 (See [Options](#options) below for the full list of flags, including a
 couple of less-common ones not shown here.)
@@ -50,9 +70,9 @@ The `rotate` subcommand name may be omitted: if the first non-option
 argument is exactly `0`, `90`, `180`, or `270`, `rotate` is assumed.
 
 ```bash
-python3 heic_rotate.py 90 photo.heic photo_rotated.heic
+heic-lossless-rotate 90 photo.heic photo_rotated.heic
 # equivalent to:
-python3 heic_rotate.py rotate 90 photo.heic photo_rotated.heic
+heic-lossless-rotate rotate 90 photo.heic photo_rotated.heic
 ```
 
 If no output path is given, `rotate` writes to `<input>_rotated.heic` —
@@ -63,7 +83,7 @@ instead of adding `_rotated` (`photo_restored.heic` → `photo.heic`).
 overwrite an existing output file — pass `-f`/`--force` to allow it.
 
 Run with no arguments, or with `-h`, for full help; `-h` also works on each
-subcommand (`heic_rotate.py rotate -h`, etc.) for its specific options.
+subcommand (`heic-lossless-rotate rotate -h`, etc.) for its specific options.
 
 **Rotation direction:** positive angles rotate **counter-clockwise** —
 `rotate 90` turns the image 90° counter-clockwise. Use `rotate 270` for a
@@ -76,29 +96,29 @@ physically turn a printed photo in your hands.
 
 ```bash
 # Rotate 90° counter-clockwise, writing to a new file
-python3 heic_rotate.py rotate 90 IMG_0001.heic IMG_0001_rotated.heic
+heic-lossless-rotate rotate 90 IMG_0001.heic IMG_0001_rotated.heic
 
 # Same thing, using the implicit-rotate shorthand
-python3 heic_rotate.py 90 IMG_0001.heic IMG_0001_rotated.heic
+heic-lossless-rotate 90 IMG_0001.heic IMG_0001_rotated.heic
 
 # Rotate 90° clockwise instead (270° counter-clockwise == 90° clockwise)
-python3 heic_rotate.py 270 IMG_0001.heic IMG_0001_rotated.heic
+heic-lossless-rotate 270 IMG_0001.heic IMG_0001_rotated.heic
 
 # Preview what would happen without writing anything
-python3 heic_rotate.py --dry-run 180 IMG_0001.heic
+heic-lossless-rotate --dry-run 180 IMG_0001.heic
 
-# Check whether/how heic_rotate.py has previously touched a file
-python3 heic_rotate.py info IMG_0001_rotated.heic
+# Check whether/how this tool has previously touched a file
+heic-lossless-rotate info IMG_0001_rotated.heic
 
 # Bring an old file's metadata up to date (e.g. add version tracking to
-# a file rotated by an older heic_rotate.py) without changing how it displays
-python3 heic_rotate.py 0 IMG_0001_rotated.heic IMG_0001_updated.heic
+# a file rotated by an older release) without changing how it displays
+heic-lossless-rotate 0 IMG_0001_rotated.heic IMG_0001_updated.heic
 
-# Undo every heic_rotate.py edit, restoring the exact original bytes
-python3 heic_rotate.py reverse IMG_0001_rotated.heic IMG_0001_original.heic
+# Undo every edit this tool has made, restoring the exact original bytes
+heic-lossless-rotate reverse IMG_0001_rotated.heic IMG_0001_original.heic
 
 # Overwrite an existing output file
-python3 heic_rotate.py 90 IMG_0001.heic IMG_0001_rotated.heic --force
+heic-lossless-rotate 90 IMG_0001.heic IMG_0001_rotated.heic --force
 ```
 
 ## Disclaimer
@@ -128,7 +148,7 @@ zero is the implicit default. When that box is missing, ExifTool's HEIF
 writer can't insert a new one, so `exiftool -QuickTime:Rotation=90` silently
 does nothing to those files (`0 image files updated`).
 
-`heic_rotate.py` handles both cases:
+`heic-lossless-rotate` handles both cases:
 
 - **Fast path** — an `irot` property already exists and is associated with
   the primary item → its 1-byte rotation value is overwritten in place
@@ -157,8 +177,8 @@ data, silently skipped by compliant readers). The record holds the
 existed, or a marker plus `ipma`'s original flags if it didn't), the
 pristine `iloc` content and `meta` size field, the legacy Exif
 orientation byte if present, CRC32 checksums used to detect if the
-file is modified by something else afterward, and the `heic_rotate.py`
-version that most recently updated the file (shown by `info`).
+file is modified by something else afterward, and the tool version
+that most recently updated the file (shown by `info`).
 
 Rotating an already-edited file updates only the live rotation value, the
 "current file" checksum, and the recorded tool version; the original
@@ -182,21 +202,22 @@ find out later that something couldn't be reversed.
 ### `reverse`
 
 `reverse` restores a file from its provenance record, undoing *all*
-`heic_rotate.py` edits at once and returning the file to be byte-for-byte
-identical to the true original. It does a final CRC self-check before
-ever writing output — it refuses to write rather than risk producing a
-silently-wrong file. This final check is unconditional and never skipped
-by `--ignore-tamper-check`: that flag only affects whether `reverse`
-proceeds past the *earlier* check for whether something else modified
-the file since the last `heic_rotate.py` edit, not this final one.
+edits this tool has made at once and returning the file to be
+byte-for-byte identical to the true original. It does a final CRC
+self-check before ever writing output — it refuses to write rather
+than risk producing a silently-wrong file. This final check is
+unconditional and never skipped by `--ignore-tamper-check`: that flag
+only affects whether `reverse` proceeds past the *earlier* check for
+whether something else modified the file since this tool's last edit,
+not this final one.
 
 ### `info`
 
 `info` is cheap and read-only: it reports the cumulative rotation *this
 tool* has added to a file, distinct from the file's absolute current
 orientation (which may include rotation the file already had before you
-ever ran this script on it), plus which `heic_rotate.py` version most
-recently updated the file, e.g. `Rotated with heic_rotate.py v1.6.0,
+ever ran this script on it), plus which tool version most
+recently updated the file, e.g. `Rotated with heic_rotate.py v1.7.0,
 provenance format v2.` (omitted for files rotated before version
 tracking was added).
 
@@ -220,7 +241,7 @@ counter-clockwise is the same as 90° clockwise).
 | `--dry-run` | `rotate`, `reverse` | Do everything except write the output file |
 | `-f`, `--force` | `rotate`, `reverse` | Overwrite the output file if it already exists (refused by default) |
 | `--no-exif-sync` | `rotate` | Don't sync the legacy embedded Exif `Orientation` tag |
-| `--ignore-tamper-check` | `reverse` | Proceed even if the file appears to have been modified by something else since the last `heic_rotate.py` edit (see note below) |
+| `--ignore-tamper-check` | `reverse` | Proceed even if the file appears to have been modified by something else since the last edit this tool made (see note below) |
 
 All top-level flags (`-q`, `--dry-run`, `-f`) may be given either before or
 after the subcommand name.
@@ -229,7 +250,7 @@ after the subcommand name.
 > different things. `-f`/`--force` is purely about not clobbering an
 > existing *output* file. `--ignore-tamper-check` (on `reverse` only)
 > overrides a CRC mismatch indicating the *input* file was changed by
-> something other than `heic_rotate.py` since its last edit — reversing in
+> something other than this tool since its last edit — reversing in
 > that situation could silently discard those other changes, so it's
 > refused unless you explicitly opt in.
 
@@ -240,7 +261,7 @@ script can branch on the result without parsing text output:
 
 | Exit code | Meaning |
 |---|---|
-| `0` | No `heic_rotate.py` provenance record found — this tool has never touched the file |
+| `0` | No provenance record found — this tool has never touched the file |
 | `1` / `2` / `3` | This tool's cumulative contribution is `90°` / `180°` / `270°` |
 | `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. `rotate 0` was used just to add tracking, or opposing rotations cancelled out) |
 | `10` | A genuine error occurred (e.g. unreadable file, refused overwrite) — deliberately outside `0`–`4` so it's never mistaken for a rotation-state result |
@@ -266,15 +287,15 @@ refused with a clear error rather than silently mis-editing the file:
 
 ## Testing
 
-A regression suite lives in `heic_rotate_tests/`, covering CLI behavior
+A regression suite lives in `tests/`, covering CLI behavior
 and the core rotate/reverse logic against synthetic HEIC files (no real
 photo required), plus any real `.heic` files you place in
-`heic_rotate_tests/testdata/`. See
-[`heic_rotate_tests/README-test.md`](heic_rotate_tests/README-test.md)
+`tests/testdata/`. See
+[`tests/README-test.md`](tests/README-test.md)
 for details.
 
 ```bash
-cd heic_rotate_tests
+cd tests
 python3 -m unittest test_heic_rotate -v
 ```
 

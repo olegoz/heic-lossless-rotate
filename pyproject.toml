@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heic-lossless-rotate"
+dynamic = ["version"]
+description = "Losslessly rotate HEIC/HEIF images by editing container metadata only - fully reversible."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Oleg Ostrozhansky" },
+]
+keywords = ["heic", "heif", "exif", "rotation", "image", "metadata", "lossless"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/olegoz/heic-lossless-rotate"
+Repository = "https://github.com/olegoz/heic-lossless-rotate"
+Changelog = "https://github.com/olegoz/heic-lossless-rotate/blob/main/CHANGELOG.md"
+
+[project.scripts]
+heic-lossless-rotate = "heic_rotate.cli:main"
+heic-rotate = "heic_rotate.cli:main"
+
+# Single source of truth for the version: this reads VERSION directly out
+# of src/heic_rotate/_version.py, so that file is the ONLY place a
+# release bump needs to touch. See _version.py's own docstring for why
+# it's kept separate from __init__.py.
+[tool.setuptools.dynamic]
+version = { attr = "heic_rotate._version.VERSION" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
