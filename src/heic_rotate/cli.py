@@ -1,7 +1,8 @@
 """
-heic_rotate.py - Losslessly rotate a HEIC/HEIF image by editing container
-metadata only (the 'irot' item property + a synced legacy Exif Orientation
-tag), never touching the encoded HEVC image data. Fully reversible.
+heic-lossless-rotate - Losslessly rotate a HEIC/HEIF image by editing
+container metadata only (the 'irot' item property + a synced legacy Exif
+Orientation tag), never touching the encoded HEVC image data. Fully
+reversible.
 
 USAGE
 -----
@@ -16,9 +17,9 @@ argument is exactly '0', '90', '180', or '270', 'rotate' is assumed.
 
 -q/--quiet, --dry-run, and -f/--force (rotate/reverse only) may be given
 either before or after the subcommand name. `info` is cheap and
-read-only: it reports the file's current rotation and any heic_rotate.py
-provenance record without doing the heavier reconstruction/verification
-`reverse` does.
+read-only: it reports the file's current rotation and any
+heic-lossless-rotate provenance record without doing the heavier
+reconstruction/verification `reverse` does.
 
 By default, rotate/reverse refuse to overwrite an existing output file;
 pass -f/--force to allow it. (This is a different flag from `reverse`'s
@@ -46,7 +47,7 @@ turn from however it currently displays", the same way you'd physically
 turn a printed photo in your hands. A concrete consequence: `rotate 90`
 twice in a row lands at 180 deg, not back at 90 deg. `rotate 0` is a
 true no-op for the visual orientation (adding 0 changes nothing) and is
-useful purely to add heic_rotate.py's tracking metadata to a file, or to
+useful purely to add heic-lossless-rotate's tracking metadata to a file, or to
 make an implicit 0 deg orientation explicit, without altering how the
 image displays either way.
 
@@ -94,7 +95,7 @@ spec-compliant readers silently skip - to reconstruct the exact original
 file, byte for byte:
   - the pristine (pre-edit) 'irot' state ONLY - not a snapshot of the
     whole 'iprp' box, which may hold other properties (an embedded ICC
-    colour profile, say) heic_rotate.py never reads or modifies and so
+    colour profile, say) heic-lossless-rotate never reads or modifies and so
     has no need to carry a copy of:
       * if 'irot' already existed: its original 1 byte, restored by
         overwriting that byte back in place on `reverse`.
@@ -109,7 +110,7 @@ file, byte for byte:
   - the pristine 4-byte 'meta' box size field
   - the pristine 2-byte legacy Exif Orientation value (if present)
   - a CRC32 of the pristine original file (identifies the lineage)
-  - a CRC32 of the file as of the most recent heic_rotate.py edit (lets
+  - a CRC32 of the file as of the most recent heic-lossless-rotate edit (lets
     `reverse` detect if something ELSE modified the file since, and
     refuse rather than silently corrupting it)
   - a 1-byte format VERSION, so a future version of this script can
@@ -119,8 +120,8 @@ file, byte for byte:
     pristine 'iprp' box instead of just 'irot' - `reverse` still
     supports reading those directly, and `rotate` migrates one to the
     leaner v2 layout the next time it edits such a file.
-  - the heic_rotate.py version (major.minor.patch) that most recently
-    UPDATED the file - shown by `info` as "Rotated with heic_rotate.py
+  - the heic-lossless-rotate version (major.minor.patch) that most recently
+    UPDATED the file - shown by `info` as "Rotated with heic-lossless-rotate
     vX.Y.Z". Written by `rotate` only, as part of the same edit whose
     reversibility it just self-checked (see below). `reverse` verifies
     reversibility too, but never writes this marker, since reversing
@@ -201,8 +202,8 @@ def build_parser():
                      version=_version_string(),
                      help="show version and metadata format info, then exit")
     # Shared flags at the TOP level, so they work whether given before or
-    # after the subcommand (`heic_rotate.py -q rotate ...` and
-    # `heic_rotate.py rotate ... -q` both work). The matching flags on each
+    # after the subcommand (`heic-rotate -q rotate ...` and
+    # `heic-rotate rotate ... -q` both work). The matching flags on each
     # subparser below use default=SUPPRESS so an omitted flag there never
     # clobbers a value already set at this level - see build_parser()'s
     # docstring-free but load-bearing use of SUPPRESS throughout.
@@ -233,7 +234,7 @@ def build_parser():
                            "NOT an absolute target angle. `rotate 90` "
                            "twice lands at 180 deg, not back at 90. "
                            "0 is a true no-op for the displayed image; "
-                           "it only adds heic_rotate.py's tracking "
+                           "it only adds heic-lossless-rotate's tracking "
                            "metadata (and makes an implicit 0 deg "
                            "orientation explicit if no 'irot' exists yet).")
     rot.add_argument('input', help='input .heic file')
@@ -253,8 +254,8 @@ def build_parser():
                       help="suppress informational stdout messages")
 
     rev = sub.add_parser(
-        'reverse', help='undo all heic_rotate.py edits, restoring the exact original file',
-        description='Undo every heic_rotate.py edit on a file, restoring '
+        'reverse', help='undo all heic-lossless-rotate edits, restoring the exact original file',
+        description='Undo every heic-lossless-rotate edit on a file, restoring '
                      'it to be byte-identical to the true original.')
     rev.add_argument('input', help='input .heic file (previously edited by this tool)')
     rev.add_argument('output', nargs='?',
@@ -267,7 +268,7 @@ def build_parser():
     rev.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS,
                       help="do everything except write the output file: "
                            "useful as a check for whether this file was "
-                           "edited by heic_rotate.py and can cleanly be "
+                           "edited by heic-lossless-rotate and can cleanly be "
                            "reversed, without actually touching it. Exits "
                            "0 if reversible, non-zero with a stderr "
                            "diagnostic otherwise.")
@@ -277,9 +278,9 @@ def build_parser():
                       help="suppress informational stdout messages")
 
     inf = sub.add_parser(
-        'info', help="report the rotation heic_rotate.py has applied, "
+        'info', help="report the rotation heic-lossless-rotate has applied, "
                       "without the heavier checks `reverse` does",
-        description="Report what heic_rotate.py knows about a file: "
+        description="Report what heic-lossless-rotate knows about a file: "
                      "whether it carries a provenance record, and - if "
                      "so - the CUMULATIVE rotation this tool has added "
                      "on top of whatever the file started with (not "
@@ -292,7 +293,7 @@ def build_parser():
                      "the full byte-level reconstruction/verification "
                      "that `reverse` does.\n\n"
                      "With -q: no text output, just an exit code. Exit 0 "
-                     "is reserved EXCLUSIVELY for 'no heic_rotate.py "
+                     "is reserved EXCLUSIVELY for 'no heic-lossless-rotate "
                      "provenance record found' (this tool never touched "
                      "the file). Once a provenance record exists, the "
                      "exit code is always non-zero: 1/2/3 for a "

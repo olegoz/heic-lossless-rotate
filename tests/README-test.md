@@ -1,26 +1,38 @@
-# heic_rotate.py test suite
+# heic-lossless-rotate test suite
 
 ## Layout
 
-This directory is meant to sit as a subfolder (`heic_rotate_tests/`) next
-to `heic_rotate.py` at the repo root:
+This directory is meant to sit as a subfolder (`tests/`) at the repo
+root, alongside `src/heic_rotate/`:
 
 ```
 heic-lossless-rotate/
 ├── README.md
 ├── LICENSE
-├── heic_rotate.py
-└── heic_rotate_tests/
+├── pyproject.toml
+├── src/
+│   └── heic_rotate/
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── _version.py
+│       ├── core.py
+│       └── cli.py
+└── tests/
     ├── README-test.md       (this file)
     ├── synth_heic.py
     ├── test_heic_rotate.py
     └── testdata/
 ```
 
-The suite always tests `heic_rotate.py` **one directory up** from wherever
-`test_heic_rotate.py` itself lives - not a local copy - so replacing the
-repo root's `heic_rotate.py` with whatever version you want to test is all
-that's needed; nothing needs to be copied into this folder.
+The suite resolves the `heic_rotate` package via `src/` (inserted onto
+`sys.path`, relative to `test_heic_rotate.py`'s own location) rather than
+importing a flat script - not a local copy, and not requiring the package
+to be pip-installed first. Replacing `src/heic_rotate/`'s contents with
+whatever version you want to test is all that's needed; nothing needs to
+be copied into this folder. Note that the functions the tests call
+(`apply_rotation`, `parse_iloc`, etc.) live in `heic_rotate.core`
+specifically, and `build_parser`/`main` in `heic_rotate.cli` - not in
+`heic_rotate` itself, which only exposes `__version__`.
 
 ## Running it
 
@@ -36,12 +48,12 @@ or simply:
 python3 test_heic_rotate.py
 ```
 
-Both work from any working directory, since the suite locates
-`heic_rotate.py` relative to its own file location rather than the
+Both work from any working directory, since the suite locates the
+`heic_rotate` package relative to its own file location rather than the
 current directory.
 
 No third-party dependencies - stdlib only (`unittest`, `subprocess`),
-same as `heic_rotate.py` itself. Requires Python 3.
+same as heic-lossless-rotate itself. Requires Python 3.
 
 ## What's in here
 
@@ -129,7 +141,9 @@ same as `heic_rotate.py` itself. Requires Python 3.
    own explicit test rather than an accidental side effect of the old
    format.
 
-3. **CLI-level tests** (`TestCLI`, via `subprocess`) - argument ordering
+3. **CLI-level tests** (`TestCLI`, via `subprocess`, running the CLI as
+   `python -m heic_rotate` with `PYTHONPATH` pointed at `src/` - works
+   whether or not the package is pip-installed) - argument ordering
    (`-q`/`--dry-run`/`-f` before vs after the subcommand), the implicit
    `rotate` shorthand (bare `0`/`90`/`180`/`270` as the first argument),
    no-args showing full help, `-V`/`--version` reporting the script and

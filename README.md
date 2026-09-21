@@ -38,8 +38,8 @@ chmod +x heic-lossless-rotate.pyz
 ./heic-lossless-rotate.pyz -V
 ```
 
-**Option 2 — install from GitHub with pip**, to get the `heic-lossless-rotate`
-and `heic-rotate` commands on your PATH:
+**Option 2 — install from GitHub with pip**, to get the CLI commands on
+your PATH (see [Usage](#usage) below for which command name to use):
 
 ```bash
 pip install git+https://github.com/olegoz/heic-lossless-rotate.git
@@ -51,17 +51,28 @@ published yet — for now, use one of the two options above.*
 ## Usage
 
 ```
-heic-lossless-rotate rotate <0|90|180|270> <input.heic> [output.heic] [-f]
-heic-lossless-rotate reverse <input.heic> [output.heic] [-f]
-heic-lossless-rotate info <input.heic>
-heic-lossless-rotate -V | --version
+heic-rotate rotate <0|90|180|270> <input.heic> [output.heic] [-f]
+heic-rotate reverse <input.heic> [output.heic] [-f]
+heic-rotate info <input.heic>
+heic-rotate -V | --version
 ```
 
-(A shorter `heic-rotate` alias installs alongside the full command name —
-the two are identical, just pick whichever you prefer to type. If you're
-running the standalone `.pyz` instead, substitute
-`./heic-lossless-rotate.pyz` for `heic-lossless-rotate` in every example
-below.)
+**Which command to actually type depends on how you installed it:**
+
+- **Installed with pip** (Option 2 above): both `heic-lossless-rotate`
+  (the full name, matching the package) and the shorter `heic-rotate`
+  are installed on your PATH — they're identical, just two names for the
+  same command. This README uses the short form throughout.
+- **Downloaded as the standalone `.pyz`** (Option 1 above): there's only
+  one file, `heic-lossless-rotate.pyz`, so run it as
+  `./heic-lossless-rotate.pyz` or `python3 heic-lossless-rotate.pyz` —
+  substitute that for `heic-rotate` in every example below. (If you'd
+  rather type the short form, nothing stops you renaming the downloaded
+  file to `heic-rotate.pyz` yourself.)
+
+Regardless of which command you're running, the tool itself always
+identifies as **heic-lossless-rotate** in its own output — e.g. `-V`
+prints `heic-lossless-rotate 1.7.0` even when invoked as `heic-rotate -V`.
 
 (See [Options](#options) below for the full list of flags, including a
 couple of less-common ones not shown here.)
@@ -70,9 +81,9 @@ The `rotate` subcommand name may be omitted: if the first non-option
 argument is exactly `0`, `90`, `180`, or `270`, `rotate` is assumed.
 
 ```bash
-heic-lossless-rotate 90 photo.heic photo_rotated.heic
+heic-rotate 90 photo.heic photo_rotated.heic
 # equivalent to:
-heic-lossless-rotate rotate 90 photo.heic photo_rotated.heic
+heic-rotate rotate 90 photo.heic photo_rotated.heic
 ```
 
 If no output path is given, `rotate` writes to `<input>_rotated.heic` —
@@ -83,7 +94,7 @@ instead of adding `_rotated` (`photo_restored.heic` → `photo.heic`).
 overwrite an existing output file — pass `-f`/`--force` to allow it.
 
 Run with no arguments, or with `-h`, for full help; `-h` also works on each
-subcommand (`heic-lossless-rotate rotate -h`, etc.) for its specific options.
+subcommand (`heic-rotate rotate -h`, etc.) for its specific options.
 
 **Rotation direction:** positive angles rotate **counter-clockwise** —
 `rotate 90` turns the image 90° counter-clockwise. Use `rotate 270` for a
@@ -96,29 +107,29 @@ physically turn a printed photo in your hands.
 
 ```bash
 # Rotate 90° counter-clockwise, writing to a new file
-heic-lossless-rotate rotate 90 IMG_0001.heic IMG_0001_rotated.heic
+heic-rotate rotate 90 IMG_0001.heic IMG_0001_rotated.heic
 
 # Same thing, using the implicit-rotate shorthand
-heic-lossless-rotate 90 IMG_0001.heic IMG_0001_rotated.heic
+heic-rotate 90 IMG_0001.heic IMG_0001_rotated.heic
 
 # Rotate 90° clockwise instead (270° counter-clockwise == 90° clockwise)
-heic-lossless-rotate 270 IMG_0001.heic IMG_0001_rotated.heic
+heic-rotate 270 IMG_0001.heic IMG_0001_rotated.heic
 
 # Preview what would happen without writing anything
-heic-lossless-rotate --dry-run 180 IMG_0001.heic
+heic-rotate --dry-run 180 IMG_0001.heic
 
 # Check whether/how this tool has previously touched a file
-heic-lossless-rotate info IMG_0001_rotated.heic
+heic-rotate info IMG_0001_rotated.heic
 
 # Bring an old file's metadata up to date (e.g. add version tracking to
 # a file rotated by an older release) without changing how it displays
-heic-lossless-rotate 0 IMG_0001_rotated.heic IMG_0001_updated.heic
+heic-rotate 0 IMG_0001_rotated.heic IMG_0001_updated.heic
 
 # Undo every edit this tool has made, restoring the exact original bytes
-heic-lossless-rotate reverse IMG_0001_rotated.heic IMG_0001_original.heic
+heic-rotate reverse IMG_0001_rotated.heic IMG_0001_original.heic
 
 # Overwrite an existing output file
-heic-lossless-rotate 90 IMG_0001.heic IMG_0001_rotated.heic --force
+heic-rotate 90 IMG_0001.heic IMG_0001_rotated.heic --force
 ```
 
 ## Disclaimer
@@ -217,7 +228,7 @@ not this final one.
 tool* has added to a file, distinct from the file's absolute current
 orientation (which may include rotation the file already had before you
 ever ran this script on it), plus which tool version most
-recently updated the file, e.g. `Rotated with heic_rotate.py v1.7.0,
+recently updated the file, e.g. `Rotated with heic-lossless-rotate v1.7.0,
 provenance format v2.` (omitted for files rotated before version
 tracking was added).
 

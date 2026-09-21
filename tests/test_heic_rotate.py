@@ -747,7 +747,7 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         rc2, out2, err2 = run_cli('info', out_path)
         self.assertEqual(rc2, 1, err2)
-        self.assertIn(f"heic_rotate.py v{hr.VERSION}, provenance format", out2)
+        self.assertIn(f"heic-lossless-rotate v{hr.VERSION}, provenance format", out2)
 
     def test_reverse_force_overwrites_and_ignore_tamper_check_is_separate(self):
         # -f/--force on `reverse` now means "overwrite the output file",

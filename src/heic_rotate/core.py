@@ -65,6 +65,14 @@ def _version_tuple():
 # Deterministic, tool-specific UUID identifying our private provenance box.
 # (uuid5 over a fixed namespace+name so it's reproducible from source, not
 # just a random constant someone could collide with by chance.)
+#
+# The literal string 'heic_rotate.py' below is FROZEN, not a stale rename
+# target: it's a magic seed baked into the UUID of every provenance box
+# ever written by any past version of this tool. Changing it would produce
+# a different UUID, meaning this (or any future) version would no longer
+# recognize files already stamped by heic-lossless-rotate as its own -
+# silently treating already-edited files as untouched. Must never change,
+# regardless of any product rename, past or future.
 PROVENANCE_UUID = uuid_mod.uuid5(uuid_mod.NAMESPACE_URL,
                                   'urn:heic_rotate.py:provenance:v1').bytes
 
@@ -512,7 +520,7 @@ def parse_provenance(data, hdr):
     if version > FORMAT_VERSION:
         raise ProvenanceError(
             f"provenance box format version {version} is newer than this "
-            f"script understands (max {FORMAT_VERSION}) - update heic_rotate.py")
+            f"script understands (max {FORMAT_VERSION}) - update heic-lossless-rotate")
     entry_count = data[pos]; pos += 1
     entries = {}
     for _ in range(entry_count):
@@ -636,7 +644,7 @@ def get_current_rotation(data):
     """Read the CURRENTLY-applied rotation (0-3 quarter turns) from the
     primary item's live 'irot' property, or 0 if it has none. This is
     the file's actual present state - it includes any rotation the file
-    already had before heic_rotate.py ever touched it, if any."""
+    already had before heic-lossless-rotate ever touched it, if any."""
     info = locate_structures(data)
     iprp_hdr = info['iprp_hdr']
     return _rotation_from_iprp_range(data, iprp_hdr[2], iprp_hdr[3],
@@ -647,7 +655,7 @@ def get_rotation_from_iprp_snapshot(iprp_box_bytes, primary_item_id):
     """Same lookup, but against a standalone saved 'iprp' box snapshot
     (as stored in a provenance record's OPRP entry: 8-byte box header +
     content), rather than a live file. Used to recover what the rotation
-    was at the time heic_rotate.py first touched the file."""
+    was at the time heic-lossless-rotate first touched the file."""
     return _rotation_from_iprp_range(iprp_box_bytes, 8, len(iprp_box_bytes),
                                       primary_item_id)
 
@@ -728,7 +736,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         _, existing_provenance = parse_provenance(data, struct_info['provenance_hdr'])
         if verbose:
             print("[info] existing provenance record found - this file has "
-                  "been edited by heic_rotate.py before; preserving its "
+                  "been edited by heic-lossless-rotate before; preserving its "
                   "saved original snapshot")
 
     # Pristine snapshots we may need to save (only on the FIRST ever edit).
@@ -949,7 +957,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         # PCRC: crc32 of the truly original file (no provenance box existed yet)
         entries[b'PCRC'] = struct.pack('>I', zlib.crc32(data) & 0xffffffff)
 
-    # TVER: the heic_rotate.py version performing THIS update, whose
+    # TVER: the heic-lossless-rotate version performing THIS update, whose
     # reversibility is about to be self-checked below (in _run()) before
     # anything is written. Always the CURRENTLY RUNNING tool's version,
     # regardless of what wrote the entries above - a "who last updated
@@ -969,7 +977,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     #     change, never the box's overall size) - no iloc patching needed.
     #   - old_prov_size != new_prov_size (both nonzero): a one-time
     #     migration - e.g. an on-disk record written by an older
-    #     heic_rotate.py that predates an entry tag this version adds
+    #     heic-lossless-rotate that predates an entry tag this version adds
     #     (such as TVER itself, the first time a pre-1.6.0-edited file is
     #     rotated again by 1.6.0+) is being resized to fit the new set.
     info_now = locate_structures(bytes(out))
@@ -1048,7 +1056,7 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
     prov_hdr = info['provenance_hdr']
     if prov_hdr is None:
         raise ProvenanceError(
-            "no heic_rotate.py provenance record found in this file - "
+            "no heic-lossless-rotate provenance record found in this file - "
             "either it was never edited by this tool, or the record was "
             "stripped by something else. Cannot reverse.")
 
@@ -1058,14 +1066,14 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
         raise ProvenanceError(
             f"provenance record is format version {version}; this script "
             f"only knows how to reverse version(s) {supported}. Use a "
-            f"matching version of heic_rotate.py.")
+            f"matching version of heic-lossless-rotate.")
 
     prov_start, _, _, prov_end, _ = prov_hdr
     current_ccrc = zlib.crc32(data[:prov_start] + data[prov_end:]) & 0xffffffff
     stored_ccrc = struct.unpack('>I', entries[b'CCRC'])[0]
     if current_ccrc != stored_ccrc:
         msg = (f"file appears to have been modified by something else since "
-               f"the last heic_rotate.py edit (CRC32 mismatch: file is "
+               f"the last heic-lossless-rotate edit (CRC32 mismatch: file is "
                f"{current_ccrc:#010x}, provenance expects {stored_ccrc:#010x}). "
                f"Reversing now could silently clobber those other changes.")
         if not ignore_tamper:
@@ -1082,7 +1090,7 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
     #   v2 (OIRT): only the 'irot' property itself was saved. FAST PATH
     #     (OIRT length 1) just needs that one byte put back - iprp's
     #     structure/size never changed. SLOW PATH (OIRT length 0) needs
-    #     the property heic_rotate.py inserted removed again - always
+    #     the property heic-lossless-rotate inserted removed again - always
     #     the LAST child of 'ipco', with an association entry always
     #     appended as the LAST entry in the primary item's 'ipma' list
     #     (see apply_rotation's slow path) - so no index bookkeeping
@@ -1141,10 +1149,10 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
                       f"({oirt[0]}) at offset {irot_pos}")
         elif len(oirt) == 0:
             # SLOW PATH: no 'irot' property existed originally - strip
-            # out exactly the one heic_rotate.py inserted.
+            # out exactly the one heic-lossless-rotate inserted.
             if not ipco_children or ipco_children[-1][4] != b'irot':
                 raise ProvenanceError(
-                    "OIRT indicates heic_rotate.py appended an 'irot' "
+                    "OIRT indicates heic-lossless-rotate appended an 'irot' "
                     "property as the last 'ipco' child, but that's not "
                     "what's there now - cannot safely reverse (file may "
                     "have been modified by something else since)")
@@ -1258,7 +1266,7 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
 # ---------------------------------------------------------------------------
 
 def gather_info(data):
-    """Read-only summary of heic_rotate.py provenance state and the file's
+    """Read-only summary of heic-lossless-rotate provenance state and the file's
     live rotation. Does none of the "heavy" work reverse/rotate do (no
     byte-level reconstruction, no final CRC-of-reconstructed-file check) -
     just parses what's already sitting in the file.
@@ -1270,9 +1278,9 @@ def gather_info(data):
                                 it, if any)
       has_provenance         : bool
       original_quarter_turns : 0-3, what the rotation was at the time
-                                heic_rotate.py FIRST touched the file
+                                heic-lossless-rotate FIRST touched the file
                                 (if has_provenance)
-      delta_quarter_turns    : 0-3, how much heic_rotate.py has added on
+      delta_quarter_turns    : 0-3, how much heic-lossless-rotate has added on
                                 top of that original, cumulatively across
                                 every edit since (if has_provenance) -
                                 THIS is the number that answers "what did
@@ -1282,7 +1290,7 @@ def gather_info(data):
       version                : provenance format version (if has_provenance)
       version_supported      : bool - False if newer than FORMAT_VERSION
       tool_version            : (major, minor, patch) tuple - the
-                                 heic_rotate.py version that most
+                                 heic-lossless-rotate version that most
                                  recently UPDATED (rotated) the file (if
                                  present; absent on records written before
                                  this field existed)
@@ -1351,7 +1359,7 @@ def format_info(result, quiet=False):
     current_degrees = current_qt * 90
 
     if not result['has_provenance']:
-        text = (f"Not rotated with heic_rotate.py (no provenance record "
+        text = (f"Not rotated with heic-lossless-rotate (no provenance record "
                 f"found).")
         if current_qt != 0:
             text += (f"\nNote: the file currently has its own 'irot' value "
@@ -1359,7 +1367,7 @@ def format_info(result, quiet=False):
                       f"something this tool did).")
         return (None if quiet else text), 0
 
-    # Once a provenance record exists, what heic_rotate.py itself did is
+    # Once a provenance record exists, what heic-lossless-rotate itself did is
     # the delta between the rotation it found on first touching the file
     # and the rotation live in the file now - NOT the absolute current
     # value, which may also include rotation the file already had before
@@ -1374,13 +1382,13 @@ def format_info(result, quiet=False):
     tool_version = result.get('tool_version')
     tool_version_str = (f" v{tool_version[0]}.{tool_version[1]}.{tool_version[2]}"
                          if tool_version is not None else "")
-    lines = [f"Rotated with heic_rotate.py{tool_version_str}, "
+    lines = [f"Rotated with heic-lossless-rotate{tool_version_str}, "
              f"provenance format v{result['version']}"
              + ("" if result['version_supported'] else
                 f" (NEWER than this script's v{FORMAT_VERSION} - shown info "
                 f"may be incomplete)") + "."]
     if delta_degrees is not None:
-        lines.append(f"  heic_rotate.py has added: {delta_degrees} deg")
+        lines.append(f"  heic-lossless-rotate has added: {delta_degrees} deg")
         lines.append(f"  file's rotation: {original_degrees} deg originally "
                       f"-> {current_degrees} deg now")
     else:
@@ -1400,7 +1408,7 @@ def format_info(result, quiet=False):
         lines.append(f"  also recorded: {', '.join(extras)}")
     text = '\n'.join(lines)
 
-    # exit code: 0 is reserved EXCLUSIVELY for "no heic_rotate.py provenance
+    # exit code: 0 is reserved EXCLUSIVELY for "no heic-lossless-rotate provenance
     # record" (the branch above, which already returned). Once a provenance
     # record exists, the file has been through this tool and we always
     # report a distinct, non-zero code based on what THIS TOOL added:
