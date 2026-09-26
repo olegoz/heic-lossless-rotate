@@ -62,7 +62,8 @@ the tag — `release.yml` will redo it in a clean environment regardless.
       before it ever reaches a server
 - [ ] Spot-check the sdist/wheel contents don't include anything
       unintended: `tar tzf dist/*.tar.gz` / `unzip -l dist/*.whl` — should
-      contain only the `heic_rotate` package (no `tests/`, no `.git`, etc.)
+      contain only the `heic_rotate` package (no `tests/`, no `.git`, etc.
+      — kept out by `MANIFEST.in`)
 - [ ] Build the standalone zipapp and smoke-test it runs with no install
       step at all:
       ```
@@ -72,17 +73,31 @@ the tag — `release.yml` will redo it in a clean environment regardless.
       ./dist/heic-lossless-rotate.pyz -V
       ```
 
-## 3. Dry run on TestPyPI
+## 3. Verify the built package actually works
+
+Pick whichever fits where you are — Option A needs no PyPI account at all
+and is what a GitHub-only release like this one uses; Option B is the
+fuller pre-publish check for whenever a release is actually going to
+PyPI.
+
+**Option A — local install from `dist/`, no PyPI involved:**
+
+- [ ] In a throwaway venv:
+      `pip install dist/heic_lossless_rotate-X.Y.Z-py3-none-any.whl`
+- [ ] Run both entry points and confirm the version matches:
+      `heic-lossless-rotate -V` and `heic-rotate -V`
+- [ ] Run at least one real `rotate` / `reverse` / `info` cycle against a
+      real test file through the installed command, not just `-V`
+
+**Option B — TestPyPI dry run**, once actually publishing to PyPI
+(requires step 0's TestPyPI account):
 
 - [ ] `twine upload --repository testpypi dist/*.whl dist/*.tar.gz`
       (the `.pyz` is a GitHub Release asset, not a PyPI upload — leave it
       out of this command)
 - [ ] In a throwaway venv:
       `pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ heic-lossless-rotate`
-- [ ] Run both entry points and confirm the version matches:
-      `heic-lossless-rotate -V` and `heic-rotate -V`
-- [ ] Run at least one real `rotate` / `reverse` / `info` cycle against a
-      real test file through the installed command, not just `-V`
+- [ ] Same entry-point and real-file checks as Option A
 - [ ] Confirm the rendered project page looks right at
       <https://test.pypi.org/project/heic-lossless-rotate/>
 
