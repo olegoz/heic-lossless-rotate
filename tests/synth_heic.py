@@ -25,7 +25,8 @@ def _fullbox(boxtype: bytes, version: int, flags: int, content: bytes) -> bytes:
 
 def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAKE_PIXEL_DATA' * 20,
                           include_irot: bool = False, irot_value: int = 0,
-                          include_exif: bool = False, exif_orientation: int = 1) -> bytes:
+                          include_exif: bool = False, exif_orientation: int = 1,
+                          exif_position: str = 'end', extra_mdat: bool = False) -> bytes:
     """Build a minimal, single-image synthetic HEIC file.
 
     layout: 'mdat_first' (ftyp, mdat, meta) or 'meta_first' (ftyp, meta, mdat)
@@ -38,6 +39,25 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
                   Orientation tag, stored via an absolute offset inside mdat
                   (construction_method 0), same as the real Samsung files
                   this project was built against.
+    exif_position: where the Exif blob sits inside mdat's content, relative
+                  to the main item's own payload bytes. 'end' (default,
+                  unchanged from before this parameter existed) places it
+                  immediately after the payload, i.e. at the tail end of
+                  mdat. 'middle' places it after the payload too, but pads
+                  additional bytes after it (equal to its own length) so
+                  the Exif item's absolute offset lands strictly inside
+                  mdat's content with real bytes on both sides - not at
+                  either edge. Real encoders are free to place item
+                  extents anywhere, so a fixture that always puts the
+                  Exif blob at a convenient edge risks never exercising
+                  an offset-computation bug that only shows up mid-stream.
+    extra_mdat: if True, adds a second, unreferenced top-level 'mdat' box
+                  (placeholder content, no iloc extent points into it)
+                  immediately after the real one, regardless of layout.
+                  The format technically permits more than one top-level
+                  'mdat' box (rare in practice, but legal per ISO/IEC
+                  14496-12) - this exercises that a spare, unreferenced
+                  one doesn't confuse anything.
     """
     item_id = 1
     exif_item_id = 2
@@ -56,13 +76,24 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
     )
     exif_blob = struct.pack('>I', 6) + b'Exif\x00\x00' + exif_tiff
 
+    if exif_position not in ('end', 'middle'):
+        raise ValueError(f"unknown exif_position {exif_position!r}")
+
     mdat_content = bytearray(mdat_payload)
     exif_offset_in_mdat = None
     if include_exif:
         exif_offset_in_mdat = len(mdat_content)
         mdat_content += exif_blob
+        if exif_position == 'middle':
+            # Pad with as many bytes as the Exif blob itself, so its
+            # offset sits strictly inside mdat's content (real bytes
+            # before AND after it), not coinciding with mdat's own
+            # final byte the way 'end' always does.
+            mdat_content += b'\x00' * len(exif_blob)
 
     mdat = _box(b'mdat', bytes(mdat_content))
+    extra_mdat_box = _box(b'mdat', b'UNREFERENCED_EXTRA_MDAT_PLACEHOLDER' * 4) \
+        if extra_mdat else b''
 
     # --- meta box children ---
     hdlr = _fullbox(b'hdlr', 0, 0,
@@ -150,6 +181,6 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
         "meta size must not change between placeholder and final offset values"
 
     if layout == 'mdat_first':
-        return ftyp + mdat + meta
+        return ftyp + mdat + extra_mdat_box + meta
     else:
-        return ftyp + meta + mdat
+        return ftyp + meta + mdat + extra_mdat_box

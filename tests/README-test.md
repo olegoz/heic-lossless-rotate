@@ -166,6 +166,52 @@ same as heic-lossless-rotate itself. Requires Python 3.
    outside the repo) rather than a real subdirectory - the suite never
    calls `rmtree` on either directory itself, only clears what's inside.
 
+5. **`mdat` edge cases, scale, and CLI output-path robustness** - covers
+   ground the rest of the suite's small, conveniently-shaped fixtures
+   don't reach:
+   - `TestMdatContentIndependence` - `apply_rotation`/`reverse_rotation`
+     should never branch on `mdat`'s actual payload bytes, only on
+     `iloc`'s own stored numbers and `mdat`'s declared size, since this
+     tool only ever edits container/box bytes and never reads the
+     encoded image data itself. Builds same-length files with different
+     `mdat` content (and, separately, corrupts an already-built file's
+     `mdat` bytes in place) and asserts the resulting box layout and
+     provenance record agree everywhere except the two fields
+     (`PCRC`/`CCRC`) that legitimately depend on `mdat`'s content.
+   - `TestLargeMdatFixtures` - round-trips (including a multi-edit chain)
+     against a multi-MiB payload. The rest of the suite uses tiny
+     (few-hundred-byte) payloads that exercise every code path but would
+     never reveal a bug whose cost or correctness depends on file size.
+   - `TestMdatMidStreamExifPatch` - an embedded legacy Exif Orientation
+     tag whose absolute offset lands inside `mdat`, with real bytes on
+     both sides of it rather than at either edge. The existing exif-sync
+     tests always place that blob at `mdat`'s tail, which would let a
+     mid-stream offset bug slip through unnoticed; `synth_heic.py`'s
+     `exif_position='middle'` fixture covers the case where a real
+     encoder placed it somewhere else instead.
+   - `TestMultipleTopLevelMdatBoxes` - the format technically permits
+     more than one top-level `mdat` box (rare, but legal). Confirms an
+     extra, unreferenced one has zero effect on round-trip correctness
+     and is itself never touched - previously only true by inspection,
+     not tested against an actual fixture with two.
+   - `TestSameFileInputOutput` - `rotate`/`reverse` with an explicit
+     output path equal to the input path (a natural way to ask for "edit
+     this file in place") isn't exercised anywhere else in the suite.
+     It's currently correct only as a side effect of the whole input
+     file being read into memory before any output is written, which
+     makes it an easy property to accidentally break in a future change
+     to the write path - worth pinning down directly.
+   - `TestDryRunSizeReport` - checks `--dry-run`'s reported size and
+     vs-input delta against a real `apply_rotation()` result, since
+     nothing else in the suite verifies those numbers are actually
+     correct rather than just present.
+
+   `synth_heic.py` gained two parameters to support this group:
+   `exif_position` (`'end'`, the previous implicit behavior, or
+   `'middle'`, which pads real bytes after the Exif blob so its offset
+   isn't at `mdat`'s edge) and `extra_mdat` (adds a second, unreferenced
+   top-level `mdat` box after the real one).
+
 ## Adding your own files to `testdata/`
 
 This folder ships empty in the public repo. Drop any `.heic` file into

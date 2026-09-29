@@ -966,5 +966,385 @@ class TestRealFiles(unittest.TestCase):
               file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# 5. mdat edge cases, scale, and CLI output-path robustness
+#
+#    These test observable behavior only (round-trip correctness, byte
+#    independence, CLI output) - none of them assume anything about HOW
+#    mdat is handled internally, so they hold regardless of whether/how
+#    the implementation ever changes.
+# ---------------------------------------------------------------------------
+
+def _structural_fingerprint(data):
+    """A comparable summary of `data`'s box layout and provenance record,
+    excluding mdat's own payload bytes (never included here in the first
+    place - only box headers are captured) and the two CRC fields
+    (PCRC/CCRC), which necessarily depend on mdat's actual content and so
+    are the one legitimate exception to "nothing outside mdat should
+    depend on mdat's bytes". Two files whose fingerprints match are
+    structurally identical in every way that matters for this project's
+    editing logic, regardless of what bytes their mdat payloads hold."""
+    top_level = [(h[0], h[1], h[2], h[3], h[4])
+                 for h in hr.iter_boxes(data, 0, len(data))]
+    info = hr.locate_structures(data)
+    prov_hdr = info['provenance_hdr']
+    prov_fingerprint = None
+    if prov_hdr is not None:
+        version, entries = hr.parse_provenance(data, prov_hdr)
+        prov_fingerprint = (version, {k: v for k, v in entries.items()
+                                       if k not in (b'PCRC', b'CCRC')})
+    return top_level, prov_fingerprint, hr.get_current_rotation(data)
+
+
+class TestMdatContentIndependence(unittest.TestCase):
+    """apply_rotation/reverse_rotation/verify_structure/locate_structures
+    should never branch on mdat's actual payload bytes - only on iloc's
+    own stored offset/length numbers and mdat's declared box size, since
+    this tool never reads or interprets the encoded image data itself
+    (see the module docstring's "Only container/box bytes are ever
+    touched" guarantee). These tests verify that behaviorally: if a
+    future change ever introduced a real dependency on mdat's content -
+    say, a stray read of a payload byte, or a size computed from actual
+    content rather than the declared box size - it would show up here as
+    two otherwise-identical files producing different output."""
+
+    def test_structural_fingerprint_independent_of_mdat_payload_bytes(self):
+        payload_a = b'\x00' * 4096
+        payload_b = bytes((i * 37 + 11) % 256 for i in range(4096))
+        self.assertNotEqual(payload_a, payload_b)  # fixture sanity check
+
+        for layout in ('mdat_first', 'meta_first'):
+            for include_irot in (False, True):
+                with self.subTest(layout=layout, include_irot=include_irot):
+                    original_a = build_synthetic_heic(
+                        layout=layout, include_irot=include_irot,
+                        mdat_payload=payload_a)
+                    original_b = build_synthetic_heic(
+                        layout=layout, include_irot=include_irot,
+                        mdat_payload=payload_b)
+
+                    rotated_a = hr.apply_rotation(original_a, 1, verbose=False)
+                    rotated_b = hr.apply_rotation(original_b, 1, verbose=False)
+                    self.assertEqual(len(rotated_a), len(rotated_b),
+                                      "same-length payloads must produce "
+                                      "same-length output")
+                    self.assertEqual(
+                        _structural_fingerprint(rotated_a),
+                        _structural_fingerprint(rotated_b),
+                        "box layout and provenance record (aside from the "
+                        "CRC fields, which legitimately depend on mdat's "
+                        "content) must be identical regardless of what "
+                        "bytes mdat's payload actually holds")
+
+                    hr.verify_structure(rotated_a)
+                    hr.verify_structure(rotated_b)
+                    self.assertEqual(
+                        hr.reverse_rotation(rotated_a, verbose=False), original_a)
+                    self.assertEqual(
+                        hr.reverse_rotation(rotated_b, verbose=False), original_b)
+
+    def test_mutating_mdat_payload_after_the_fact_does_not_change_edit_decisions(self):
+        """A more direct phrasing of the same invariant: take a file,
+        apply_rotation it, then separately corrupt ONLY mdat's payload
+        bytes (same length) in a fresh copy of the ORIGINAL before
+        rotating that copy too - the two outputs must still agree on
+        every non-CRC structural fact, exactly as above. This variant
+        also covers the include_exif=False, extra_mdat=False default
+        fixture directly, as a minimal reproduction independent of the
+        more elaborate subTest matrix above."""
+        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
+        tampered = bytearray(original)
+        info = hr.locate_structures(bytes(tampered))
+        mdat_hdr = next(h for h in hr.iter_boxes(bytes(tampered), 0, len(tampered))
+                         if h[4] == b'mdat')
+        for i in range(mdat_hdr[2], mdat_hdr[3]):
+            tampered[i] ^= 0xFF
+        tampered = bytes(tampered)
+        self.assertNotEqual(tampered, original)  # fixture sanity check
+
+        rotated_orig = hr.apply_rotation(original, 1, verbose=False)
+        rotated_tampered = hr.apply_rotation(tampered, 1, verbose=False)
+        self.assertEqual(_structural_fingerprint(rotated_orig),
+                          _structural_fingerprint(rotated_tampered))
+        self.assertEqual(
+            hr.reverse_rotation(rotated_orig, verbose=False), original)
+        self.assertEqual(
+            hr.reverse_rotation(rotated_tampered, verbose=False), tampered)
+
+
+class TestLargeMdatFixtures(unittest.TestCase):
+    """Round-trips against a payload big enough (a few MiB) to actually
+    exercise size-dependent behavior - the rest of the synthetic tests
+    all use tiny (few-hundred-byte) payloads, which happen to exercise
+    every code path but would never reveal a bug whose cost or
+    correctness depends on file size (e.g. an accidental O(N^2) slice,
+    an off-by-one that only shows up once an offset exceeds 16 bits, or
+    a real-world multi-image HEIF with a large embedded thumbnail/depth
+    map). Kept to a single representative layout/path/exif combination
+    per size tier - the full box-layout x fast/slow-path x exif-sync
+    matrix is already covered at small size by TestSyntheticRoundTrips;
+    this class exists to add SIZE as a covered dimension, not to repeat
+    that matrix at multi-MB scale, which would make the suite needlessly
+    slow for the same coverage."""
+
+    LARGE_SIZE = 2 * 1024 * 1024  # 2 MiB - enough to be meaningfully
+                                   # "large" without making the suite slow
+
+    def test_round_trip_with_large_payload(self):
+        for layout in ('mdat_first', 'meta_first'):
+            for include_exif in (False, True):
+                with self.subTest(layout=layout, include_exif=include_exif):
+                    payload = bytes((i % 256) for i in range(self.LARGE_SIZE))
+                    original = build_synthetic_heic(
+                        layout=layout, include_irot=False,
+                        mdat_payload=payload, include_exif=include_exif)
+
+                    rotated = hr.apply_rotation(original, 1, sync_exif=True,
+                                                 verbose=False)
+                    hr.verify_structure(rotated)
+
+                    orig_top = list(hr.iter_boxes(original, 0, len(original)))
+                    rot_top = list(hr.iter_boxes(rotated, 0, len(rotated)))
+                    orig_mdat = next(h for h in orig_top if h[4] == b'mdat')
+                    rot_mdat = next(h for h in rot_top if h[4] == b'mdat')
+                    self.assertEqual(orig_mdat[3] - orig_mdat[2],
+                                      rot_mdat[3] - rot_mdat[2],
+                                      "mdat length must never change")
+                    orig_bytes = original[orig_mdat[0]:orig_mdat[3]]
+                    rot_bytes = rotated[rot_mdat[0]:rot_mdat[3]]
+                    diffs = sum(1 for a, b in zip(orig_bytes, rot_bytes) if a != b)
+                    max_allowed_diffs = 1 if include_exif else 0
+                    self.assertLessEqual(
+                        diffs, max_allowed_diffs,
+                        "the multi-MB payload must come through untouched "
+                        "except for the single Exif-orientation byte, if "
+                        "an embedded Exif item exists")
+
+                    restored = hr.reverse_rotation(rotated, verbose=False)
+                    self.assertEqual(restored, original,
+                                      "reverse must reconstruct the exact "
+                                      "original even at multi-MB size")
+
+    def test_multi_edit_chain_at_large_size(self):
+        """The additive-rotation regression test
+        (TestSyntheticRoundTrips.test_multi_edit_chain_composes_
+        additively) repeated at large size, since the provenance-record
+        migration/resize path it exercises is exactly the kind of code
+        where a subtle offset bug would only surface once mdat is big
+        enough to push absolute file offsets past small, easily-covered
+        values."""
+        payload = bytes((i * 7) % 256 for i in range(self.LARGE_SIZE))
+        original = build_synthetic_heic(layout='meta_first', include_irot=False,
+                                         mdat_payload=payload)
+        step1 = hr.apply_rotation(original, 1, verbose=False)
+        step2 = hr.apply_rotation(step1, 1, verbose=False)
+
+        info = hr.gather_info(step2)
+        self.assertEqual(info['delta_quarter_turns'], 2)
+
+        restored = hr.reverse_rotation(step2, verbose=False)
+        self.assertEqual(restored, original)
+
+
+class TestMdatMidStreamExifPatch(unittest.TestCase):
+    """The embedded legacy Exif Orientation tag can sit at an absolute
+    file offset that lands INSIDE mdat's content, not just adjacent to
+    its edges - real encoders are free to place item extents anywhere.
+    The existing exif-sync tests always place the Exif blob immediately
+    after the main payload (effectively mdat's tail), which never
+    exercises an offset that's genuinely mid-stream, with real payload
+    bytes both before AND after it. synth_heic's exif_position='middle'
+    fixture exists specifically to cover that, since a byte-offset bug
+    in find_exif_orientation_field()/find_exif_item_location() could
+    easily go unnoticed if every test fixture happens to put the tag at
+    a convenient edge."""
+
+    def test_exif_offset_lands_strictly_inside_mdat(self):
+        """Fixture sanity check: confirms exif_position='middle' actually
+        produces an offset that is neither 0 nor at mdat's final byte,
+        for a large payload - i.e. that this test class is exercising a
+        genuinely different geometry than the existing 'end'-position
+        tests, not accidentally the same case under a new name."""
+        for layout in ('mdat_first', 'meta_first'):
+            with self.subTest(layout=layout):
+                original = build_synthetic_heic(
+                    layout=layout, include_irot=False, include_exif=True,
+                    exif_position='middle',
+                    mdat_payload=bytes(range(256)) * 4096)  # 1 MiB
+                info = hr.locate_structures(original)
+                loc = hr.find_exif_item_location(
+                    original, info['meta_body_start'], info['meta_hdr'][3])
+                self.assertIsNotNone(loc)
+                _, abs_start, length = loc
+                top = list(hr.iter_boxes(original, 0, len(original)))
+                mdat_hdr = next(h for h in top if h[4] == b'mdat')
+                offset_in_mdat = abs_start - mdat_hdr[2]
+                self.assertGreater(offset_in_mdat, 0,
+                                    "Exif blob must not sit at mdat's very start")
+                self.assertLess(offset_in_mdat + length, mdat_hdr[3] - mdat_hdr[2],
+                                 "Exif blob must not sit at mdat's very end - "
+                                 "real bytes must follow it too")
+
+    def test_round_trip_and_sync_with_mid_stream_exif(self):
+        for layout in ('mdat_first', 'meta_first'):
+            for target_irot in (0, 1, 2, 3):
+                with self.subTest(layout=layout, target_irot=target_irot):
+                    original = build_synthetic_heic(
+                        layout=layout, include_irot=False, include_exif=True,
+                        exif_position='middle', exif_orientation=1,
+                        mdat_payload=bytes(range(256)) * 4096)
+
+                    rotated = hr.apply_rotation(original, target_irot,
+                                                 sync_exif=True, verbose=False)
+                    hr.verify_structure(rotated)
+                    self.assertEqual(hr.get_current_rotation(rotated), target_irot)
+
+                    info = hr.locate_structures(rotated)
+                    field = hr.find_exif_orientation_field(
+                        rotated, info['meta_body_start'], info['meta_hdr'][3])
+                    self.assertIsNotNone(field)
+                    expected_exif = {0: 1, 1: 8, 2: 3, 3: 6}[target_irot]
+                    self.assertEqual(
+                        field[2], expected_exif,
+                        "the mid-stream Exif Orientation field must still be "
+                        "found and correctly synced when it's nowhere near "
+                        "either edge of mdat")
+
+                    restored = hr.reverse_rotation(rotated, verbose=False)
+                    self.assertEqual(restored, original)
+
+
+class TestMultipleTopLevelMdatBoxes(unittest.TestCase):
+    """The format technically permits more than one top-level 'mdat' box
+    (rare, but not disallowed by ISO/IEC 14496-12). core.py doesn't look
+    up 'mdat' by box type or assume there's exactly one anywhere in its
+    logic, so an unreferenced second 'mdat' box should have zero effect
+    on correctness - previously only true by inspection, never actually
+    tested against a fixture with two."""
+
+    def test_round_trip_unaffected_by_extra_unreferenced_mdat(self):
+        for layout in ('mdat_first', 'meta_first'):
+            with self.subTest(layout=layout):
+                original = build_synthetic_heic(
+                    layout=layout, include_irot=False, extra_mdat=True)
+
+                top = list(hr.iter_boxes(original, 0, len(original)))
+                mdat_count = sum(1 for h in top if h[4] == b'mdat')
+                self.assertEqual(mdat_count, 2,
+                                  "fixture sanity check: two top-level "
+                                  "'mdat' boxes must actually be present")
+
+                rotated = hr.apply_rotation(original, 1, verbose=False)
+                hr.verify_structure(rotated)
+                restored = hr.reverse_rotation(rotated, verbose=False)
+                self.assertEqual(restored, original,
+                                  "an extra, unreferenced 'mdat' box must "
+                                  "not affect round-trip correctness at all")
+
+    def test_extra_mdat_content_is_never_touched(self):
+        original = build_synthetic_heic(
+            layout='mdat_first', include_irot=False, extra_mdat=True)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+
+        def mdat_boxes(data):
+            return [h for h in hr.iter_boxes(data, 0, len(data)) if h[4] == b'mdat']
+
+        orig_mdats = mdat_boxes(original)
+        rot_mdats = mdat_boxes(rotated)
+        self.assertEqual(len(orig_mdats), len(rot_mdats), 2)
+        # The second 'mdat' (the unreferenced one) must be completely
+        # unchanged, position and content both - only the first one is
+        # ever referenced by iloc, so only it is even eligible to be
+        # touched (and isn't here either, per TestMdatContentIndependence).
+        orig_extra = original[orig_mdats[1][0]:orig_mdats[1][3]]
+        rot_extra = rotated[rot_mdats[1][0]:rot_mdats[1][3]]
+        self.assertEqual(orig_extra, rot_extra)
+
+
+class TestSameFileInputOutput(unittest.TestCase):
+    """`rotate`/`reverse` with an explicit output path equal to the input
+    path (a natural way to ask for "rotate this file in place") isn't
+    exercised anywhere else in the suite. cli.py never checks for this
+    case explicitly, so it's only correct as a side effect of main()
+    reading the entire input file into memory before _run() computes the
+    full output and only THEN opens out_path for writing - overwriting
+    the input file at that point can't corrupt anything still being
+    read, since nothing is still being read by then. That's a real but
+    easy-to-break property (any future change to the write path that
+    starts reading from the input file later, e.g. for a second pass or
+    incremental processing, could silently corrupt this exact scenario),
+    so it's worth pinning down directly as its own regression test."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, 'photo.heic')
+        with open(self.path, 'wb') as f:
+            f.write(build_synthetic_heic(layout='meta_first', include_irot=False))
+        with open(self.path, 'rb') as f:
+            self.original = f.read()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_rotate_with_output_equal_to_input(self):
+        rc, out, err = run_cli('rotate', '90', self.path, self.path, '-f', '-q')
+        self.assertEqual(rc, 0, err)
+        with open(self.path, 'rb') as f:
+            result = f.read()
+        self.assertNotEqual(result, self.original)
+        hr.verify_structure(result)
+        restored = hr.reverse_rotation(result, verbose=False)
+        self.assertEqual(restored, self.original,
+                          "rotating a file onto itself must still produce a "
+                          "fully correct, fully reversible result")
+
+    def test_reverse_with_output_equal_to_input(self):
+        rotated_path = os.path.join(self.tmpdir, 'rotated.heic')
+        rc, _, err = run_cli('rotate', '90', self.path, rotated_path, '-q')
+        self.assertEqual(rc, 0, err)
+
+        rc2, out2, err2 = run_cli('reverse', rotated_path, rotated_path, '-f', '-q')
+        self.assertEqual(rc2, 0, err2)
+        with open(rotated_path, 'rb') as f:
+            result = f.read()
+        self.assertEqual(result, self.original,
+                          "reversing a file onto itself must still "
+                          "reconstruct the exact true original")
+
+
+class TestDryRunSizeReport(unittest.TestCase):
+    """`--dry-run` reports a size and a vs-input delta without writing
+    anything, and that report is the ONLY way to check its accuracy short
+    of removing `--dry-run` and comparing the real output - nothing else
+    in the suite checks these numbers against a real `apply_rotation()`
+    result. Uses a payload large enough (64 KiB) that a wrong size would
+    be an obviously wrong number, not something that could coincidentally
+    match by being off by a byte or two."""
+
+    def test_dry_run_reports_correct_size_and_delta(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            payload = bytes((i % 256) for i in range(64 * 1024))  # 64 KiB
+            input_path = os.path.join(tmpdir, 'input.heic')
+            with open(input_path, 'wb') as f:
+                original = build_synthetic_heic(
+                    layout='mdat_first', include_irot=False, mdat_payload=payload)
+                f.write(original)
+
+            expected_out = hr.apply_rotation(original, 1, verbose=False)
+
+            out_path = os.path.join(tmpdir, 'out.heic')
+            rc, out, err = run_cli('rotate', '90', input_path, out_path, '--dry-run')
+            self.assertEqual(rc, 0, err)
+            self.assertFalse(os.path.exists(out_path))
+
+            expected_size = len(expected_out)
+            expected_delta = len(expected_out) - len(original)
+            self.assertIn(f"{expected_size} bytes", out)
+            self.assertIn(f"{expected_delta:+d}", out)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
