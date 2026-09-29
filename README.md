@@ -2,12 +2,46 @@
 
 Repository: https://github.com/olegoz/heic-lossless-rotate
 
-A Python 3 tool that **losslessly rotates HEIC/HEIF images** — the photo
-format used by default on recent iPhones and many Android phones —
-without re-encoding or losing any quality, and is **fully reversible**
-back to the exact original file, byte for byte.
+A Python 3 tool that **rotates HEIC/HEIF images** — the photo format used
+by default on recent iPhones and many Android phones — **losslessly**, by
+changing a small "which way is up" tag in the file's metadata, instead of
+decoding and re-encoding the image. It is also **fully reversible** back
+to the exact original file, byte for byte.
+
+> **Why "lossless" matters here:** HEIC, like JPEG, is a **lossy**
+> compression format — every time an image is decoded and re-encoded,
+> some image quality is discarded, and that loss compounds with each
+> additional re-save. Rotating losslessly (by editing metadata rather than
+> recompressing) is common for JPEGs — tools like `jpegtran` and ExifTool
+> have done it for years. Equivalent tooling for HEIC is much harder to
+> find, which is the gap this tool fills: it only ever flips the metadata
+> tag, so no re-encoding — and no quality loss — happens, no matter how
+> many times you rotate.
 
 No third-party dependencies. Python 3 standard library only.
+
+## Table of contents
+
+- [What it does](#what-it-does)
+- [Requirements](#requirements)
+- [Installation](#installation)
+  - [Option 1: download and run, no install step at all](#option-1-download-and-run-no-install-step-at-all)
+  - [Option 2: install with pip](#option-2-install-with-pip)
+- [Usage](#usage)
+  - [Examples](#examples)
+- [Disclaimer](#disclaimer)
+- [Why this exists](#why-this-exists)
+- [How each command works](#how-each-command-works)
+  - [`rotate`](#rotate)
+  - [`reverse`](#reverse)
+  - [`info`](#info)
+- [How rotation values map to the container format](#how-rotation-values-map-to-the-container-format)
+- [Options](#options)
+- [Exit codes](#exit-codes)
+- [Known limitations](#known-limitations)
+- [Development install](#development-install)
+- [Testing](#testing)
+- [License](#license)
 
 ## What it does
 
@@ -28,9 +62,19 @@ No third-party dependencies. Python 3 standard library only.
 
 ## Installation
 
-**Option 1 — just download and run, no install step at all.** A single
-self-contained file, a few hundred KB, that runs with nothing but Python
-itself:
+### Option 1: download and run, no install step at all
+
+A single self-contained file, a few hundred KB, that runs with nothing
+but Python itself. Simplest approach: open the
+[releases page](https://github.com/olegoz/heic-lossless-rotate/releases/latest)
+in a browser, download `heic-lossless-rotate.pyz`, and save (or rename)
+it wherever you'd like to run it from. On macOS/Linux, make it executable
+first — `chmod +x heic-lossless-rotate.pyz` (or via your file manager's
+"Properties"/"Get Info" permissions).
+
+If you'd rather do it from the command line instead:
+
+**macOS / Linux:**
 
 ```bash
 curl -LO https://github.com/olegoz/heic-lossless-rotate/releases/latest/download/heic-lossless-rotate.pyz
@@ -38,15 +82,142 @@ chmod +x heic-lossless-rotate.pyz
 ./heic-lossless-rotate.pyz -V
 ```
 
-**Option 2 — install from GitHub with pip**, to get the CLI commands on
-your PATH (see [Usage](#usage) below for which command name to use):
+**Windows (PowerShell):**
+
+```powershell
+Invoke-WebRequest -Uri https://github.com/olegoz/heic-lossless-rotate/releases/latest/download/heic-lossless-rotate.pyz -OutFile heic-lossless-rotate.pyz
+python heic-lossless-rotate.pyz -V
+```
+
+Windows has no `chmod`/execute-bit concept, and there's no default file
+association that lets you double-click or `./`-run a `.pyz` the way
+macOS/Linux can — Windows doesn't know to hand it to Python. So on
+Windows, always invoke it explicitly as `python heic-lossless-rotate.pyz
+...` (or `py heic-lossless-rotate.pyz ...`, depending on how Python was
+installed).
+
+### Option 2: install with pip
+
+This gets the CLI commands on your PATH under a proper name (see
+[Usage](#usage) below for which command name to
+use). Since this isn't on PyPI yet, you're installing straight from
+GitHub.
+
+What happens when you run `pip install` depends on your OS — pick the
+section below that matches:
+
+**Windows, using the official python.org installer:** a plain
+`pip install` normally just works, no virtual environment required:
 
 ```bash
 pip install git+https://github.com/olegoz/heic-lossless-rotate.git
 ```
 
+The launcher files (`heic-lossless-rotate.exe` and `heic-rotate.exe`) land
+inside that Python installation's `Scripts` folder — for the default
+"install for me only" option, that's typically
+`%LOCALAPPDATA%\Programs\Python\Python3xx\Scripts\`. If you checked **"Add
+python.exe to PATH"** during setup, that folder is already on PATH and the
+commands work immediately in a new terminal. If you didn't check it, your
+options are: re-run the installer and check it, add that `Scripts` folder
+to PATH yourself, or use pipx (see below), which takes care of PATH for
+you. If the plain command above fails with a permissions error instead
+(uncommon, but possible with an "install for all users" setup), add
+`--user` and try again — that installs to `%APPDATA%\Python\Python3xx\Scripts\`
+instead, which is always writable by your own account.
+
+**macOS:** which route applies depends on how you got Python —
+
+- *Official python.org installer:* a plain `pip install` normally just
+  works, no virtual environment required:
+
+  ```bash
+  pip install git+https://github.com/olegoz/heic-lossless-rotate.git
+  ```
+
+  The launcher files land in that installation's `bin` folder — typically
+  `/Library/Frameworks/Python.framework/Versions/3.x/bin/`. The installer
+  adds this folder to your shell's `PATH` itself (it edits your shell
+  profile during setup), so the commands should work right away in a new
+  terminal.
+
+- *Python from Homebrew* (`brew install python`), which is just as common
+  on macOS: Homebrew's Python is externally managed, the same as the
+  Linux case below — a plain `pip install` outside a virtual environment
+  is refused with an `error: externally-managed-environment` message.
+  pipx is the easiest fix and is itself installable via Homebrew:
+
+  ```bash
+  brew install pipx
+  pipx ensurepath          # adds ~/.local/bin to your PATH if it isn't already
+  pipx install git+https://github.com/olegoz/heic-lossless-rotate.git
+  ```
+
+  This puts the launcher files, `heic-lossless-rotate` and `heic-rotate`,
+  in `~/.local/bin/`. If `pipx ensurepath` changed your PATH, open a new
+  terminal before the commands will be found. The venv and
+  `--user --break-system-packages` alternatives under Linux below work
+  here too, with `~/.venvs/...` and `~/.local/bin` in the same place they'd
+  be on Linux.
+
+**Linux, where the system Python manages its own packages** (Ubuntu
+23.04+, Debian 12+, and others following
+[PEP 668](https://peps.python.org/pep-0668/)): the system-wide Python
+refuses a plain `pip install` outside of a virtual environment, to avoid
+clashing with OS-managed packages — you'll see an
+`error: externally-managed-environment` message if you try it. Pick
+whichever of the following fits how you use Python:
+
+- **Don't otherwise use Python / just want the command to work (recommended
+  for most people):** use [pipx](https://pipx.pypa.io/), which handles the
+  isolation for you:
+
+  ```bash
+  sudo apt install pipx    # if you don't already have it (Ubuntu/Debian)
+  pipx ensurepath          # adds ~/.local/bin to your PATH if it isn't already
+  pipx install git+https://github.com/olegoz/heic-lossless-rotate.git
+  ```
+
+  This creates an isolated environment under
+  `~/.local/pipx/venvs/heic-lossless-rotate/`, and adds two launcher files,
+  `heic-lossless-rotate` and `heic-rotate`, to `~/.local/bin/`. If
+  `pipx ensurepath` reports it changed your PATH, open a new terminal (or
+  log out and back in) before the commands will be found.
+
+- **Comfortable with virtual environments:**
+
+  ```bash
+  python3 -m venv ~/.venvs/heic-rotate
+  source ~/.venvs/heic-rotate/bin/activate
+  pip install git+https://github.com/olegoz/heic-lossless-rotate.git
+  ```
+
+  The launcher files land in `~/.venvs/heic-rotate/bin/` and are only on
+  your PATH while that environment is activated (re-run the `source` line
+  in any new terminal you want to use them from).
+
+- **Want a one-line install without pipx or a venv, and are OK overriding
+  the OS's protection for your own user account:**
+
+  ```bash
+  pip install --user --break-system-packages git+https://github.com/olegoz/heic-lossless-rotate.git
+  ```
+
+  This installs the package itself under
+  `~/.local/lib/python3.<X>/site-packages/`, and puts the two launcher
+  files in `~/.local/bin/`. Nothing is written outside your home
+  directory, and no `sudo`/root install is needed or recommended. If
+  `~/.local/bin` didn't already exist before this install, it may not yet
+  be on your PATH in the *current* terminal — open a new terminal (Ubuntu
+  adds `~/.local/bin` to PATH automatically for new sessions once the
+  directory exists) if the command isn't found right away.
+
+Whichever route you use, `which heic-rotate` (macOS/Linux) or
+`where heic-rotate` (Windows) afterward will show you exactly which file
+is being run.
+
 *A PyPI release (`pip install heic-lossless-rotate`) is planned but not
-published yet — for now, use one of the two options above.*
+published yet — for now, use Option 1 or one of the routes above.*
 
 ## Usage
 
@@ -64,11 +235,14 @@ heic-rotate -V | --version
   are installed on your PATH — they're identical, just two names for the
   same command. This README uses the short form throughout.
 - **Downloaded as the standalone `.pyz`** (Option 1 above): there's only
-  one file, `heic-lossless-rotate.pyz`, so run it as
-  `./heic-lossless-rotate.pyz` or `python3 heic-lossless-rotate.pyz` —
-  substitute that for `heic-rotate` in every example below. (If you'd
-  rather type the short form, nothing stops you renaming the downloaded
-  file to `heic-rotate.pyz` yourself.)
+  one file, `heic-lossless-rotate.pyz`. On macOS/Linux, run it as
+  `./heic-lossless-rotate.pyz` or `python3 heic-lossless-rotate.pyz`; on
+  Windows, run it as `python heic-lossless-rotate.pyz` (or
+  `py heic-lossless-rotate.pyz`) — `./`-running it directly doesn't work
+  there. Substitute whichever applies for `heic-rotate` in every example
+  below. (If you'd rather type the short form, nothing stops you renaming
+  the downloaded file to `heic-rotate.pyz` yourself — just keep invoking
+  it the same OS-appropriate way.)
 
 Regardless of which command you're running, the tool itself always
 identifies as **heic-lossless-rotate** in its own output — e.g. `-V`
@@ -295,6 +469,30 @@ refused with a clear error rather than silently mis-editing the file:
   being stored via an absolute file offset. If it's stored via `idat` or
   another item's data, the sync is silently skipped — safe, just
   incomplete.
+
+## Development install
+
+If you're contributing or modifying the source rather than just using the
+tool, clone the repo and install it in **editable mode**, from inside a
+virtual environment (see the [Linux pip notes](#installation) above for
+why a venv — the same externally-managed-environment restriction applies
+here):
+
+```bash
+git clone https://github.com/olegoz/heic-lossless-rotate.git
+cd heic-lossless-rotate
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+This points the installed `heic-lossless-rotate`/`heic-rotate` commands
+straight at `src/heic_rotate/`, so changes you make take effect
+immediately — no reinstalling after every edit. (Note: `-U`/`--upgrade`
+isn't needed on a fresh clone like this; it only matters if you re-run
+the same install command later and want pip to notice you've bumped
+something.) This step is optional for just running the test suite below,
+which works directly against `src/` without installing the package first.
 
 ## Testing
 
