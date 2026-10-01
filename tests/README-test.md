@@ -212,6 +212,42 @@ same as heic-lossless-rotate itself. Requires Python 3.
    isn't at `mdat`'s edge) and `extra_mdat` (adds a second, unreferenced
    top-level `mdat` box after the real one).
 
+6. **Correctness of the lighter-weight reversibility check used by
+   `rotate`'s self-check.** `verify_reversible()` computes the same
+   pass/fail determination as `reverse_rotation()` - and the identical
+   underlying CRC32 when both succeed - without allocating a second
+   full-file buffer (see its docstring in `core.py`). Since the
+   post-rotate self-check trusts it exclusively, a bug that made it
+   silently diverge from `reverse_rotation()` would defeat the very
+   thing the self-check exists to catch:
+   - `TestVerifyReversibleMatchesReverseRotation` - cross-checks the two
+     functions directly (not just each in isolation) against every
+     scenario the rest of the suite exercises: every layout/fast-or-
+     slow-path/exif-sync combination, a mid-stream embedded Exif item,
+     a multi-edit chain, multi-MiB payloads, an extra unreferenced
+     `mdat` box, old v1-format records, and several tamper scenarios
+     (including one that lands inside the mid-stream Exif region
+     specifically). Also includes a direct `tracemalloc`-based
+     regression test confirming `verify_reversible()` doesn't allocate
+     memory proportional to file size - the whole reason it exists.
+   - `TestSharedReconstructionCode` - goes a step further than just
+     checking agreement: both functions call the exact same
+     `_prepare_reversal()` and `_iter_reconstructed_chunks()` to produce
+     the reconstructed bytes (the latter is the single piece of code
+     that decides what those bytes are and in what order; each caller
+     only differs in what it does with the resulting chunks -
+     concatenate them into real output, or feed them straight into a
+     CRC32 and discard). Verifies this two ways: a static check that
+     each function's own bytecode references both shared helpers by
+     name, and a dynamic check that wraps `_iter_reconstructed_chunks`
+     to record the literal chunk sequence each function consumes for
+     the same input, confirming they're byte-for-byte identical.
+   - `TestReturnTypeAvoidsExtraCopy` - `apply_rotation()` and
+     `reverse_rotation()` return the `bytearray` they already built
+     rather than wrapping it in `bytes()` first; pinned directly since
+     nothing else would fail if that copy were silently reintroduced
+     (bytes and bytearray compare equal).
+
 ## Adding your own files to `testdata/`
 
 This folder ships empty in the public repo. Drop any `.heic` file into

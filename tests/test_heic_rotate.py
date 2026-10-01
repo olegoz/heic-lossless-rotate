@@ -415,6 +415,292 @@ class TestSyntheticRoundTrips(unittest.TestCase):
             hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
 
 
+class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
+    """verify_reversible() computes the same pass/fail determination as
+    reverse_rotation() - and, when both succeed, the identical
+    underlying CRC32 - via an independent code path (see its own
+    docstring). rotate's post-edit self-check (cli.py) relies on
+    verify_reversible() exclusively, so a bug that made it silently
+    diverge from reverse_rotation() would be a serious hidden failure
+    mode: the self-check exists specifically to catch exactly this kind
+    of thing, so it can't be allowed to be the thing that's wrong. These
+    tests cross-check the two directly against every scenario the rest
+    of the suite exercises, rather than testing either in isolation."""
+
+    def _assert_agree(self, rotated, ignore_tamper=False):
+        """Run both functions against the same input and assert they
+        reach an identical verdict - either both raise, or both succeed.
+        Returns reverse_rotation's actual reconstructed bytes (or None,
+        if both raised) for the caller to inspect further."""
+        reverse_exc = restored = verify_exc = None
+        try:
+            restored = hr.reverse_rotation(rotated, ignore_tamper=ignore_tamper,
+                                            verbose=False)
+        except (hr.ProvenanceError, hr.BoxParseError) as e:
+            reverse_exc = e
+        try:
+            hr.verify_reversible(rotated, ignore_tamper=ignore_tamper, verbose=False)
+        except (hr.ProvenanceError, hr.BoxParseError) as e:
+            verify_exc = e
+
+        self.assertEqual(
+            reverse_exc is None, verify_exc is None,
+            f"reverse_rotation and verify_reversible disagreed on whether "
+            f"this file is reversible: reverse_rotation "
+            f"{'raised: ' + str(reverse_exc) if reverse_exc else 'succeeded'}, "
+            f"verify_reversible "
+            f"{'raised: ' + str(verify_exc) if verify_exc else 'succeeded'}")
+        return restored
+
+    def test_agrees_across_layout_path_and_exif_combinations(self):
+        for layout in ('mdat_first', 'meta_first'):
+            for include_irot in (False, True):
+                for include_exif in (False, True):
+                    with self.subTest(layout=layout, include_irot=include_irot,
+                                       include_exif=include_exif):
+                        original = build_synthetic_heic(
+                            layout=layout, include_irot=include_irot,
+                            include_exif=include_exif)
+                        rotated = hr.apply_rotation(original, 1, sync_exif=True,
+                                                     verbose=False)
+                        restored = self._assert_agree(rotated)
+                        self.assertEqual(restored, original)
+
+    def test_agrees_with_mid_stream_exif(self):
+        for layout in ('mdat_first', 'meta_first'):
+            for target_irot in (0, 1, 2, 3):
+                with self.subTest(layout=layout, target_irot=target_irot):
+                    original = build_synthetic_heic(
+                        layout=layout, include_irot=False, include_exif=True,
+                        exif_position='middle', exif_orientation=1,
+                        mdat_payload=bytes(range(256)) * 4096)
+                    rotated = hr.apply_rotation(original, target_irot,
+                                                 sync_exif=True, verbose=False)
+                    restored = self._assert_agree(rotated)
+                    self.assertEqual(restored, original)
+
+    def test_agrees_with_multi_edit_chain(self):
+        original = build_synthetic_heic(layout='meta_first', include_irot=False)
+        step1 = hr.apply_rotation(original, 1, verbose=False)
+        step2 = hr.apply_rotation(step1, 1, verbose=False)
+        restored = self._assert_agree(step2)
+        self.assertEqual(restored, original)
+
+    def test_agrees_with_large_payload(self):
+        for layout in ('mdat_first', 'meta_first'):
+            for include_exif in (False, True):
+                with self.subTest(layout=layout, include_exif=include_exif):
+                    payload = bytes((i % 256) for i in range(2 * 1024 * 1024))
+                    original = build_synthetic_heic(
+                        layout=layout, include_irot=False, mdat_payload=payload,
+                        include_exif=include_exif)
+                    rotated = hr.apply_rotation(original, 1, sync_exif=True,
+                                                 verbose=False)
+                    restored = self._assert_agree(rotated)
+                    self.assertEqual(restored, original)
+
+    def test_agrees_with_extra_unreferenced_mdat(self):
+        for layout in ('mdat_first', 'meta_first'):
+            with self.subTest(layout=layout):
+                original = build_synthetic_heic(
+                    layout=layout, include_irot=False, extra_mdat=True)
+                rotated = hr.apply_rotation(original, 1, verbose=False)
+                restored = self._assert_agree(rotated)
+                self.assertEqual(restored, original)
+
+    def test_agrees_with_old_v1_format_record(self):
+        for include_irot in (True, False):
+            with self.subTest(fast_path=include_irot):
+                original = build_synthetic_heic(layout='mdat_first',
+                                                  include_irot=include_irot)
+                rotated = hr.apply_rotation(original, 1, verbose=False)
+                v1_style = _make_v1_style_record(original, rotated)
+                restored = self._assert_agree(v1_style)
+                self.assertEqual(restored, original)
+
+    def test_agrees_on_tamper_of_saved_irot_byte_fast_path(self):
+        original = build_synthetic_heic(layout='mdat_first', include_irot=True,
+                                         irot_value=1)
+        rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))
+        info = hr.locate_structures(bytes(rotated))
+        iprp_hdr = info['iprp_hdr']
+        ipco_hdr = hr.find_unique_child(bytes(rotated), iprp_hdr[2], iprp_hdr[3],
+                                         b'ipco', "'iprp'")
+        ipco_children = hr.parse_ipco_children(bytes(rotated), ipco_hdr[2], ipco_hdr[3])
+        irot_child = next(c for c in ipco_children if c[4] == b'irot')
+        rotated[irot_child[2]] = 0xFF
+        rotated = bytes(rotated)
+
+        self._assert_agree(rotated, ignore_tamper=False)
+        restored = self._assert_agree(rotated, ignore_tamper=True)
+        self.assertEqual(restored, original)
+
+    def test_agrees_on_tamper_elsewhere_in_iprp(self):
+        for include_irot in (True, False):
+            with self.subTest(fast_path=include_irot):
+                original = build_synthetic_heic(layout='mdat_first',
+                                                  include_irot=include_irot)
+                rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))
+                info = hr.locate_structures(bytes(rotated))
+                ipco_hdr = hr.find_unique_child(bytes(rotated), info['iprp_hdr'][2],
+                                                 info['iprp_hdr'][3], b'ipco', "'iprp'")
+                ispe_hdr = hr.find_child(bytes(rotated), ipco_hdr[2], ipco_hdr[3], b'ispe')
+                rotated[ispe_hdr[2]] ^= 0xFF
+                rotated = bytes(rotated)
+
+                self._assert_agree(rotated, ignore_tamper=False)
+                self._assert_agree(rotated, ignore_tamper=True)
+
+    def test_agrees_on_tamper_outside_restored_region(self):
+        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
+        rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))
+        rotated[10] ^= 0xFF  # inside 'ftyp' - never touched by either function
+        rotated = bytes(rotated)
+
+        self._assert_agree(rotated, ignore_tamper=False)
+        self._assert_agree(rotated, ignore_tamper=True)
+
+    def test_agrees_on_tampered_mid_stream_exif_byte(self):
+        """A file with an embedded, mid-stream Exif item whose CURRENT
+        (post-rotate) tag value has been directly tampered with, deep
+        inside 'mdat' - covers agreement specifically on the one kind of
+        tamper that can land inside the region verify_reversible reads
+        directly off the input rather than off a freshly-restored
+        buffer."""
+        original = build_synthetic_heic(
+            layout='meta_first', include_irot=False, include_exif=True,
+            exif_position='middle', exif_orientation=1,
+            mdat_payload=bytes(range(256)) * 4096)
+        rotated = bytearray(hr.apply_rotation(original, 1, sync_exif=True,
+                                               verbose=False))
+        info = hr.locate_structures(bytes(rotated))
+        field = hr.find_exif_orientation_field(
+            bytes(rotated), info['meta_body_start'], info['meta_hdr'][3])
+        self.assertIsNotNone(field)
+        rotated[field[0]] ^= 0xFF  # corrupt the live Exif Orientation byte
+        rotated = bytes(rotated)
+
+        self._assert_agree(rotated, ignore_tamper=False)
+        self._assert_agree(rotated, ignore_tamper=True)
+
+
+    def test_avoids_full_file_size_allocation(self):
+        """verify_reversible's entire reason to exist is avoiding a
+        second full-file-size buffer - if a future change accidentally
+        reintroduced one (e.g. someone "simplifying" it back into a
+        bytearray(data) copy), this suite should catch it rather than
+        silently losing the whole point of the function. Uses tracemalloc
+        to measure actual net allocation directly, rather than trusting
+        that the source still looks the way it's supposed to."""
+        import tracemalloc
+
+        payload = bytes((i % 256) for i in range(4 * 1024 * 1024))  # 4 MiB
+        original = build_synthetic_heic(layout='meta_first', include_irot=False,
+                                         mdat_payload=payload)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+
+        tracemalloc.start()
+        try:
+            snap_before = tracemalloc.take_snapshot()
+            hr.verify_reversible(rotated, ignore_tamper=False, verbose=False)
+            snap_after = tracemalloc.take_snapshot()
+        finally:
+            tracemalloc.stop()
+
+        net_allocated = sum(
+            s.size_diff for s in snap_after.compare_to(snap_before, 'lineno')
+            if s.size_diff > 0)
+        self.assertLess(
+            net_allocated, len(payload) // 4,
+            f"verify_reversible allocated {net_allocated} bytes net for a "
+            f"{len(payload)}-byte payload - expected it to stay a small "
+            f"fraction of the file size, not scale with it")
+
+
+class TestSharedReconstructionCode(unittest.TestCase):
+    """TestVerifyReversibleMatchesReverseRotation (above) checks that
+    reverse_rotation() and verify_reversible() AGREE. These go a step
+    further and check that they run the literal same code to get there,
+    not two independent implementations that happen to agree on every
+    case this suite happens to think of. Both call _prepare_reversal()
+    then _iter_reconstructed_chunks() - the latter is the single piece
+    of code that decides what bytes the reconstructed file consists of
+    and in what order; each caller only differs in what it does with the
+    chunks afterward (concatenate vs. feed straight into a CRC32)."""
+
+    def test_both_functions_call_the_shared_helpers(self):
+        """Static check: each function's own bytecode must reference
+        _prepare_reversal and _iter_reconstructed_chunks directly - not
+        some similarly-named function, and not a private
+        reimplementation of either."""
+        for fn in (hr.reverse_rotation, hr.verify_reversible):
+            names = fn.__code__.co_names
+            self.assertIn('_prepare_reversal', names,
+                           f"{fn.__name__} must call _prepare_reversal()")
+            self.assertIn('_iter_reconstructed_chunks', names,
+                           f"{fn.__name__} must call _iter_reconstructed_chunks()")
+
+    def test_both_consume_the_identical_chunk_sequence(self):
+        """Dynamic check: wraps _iter_reconstructed_chunks to record the
+        exact sequence of chunks (as bytes) it yields on each call, then
+        confirms reverse_rotation() and verify_reversible() are handed
+        byte-for-byte identical chunk sequences, in the same order, for
+        the same input - using a fixture with a mid-stream embedded Exif
+        item specifically, since that's what makes the chunk sequence
+        have more than the trivial two pieces."""
+        original = build_synthetic_heic(
+            layout='meta_first', include_irot=False, include_exif=True,
+            exif_position='middle', exif_orientation=1,
+            mdat_payload=bytes(range(256)) * 4096)
+        rotated = hr.apply_rotation(original, 1, sync_exif=True, verbose=False)
+
+        captured = []
+        real_iter = hr._iter_reconstructed_chunks
+
+        def spy(*args, **kwargs):
+            chunks = [bytes(c) for c in real_iter(*args, **kwargs)]
+            captured.append(chunks)
+            yield from chunks
+
+        with unittest.mock.patch.object(hr, '_iter_reconstructed_chunks', spy):
+            hr.reverse_rotation(rotated, verbose=False)
+            hr.verify_reversible(rotated, verbose=False)
+
+        self.assertEqual(len(captured), 2)  # fixture sanity check
+        self.assertGreater(len(captured[0]), 2,
+                            "fixture sanity check: the mid-stream Exif item "
+                            "should make this a multi-chunk sequence, not "
+                            "just the trivial prefix/span/suffix split")
+        self.assertEqual(captured[0], captured[1],
+                          "reverse_rotation and verify_reversible must be "
+                          "handed the exact same sequence of chunks, in the "
+                          "same order, for the same input")
+
+
+
+class TestReturnTypeAvoidsExtraCopy(unittest.TestCase):
+    """apply_rotation() and reverse_rotation() return the mutable
+    bytearray they already built rather than wrapping it in bytes()
+    first - a copy that would otherwise happen on every single call for
+    no reason, since nothing downstream needs immutability
+    (verify_structure, struct.unpack_from, file writes, and zlib.crc32
+    all work identically against either type). Pinned directly here
+    since it's easy to "simplify" back to bytes(out) without anything
+    else failing - bytes and bytearray compare equal, so only the
+    return type itself would regress silently."""
+
+    def test_apply_rotation_returns_bytearray(self):
+        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
+        result = hr.apply_rotation(original, 1, verbose=False)
+        self.assertIsInstance(result, bytearray)
+
+    def test_reverse_rotation_returns_bytearray(self):
+        original = build_synthetic_heic(layout='mdat_first', include_irot=False)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        result = hr.reverse_rotation(rotated, verbose=False)
+        self.assertIsInstance(result, bytearray)
+
+
 def _strip_provenance_tag(data: bytes, tag: bytes) -> bytes:
     """Return a self-consistent copy of `data` with one entry tag removed
     from its provenance record - simulating what a file actually edited
@@ -542,13 +828,13 @@ class TestProvenanceVersionAndSelfCheck(unittest.TestCase):
             args = hr_cli.build_parser().parse_args(['rotate', '90', input_path, out_path])
 
             # Patched on hr_cli (heic_rotate.cli), not hr (heic_rotate.core):
-            # cli.py imports reverse_rotation by name (`from .core import
-            # reverse_rotation`), so that's the binding _run() actually
-            # looks up at call time - patching core.reverse_rotation
+            # cli.py imports verify_reversible by name (`from .core import
+            # verify_reversible`), so that's the binding _run() actually
+            # looks up at call time - patching core.verify_reversible
             # instead would silently miss, since cli's own copy of the
             # name would be untouched.
             with unittest.mock.patch.object(
-                    hr_cli, 'reverse_rotation',
+                    hr_cli, 'verify_reversible',
                     side_effect=hr.ProvenanceError("simulated failure")):
                 with self.assertRaises(hr.ProvenanceError) as ctx:
                     hr_cli._run(args, data)

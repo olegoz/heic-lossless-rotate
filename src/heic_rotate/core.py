@@ -497,8 +497,19 @@ def find_exif_orientation_field(data, meta_body_start, meta_c_end):
 
 def crc32_excluding_range(data, excl_start, excl_end):
     """CRC32 of `data` with the byte range [excl_start, excl_end) removed -
-    used so a provenance box's own CRC field isn't hashing itself."""
-    return zlib.crc32(data[:excl_start] + data[excl_end:]) & 0xffffffff
+    used so a provenance box's own CRC field isn't hashing itself.
+
+    Computed as two incremental passes over zero-copy `memoryview` slices
+    instead of slicing both halves and concatenating them, which would
+    allocate three near-full-size temporaries (prefix copy, suffix copy,
+    joined copy) for what's conceptually a single pass. `zlib.crc32`
+    supports incremental continuation via its second argument, so this
+    produces the identical result without ever materializing a second
+    buffer."""
+    view = memoryview(data)
+    crc = zlib.crc32(view[:excl_start])
+    crc = zlib.crc32(view[excl_end:], crc)
+    return crc & 0xffffffff
 
 
 def find_provenance_box(data):
@@ -893,7 +904,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     if sync_exif and new_turns != current_turns:
         # re-locate fresh against the (possibly resized) output buffer;
         # meta_c_end may have shifted in the slow path so re-derive it
-        info_now = locate_structures(bytes(out))
+        info_now = locate_structures(out)
         exif_field_now = find_exif_orientation_field(
             out, info_now['meta_body_start'], info_now['meta_hdr'][3])
         if exif_field_now is not None:
@@ -980,7 +991,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     #     heic-lossless-rotate that predates an entry tag this version adds
     #     (such as TVER itself, the first time a pre-1.6.0-edited file is
     #     rotated again by 1.6.0+) is being resized to fit the new set.
-    info_now = locate_structures(bytes(out))
+    info_now = locate_structures(out)
     old_prov_hdr = info_now['provenance_hdr']
     if old_prov_hdr is not None:
         old_prov_start, _, _, old_prov_end, _ = old_prov_hdr
@@ -1010,7 +1021,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         # (if any) - that one does not cover this box.
         iloc_hdr_now = info_now['iloc_hdr']
         new_iloc_content, any_changed = patch_iloc_offsets_at_threshold(
-            bytes(out), iloc_hdr_now, old_prov_end, prov_delta)
+            out, iloc_hdr_now, old_prov_end, prov_delta)
         if any_changed:
             iloc_c_start, iloc_c_end = iloc_hdr_now[2], iloc_hdr_now[3]
             out[iloc_c_start:iloc_c_end] = new_iloc_content
@@ -1028,8 +1039,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     # BEFORE the provenance box is (re)written - i.e. with iloc already
     # patched above if needed, and the provenance box itself excluded -
     # exactly the "excluded" state CCRC is defined to cover.
-    excluded_view = bytes(out[:old_prov_start]) + bytes(out[old_prov_end:])
-    ccrc = zlib.crc32(excluded_view) & 0xffffffff
+    ccrc = crc32_excluding_range(out, old_prov_start, old_prov_end)
     entries[b'CCRC'] = struct.pack('>I', ccrc)
     new_prov_box = build_provenance_box(FORMAT_VERSION, entries)
     if len(new_prov_box) != new_prov_size:
@@ -1044,44 +1054,44 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
               f"provenance record (format v{FORMAT_VERSION}, "
               f"{len(new_prov_box)} bytes)")
 
-    return bytes(out)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Reverse logic
 # ---------------------------------------------------------------------------
 
-def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
-    info = locate_structures(data)
-    prov_hdr = info['provenance_hdr']
-    if prov_hdr is None:
-        raise ProvenanceError(
-            "no heic-lossless-rotate provenance record found in this file - "
-            "either it was never edited by this tool, or the record was "
-            "stripped by something else. Cannot reverse.")
+def _restore_meta_provenance_span(span, entries, verbose=False):
+    """Given `span` = data[meta_start:prov_end] for some file
+    heic-lossless-rotate has rotated - a standalone buffer whose only
+    two top-level boxes are the file's 'meta' box immediately followed
+    by the provenance ('uuid') box and nothing else (apply_rotation
+    always inserts the provenance box as 'meta''s immediate next
+    sibling - see its own provenance-insertion comments, and
+    reverse_rotation's docstring for why nothing else can fall between
+    them) - restores 'meta' to its pristine pre-rotation state (iprp/
+    ipma, meta's own size field, iloc content) and removes the
+    provenance box. Mutates and returns `span`.
 
-    version, entries = parse_provenance(data, prov_hdr)
-    if version not in SUPPORTED_REVERSE_FORMAT_VERSIONS:
-        supported = ', '.join(str(v) for v in SUPPORTED_REVERSE_FORMAT_VERSIONS)
-        raise ProvenanceError(
-            f"provenance record is format version {version}; this script "
-            f"only knows how to reverse version(s) {supported}. Use a "
-            f"matching version of heic-lossless-rotate.")
-
-    prov_start, _, _, prov_end, _ = prov_hdr
-    current_ccrc = zlib.crc32(data[:prov_start] + data[prov_end:]) & 0xffffffff
-    stored_ccrc = struct.unpack('>I', entries[b'CCRC'])[0]
-    if current_ccrc != stored_ccrc:
-        msg = (f"file appears to have been modified by something else since "
-               f"the last heic-lossless-rotate edit (CRC32 mismatch: file is "
-               f"{current_ccrc:#010x}, provenance expects {stored_ccrc:#010x}). "
-               f"Reversing now could silently clobber those other changes.")
-        if not ignore_tamper:
-            raise ProvenanceError(msg + " Re-run with --ignore-tamper-check to override.")
-        elif verbose:
-            print(f"[warning] {msg} Proceeding anyway (--ignore-tamper-check).")
-
-    out = bytearray(data)
+    This is reverse_rotation's own restoration logic, factored out so it
+    has exactly one implementation shared by two callers: reverse_
+    rotation() (which slices this out of, and splices the result back
+    into, the full file buffer, since it needs actual output bytes to
+    write to disk) and verify_reversible() (which never needs a
+    full-file buffer at all, since 'mdat' - the only thing excluded from
+    this span - never has anything about it that this restoration step
+    touches; only the separate, optional embedded-Exif 2-byte patch
+    reaches into 'mdat', and each caller applies that themselves against
+    whichever buffer they actually have that contains it). Box parsing
+    is header-driven, not position-driven (see locate_structures), so
+    operating on this standalone slice - where 'meta' starts at local
+    position 0 rather than wherever it sits in the real file - needs no
+    special-casing here at all.
+    """
+    info = locate_structures(span)
+    iprp_hdr = info['iprp_hdr']
+    iprp_start, _, _, iprp_c_end, _ = iprp_hdr
+    primary_item_id = info['primary_item_id']
 
     # Restore iprp. Two formats, branched on which entry is present:
     #   v1 (OPRP): the pristine 'iprp' box was saved in full - restoring
@@ -1095,31 +1105,26 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
     #     appended as the LAST entry in the primary item's 'ipma' list
     #     (see apply_rotation's slow path) - so no index bookkeeping
     #     needs to have been saved to find and remove it again.
-    info2 = locate_structures(bytes(out))
-    iprp_hdr = info2['iprp_hdr']
-    iprp_start, _, _, iprp_c_end, _ = iprp_hdr
-    primary_item_id = info2['primary_item_id']
-
     if b'OPRP' in entries:
         pristine_iprp = entries[b'OPRP']
-        out[iprp_start:iprp_c_end] = pristine_iprp
+        span[iprp_start:iprp_c_end] = pristine_iprp
         if verbose:
             print(f"[reverse] restored pristine 'iprp' from full v1 "
                   f"snapshot ({len(pristine_iprp)} bytes)")
     elif b'OIRT' in entries:
         oirt = entries[b'OIRT']
-        ipco_hdr = find_unique_child(bytes(out), iprp_hdr[2], iprp_hdr[3],
+        ipco_hdr = find_unique_child(span, iprp_hdr[2], iprp_hdr[3],
                                       b'ipco', "'iprp'")
-        ipma_hdr = find_unique_child(bytes(out), iprp_hdr[2], iprp_hdr[3],
+        ipma_hdr = find_unique_child(span, iprp_hdr[2], iprp_hdr[3],
                                       b'ipma', "'iprp'")
         if ipco_hdr is None or ipma_hdr is None:
             raise ProvenanceError("'iprp' is missing 'ipco' or 'ipma' - "
                                    "cannot reverse")
         ipco_start, _, ipco_c_start, ipco_c_end, _ = ipco_hdr
         ipma_start, _, ipma_c_start, ipma_c_end, _ = ipma_hdr
-        ipco_children = parse_ipco_children(bytes(out), ipco_c_start, ipco_c_end)
+        ipco_children = parse_ipco_children(span, ipco_c_start, ipco_c_end)
         ipma_version, current_ipma_flags, ipma_entries = parse_ipma(
-            bytes(out), ipma_c_start, ipma_c_end)
+            span, ipma_c_start, ipma_c_end)
         primary_entry = next((e for e in ipma_entries if e[0] == primary_item_id), None)
 
         if len(oirt) == 1:
@@ -1143,7 +1148,7 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
                     "OIRT indicates an 'irot' property should exist on "
                     "the primary item, but none was found - cannot "
                     "reverse")
-            out[irot_pos] = oirt[0]
+            span[irot_pos] = oirt[0]
             if verbose:
                 print(f"[reverse] restored original 'irot' byte "
                       f"({oirt[0]}) at offset {irot_pos}")
@@ -1175,7 +1180,7 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
             original_flags = struct.unpack('>I', b'\x00' + entries[b'OIPF'])[0]
             new_ipma_box = build_ipma(ipma_version, original_flags, new_ipma_entries)
 
-            new_ipco_content = bytes(out[ipco_c_start:last_child[0]])
+            new_ipco_content = bytes(span[ipco_c_start:last_child[0]])
             new_ipco_box = struct.pack('>I4s', len(new_ipco_content) + 8,
                                         b'ipco') + new_ipco_content
 
@@ -1184,7 +1189,7 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
                 else (new_ipma_box + new_ipco_box)
             new_iprp_box = struct.pack('>I4s', len(new_iprp_content) + 8,
                                         b'iprp') + new_iprp_content
-            out[iprp_start:iprp_c_end] = new_iprp_box
+            span[iprp_start:iprp_c_end] = new_iprp_box
             if verbose:
                 print(f"[reverse] removed inserted 'irot' property and "
                       f"its 'ipma' association, restored original 'ipma' "
@@ -1202,51 +1207,191 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
     # Restore meta's size field. This overwrites a plain 4-byte field in
     # place, same limitation as apply_rotation's meta-size patch - but we
     # don't need a redundant guard here: this file was necessarily edited
-    # by apply_rotation to have a provenance record at all (checked
-    # above), and apply_rotation refuses up front on a 64-bit/extends-to-
-    # EOF 'meta' header, so any file that reaches this point is
-    # guaranteed to already have a standard 32-bit one.
-    meta_start = info2['meta_hdr'][0]
-    out[meta_start:meta_start + 4] = entries[b'OMSZ']
+    # by apply_rotation to have a provenance record at all, and
+    # apply_rotation refuses up front on a 64-bit/extends-to-EOF 'meta'
+    # header, so any file that reaches this point is guaranteed to
+    # already have a standard 32-bit one.
+    meta_start_local = info['meta_hdr'][0]
+    span[meta_start_local:meta_start_local + 4] = entries[b'OMSZ']
 
-    # Remove the provenance box itself NOW, before restoring iloc/Exif -
-    # both of those need to compute or use absolute file offsets into
-    # 'mdat', which are only correct once every size-changing edit
-    # (including this box's own insertion) has actually been undone. If
-    # 'meta' precedes 'mdat' in this file's layout, this removal is what
-    # shifts 'mdat' back down to its true original position - do it too
-    # late (e.g. after restoring iloc) and iloc ends up holding pristine
-    # offsets that don't yet match where the bytes actually are.
-    info3 = locate_structures(bytes(out))
+    # Remove the provenance box itself NOW, before restoring iloc - which
+    # needs 'meta''s own byte range to be in its FINAL (post-shrink)
+    # state to correctly locate iloc within it.
+    info3 = locate_structures(span)
     prov_hdr2 = info3['provenance_hdr']
     p_start, _, _, p_end, _ = prov_hdr2
-    del out[p_start:p_end]
+    del span[p_start:p_end]
 
     # Restore iloc content, if we have a saved snapshot
     if b'OILC' in entries:
-        info4 = locate_structures(bytes(out))
+        info4 = locate_structures(span)
         iloc_hdr = info4['iloc_hdr']
         if iloc_hdr is not None:
-            out[iloc_hdr[2]:iloc_hdr[3]] = entries[b'OILC']
+            span[iloc_hdr[2]:iloc_hdr[3]] = entries[b'OILC']
 
-    # Restore the legacy Exif Orientation value, if we have one
+    return span
+
+
+def _prepare_reversal(data, ignore_tamper, verbose):
+    """All of the setup shared by reverse_rotation() and
+    verify_reversible(), up to (but not including) actually assembling
+    the reconstructed file's bytes: locate the provenance record, check
+    its format version, run the tamper check, restore the meta+
+    provenance span, and determine the embedded-Exif patch (if any).
+
+    Returns (entries, meta_start, prov_end, span, exif_patch) - entries
+    for the final PCRC comparison each caller makes itself, and the
+    rest to hand straight to _iter_reconstructed_chunks(). Raises the
+    same ProvenanceError conditions either caller would need to raise
+    on its own otherwise - having this in exactly one place means
+    reverse_rotation() and verify_reversible() can't drift apart on
+    what counts as a valid/tampered/malformed record, only on what they
+    each do with the reconstructed bytes afterward.
+    """
+    info = locate_structures(data)
+    prov_hdr = info['provenance_hdr']
+    if prov_hdr is None:
+        raise ProvenanceError(
+            "no heic-lossless-rotate provenance record found in this file - "
+            "either it was never edited by this tool, or the record was "
+            "stripped by something else. Cannot reverse.")
+
+    version, entries = parse_provenance(data, prov_hdr)
+    if version not in SUPPORTED_REVERSE_FORMAT_VERSIONS:
+        supported = ', '.join(str(v) for v in SUPPORTED_REVERSE_FORMAT_VERSIONS)
+        raise ProvenanceError(
+            f"provenance record is format version {version}; this script "
+            f"only knows how to reverse version(s) {supported}. Use a "
+            f"matching version of heic-lossless-rotate.")
+
+    prov_start, _, _, prov_end, _ = prov_hdr
+    current_ccrc = crc32_excluding_range(data, prov_start, prov_end)
+    stored_ccrc = struct.unpack('>I', entries[b'CCRC'])[0]
+    if current_ccrc != stored_ccrc:
+        msg = (f"file appears to have been modified by something else since "
+               f"the last heic-lossless-rotate edit (CRC32 mismatch: file is "
+               f"{current_ccrc:#010x}, provenance expects {stored_ccrc:#010x}). "
+               f"Reversing now could silently clobber those other changes.")
+        if not ignore_tamper:
+            raise ProvenanceError(msg + " Re-run with --ignore-tamper-check to override.")
+        elif verbose:
+            print(f"[warning] {msg} Proceeding anyway (--ignore-tamper-check).")
+
+    # 'mdat' - excluded from this span in both supported layouts, since
+    # the provenance box is always inserted as 'meta''s immediate next
+    # sibling (see _restore_meta_provenance_span's docstring) - is never
+    # touched by the restoration itself, only (optionally) by the
+    # Exif-Orientation patch below.
+    meta_start = info['meta_hdr'][0]
+    span = _restore_meta_provenance_span(
+        bytearray(data[meta_start:prov_end]), entries, verbose=verbose)
+
+    # The Exif patch, if any, lands inside 'mdat' - read its CURRENT
+    # position and value directly off `data` as-is. Reversing never
+    # moves 'mdat''s own bytes, it only removes/shrinks the meta+
+    # provenance span - so `data`'s own (current, valid) iloc already
+    # points at exactly the physical bytes the fully reconstructed file
+    # will too, just via a different absolute file offset if the span's
+    # shrinkage happens to fall before 'mdat' in this file's layout
+    # (handled by _iter_reconstructed_chunks, purely in terms of where
+    # this offset falls relative to meta_start/prov_end - never relative
+    # to any assembled output buffer, since one may never be built).
+    exif_patch = None
     if b'OEXO' in entries:
-        info5 = locate_structures(bytes(out))
         exif_field = find_exif_orientation_field(
-            out, info5['meta_body_start'], info5['meta_hdr'][3])
+            data, info['meta_body_start'], info['meta_hdr'][3])
         if exif_field is not None:
-            abs_value_offset, byte_order, _cur = exif_field
-            out[abs_value_offset:abs_value_offset + 2] = entries[b'OEXO']
+            abs_offset = exif_field[0]
+            if meta_start <= abs_offset < prov_end:
+                # Should be structurally impossible (see
+                # reverse_rotation's docstring) for any file this tool
+                # itself produced - fail loudly rather than silently
+                # risk reconstructing the wrong bytes.
+                raise ProvenanceError(
+                    "internal error: embedded Exif Orientation field "
+                    "unexpectedly falls inside the meta/provenance span "
+                    "- refusing to guess at the reconstructed bytes")
+            exif_patch = (abs_offset, entries[b'OEXO'])
             if verbose:
-                print("[reverse] restored pristine legacy Exif Orientation tag")
+                print("[reverse] restoring pristine legacy Exif Orientation tag")
         elif verbose:
             print("[reverse] warning: had a saved Exif Orientation snapshot "
                   "but couldn't relocate the field to restore it - the "
                   "final CRC check below will catch any resulting mismatch")
 
+    return entries, meta_start, prov_end, span, exif_patch
+
+
+def _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
+    """Yields the reconstructed file's bytes, in file order, as a
+    handful of chunks: zero-copy `memoryview` slices of `data` for
+    everything passed through unchanged, real bytes only for the
+    restored meta+provenance span and (if applicable) the 2-byte Exif
+    patch. This is the SINGLE piece of code that decides what bytes the
+    reconstructed file actually consists of and in what order -
+    reverse_rotation() concatenates these chunks (to produce real
+    output bytes to return/write) while ALSO feeding each one into a
+    running CRC32 as it goes; verify_reversible() feeds them into that
+    same kind of running CRC32 without ever concatenating them. Either
+    way, which bytes make up the result is decided here and only here -
+    not re-derived independently by each caller."""
+    view = memoryview(data)
+    if exif_patch is not None and exif_patch[0] < meta_start:
+        patch_offset, patch_bytes = exif_patch
+        yield view[:patch_offset]
+        yield patch_bytes
+        yield view[patch_offset + 2:meta_start]
+    else:
+        yield view[:meta_start]
+
+    yield span
+
+    if exif_patch is not None and exif_patch[0] >= prov_end:
+        patch_offset, patch_bytes = exif_patch
+        yield view[prov_end:patch_offset]
+        yield patch_bytes
+        yield view[patch_offset + 2:]
+    else:
+        yield view[prov_end:]
+
+
+def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
+    """Undo heic-lossless-rotate's own edit(s), reconstructing the exact
+    original file (verified by CRC32 against the PCRC recorded on the
+    file's first-ever edit).
+
+    Structural fact this relies on, and that verify_reversible() below
+    also depends on: every edit made here falls either inside the
+    contiguous span [meta_start, prov_end) - covering 'meta' itself
+    (iprp/ipma, meta's own size field, iloc) and the provenance box
+    that immediately follows it - or, for at most one 2-byte patch,
+    inside 'mdat' (restoring an embedded legacy Exif Orientation tag).
+    Nothing outside those two regions is ever touched. This holds
+    regardless of which supported box layout the file uses ('mdat'
+    before or after 'meta'), since apply_rotation always inserts the
+    provenance box as 'meta''s immediate next sibling - so 'mdat' can
+    never fall between them, only strictly before meta_start or at/after
+    prov_end.
+
+    Shares its actual reconstruction logic with verify_reversible() -
+    both call _prepare_reversal() then _iter_reconstructed_chunks() -
+    so the two can never silently disagree on what the reconstructed
+    file's bytes are: only on what each does with them afterward (here,
+    concatenate into real output bytes; there, feed straight into a
+    CRC32 and discard).
+    """
+    entries, meta_start, prov_end, span, exif_patch = _prepare_reversal(
+        data, ignore_tamper, verbose)
+
+    out = bytearray()
+    crc = None
+    for chunk in _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
+        out += chunk
+        crc = zlib.crc32(chunk) if crc is None else zlib.crc32(chunk, crc)
+
     # Final sanity check: the reconstructed file's CRC32 must match the
     # pristine-original CRC32 we recorded on the very first edit.
-    final_crc = zlib.crc32(bytes(out)) & 0xffffffff
+    final_crc = crc & 0xffffffff
     expected_pcrc = struct.unpack('>I', entries[b'PCRC'])[0]
     if final_crc != expected_pcrc:
         raise ProvenanceError(
@@ -1258,7 +1403,49 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
         print(f"[ok] reconstructed file CRC32 matches the recorded original "
               f"({final_crc:#010x}) - byte-identical to the true original")
 
-    return bytes(out)
+    return out
+
+
+def verify_reversible(data, ignore_tamper=False, verbose=False):
+    """Equivalent, in terms of pass/fail and the error(s) raised, to
+    calling reverse_rotation(data, ignore_tamper, verbose) and
+    discarding the result - but computes the final CRC32 comparison
+    without ever materializing a second full-file buffer. Intended for
+    rotate's post-edit self-check (see cli.py), which only needs to know
+    whether reversing its own freshly-produced output would reconstruct
+    the true original - it never needs the actual reconstructed bytes,
+    so there's no reason to pay for a full bytearray(data) copy just to
+    throw the result away.
+
+    This isn't a second implementation that happens to agree with
+    reverse_rotation() - it calls the exact same _prepare_reversal() and
+    _iter_reconstructed_chunks() reverse_rotation() does, and computes
+    its CRC32 over the exact same sequence of chunks those yield. The
+    only difference is what happens to each chunk once produced:
+    reverse_rotation() concatenates them into real output bytes (and
+    also feeds them into a running CRC32 as it goes); this function
+    feeds them into that same kind of running CRC32 and nothing else -
+    it is never possible for the two to reconstruct different bytes,
+    only for one to additionally keep a copy of them.
+    """
+    entries, meta_start, prov_end, span, exif_patch = _prepare_reversal(
+        data, ignore_tamper, verbose)
+
+    crc = None
+    for chunk in _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
+        crc = zlib.crc32(chunk) if crc is None else zlib.crc32(chunk, crc)
+
+    final_crc = crc & 0xffffffff
+    expected_pcrc = struct.unpack('>I', entries[b'PCRC'])[0]
+    if final_crc != expected_pcrc:
+        raise ProvenanceError(
+            f"reconstruction mismatch: rebuilt file CRC32 {final_crc:#010x} "
+            f"does not match recorded original CRC32 {expected_pcrc:#010x}. "
+            f"Do not trust this output - this indicates a bug or an "
+            f"inconsistent provenance record.")
+    elif verbose:
+        print(f"[ok] reconstructed file CRC32 matches the recorded original "
+              f"({final_crc:#010x}) - byte-identical to the true original")
 
 
 # ---------------------------------------------------------------------------

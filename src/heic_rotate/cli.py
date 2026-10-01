@@ -186,6 +186,7 @@ from .core import (
     ProvenanceError,
     apply_rotation,
     reverse_rotation,
+    verify_reversible,
     gather_info,
     format_info,
     verify_structure,
@@ -376,15 +377,20 @@ def _run(args, data):
         if not args.quiet:
             print("[ok] output box structure is internally consistent")
 
-        # Post-rotate reversibility self-check: reverse our own freshly-
-        # produced output, in memory, before writing anything to disk.
-        # reverse_rotation() already raises if the reconstructed file's
+        # Post-rotate reversibility self-check: verify - in memory, before
+        # writing anything to disk - that reversing our own freshly-
+        # produced output would reconstruct the true original.
+        # verify_reversible() already raises if the reconstructed file's
         # CRC32 doesn't match the recorded original (or if anything about
         # the record is malformed) - we just need to make sure a failure
         # here aborts the rotate instead of silently producing a file
         # that this tool claims to be able to reverse but actually can't.
+        # (Uses verify_reversible() rather than reverse_rotation() here
+        # since only the pass/fail matters - the reconstructed bytes
+        # themselves are never used, so there's no reason to pay for a
+        # second full-file copy just to discard it.)
         try:
-            reverse_rotation(out, ignore_tamper=False, verbose=False)
+            verify_reversible(out, ignore_tamper=False, verbose=False)
         except (BoxParseError, ProvenanceError) as e:
             raise ProvenanceError(
                 f"post-rotate reversibility self-check failed - refusing "
