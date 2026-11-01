@@ -152,11 +152,20 @@ def find_unique_child(data, start, end, boxtype_bytes, context):
 # ---------------------------------------------------------------------------
 
 def parse_pitm(data, c_start, c_end):
+    """Return the primary item ID. Raises BoxParseError (never IndexError/
+    struct.error, and never silently reads into the NEXT box's bytes) if
+    the box's own content is too short to hold its fixed fields."""
+    if c_end - c_start < 4:
+        raise BoxParseError(
+            f"truncated 'pitm' box: {c_end - c_start} content byte(s), "
+            f"need at least 4 for version/flags")
     version = data[c_start]
-    if version == 0:
-        item_id = struct.unpack_from('>H', data, c_start + 4)[0]
-    else:
-        item_id = struct.unpack_from('>I', data, c_start + 4)[0]
+    id_size = 2 if version == 0 else 4
+    if c_end - c_start < 4 + id_size:
+        raise BoxParseError(
+            f"truncated 'pitm' box: {c_end - c_start} content byte(s), "
+            f"need {4 + id_size} for a version {version} item ID")
+    item_id = int.from_bytes(data[c_start + 4:c_start + 4 + id_size], 'big')
     return item_id
 
 
@@ -435,6 +444,33 @@ def parse_iinf_items(data, c_start, c_end):
 #   irot=3 (270 deg CCW == needs 90 deg CW) -> Exif 6 (Rotate 90 CW)
 IROT_TO_EXIF_ORIENTATION = {0: 1, 1: 8, 2: 3, 3: 6}
 EXIF_ORIENTATION_TO_IROT = {v: k for k, v in IROT_TO_EXIF_ORIENTATION.items()}
+
+# Mirrored Exif Orientation values (2/4/5/7) are "flip horizontally, THEN
+# rotate", keyed here by the CCW quarter-turns of that following rotation
+# (same convention as irot):
+#   2 = flip only                         (0 turns)
+#   5 = flip + "rotate 270 CW" = 90 CCW   (1 turn)
+#   4 = flip + 180 (== "mirror vertical") (2 turns)
+#   7 = flip + "rotate 90 CW"  = 270 CCW  (3 turns)
+EXIF_MIRRORED_TURNS_TO_ORIENTATION = {0: 2, 1: 5, 2: 4, 3: 7}
+EXIF_MIRRORED_ORIENTATION_TO_TURNS = {
+    v: k for k, v in EXIF_MIRRORED_TURNS_TO_ORIENTATION.items()}
+
+
+def exif_orientation_after_rotation(old_value, new_turns, delta_turns):
+    """Exif Orientation value to write after rotating by `delta_turns`.
+
+    Unmirrored (or unrecognized) values keep the original behavior: the
+    value is derived from the file's new absolute irot (`new_turns`).
+    A MIRRORED value (2/4/5/7) must stay mirrored - dropping the flip
+    would change what Exif-only readers display - so the delta is
+    composed onto its own rotation component instead: rotating the
+    displayed image by `delta_turns` turns R(k)*Flip into R(k+delta)*Flip.
+    """
+    if old_value in EXIF_MIRRORED_ORIENTATION_TO_TURNS:
+        k = EXIF_MIRRORED_ORIENTATION_TO_TURNS[old_value]
+        return EXIF_MIRRORED_TURNS_TO_ORIENTATION[(k + delta_turns) & 0x3]
+    return IROT_TO_EXIF_ORIENTATION[new_turns]
 
 
 def find_exif_item_location(data, meta_body_start, meta_c_end):
@@ -909,7 +945,8 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
             out, info_now['meta_body_start'], info_now['meta_hdr'][3])
         if exif_field_now is not None:
             abs_value_offset, byte_order, _cur = exif_field_now
-            new_exif_orientation = IROT_TO_EXIF_ORIENTATION[new_turns]
+            new_exif_orientation = exif_orientation_after_rotation(
+                _cur, new_turns, delta_turns)
             struct.pack_into(byte_order + 'H', out, abs_value_offset, new_exif_orientation)
             if verbose:
                 print(f"[exif sync] embedded legacy Exif Orientation tag "

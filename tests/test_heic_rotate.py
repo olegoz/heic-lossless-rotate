@@ -214,6 +214,49 @@ class TestDuplicateBoxDetection(unittest.TestCase):
 # 2. Synthetic-file integration tests - no real photo needed
 # ---------------------------------------------------------------------------
 
+class TestPitmBoundsChecking(unittest.TestCase):
+    """parse_pitm must refuse a truncated box with BoxParseError - not
+    IndexError/struct.error, which the CLI doesn't catch."""
+
+    def test_truncated_pitm_raises_box_parse_error(self):
+        cases = {
+            'empty content': b'',
+            'partial version/flags': b'\x00\x00\x00',
+            'v0 missing item id': b'\x00\x00\x00\x00',
+            'v0 half item id': b'\x00\x00\x00\x00\x00',
+            'v1 short item id': b'\x01\x00\x00\x00\x00\x00\x00',
+        }
+        for name, content in cases.items():
+            with self.subTest(name):
+                # trailing bytes after the box must NOT be read as the ID
+                data = content + b'\xff' * 16
+                with self.assertRaises(hr.BoxParseError):
+                    hr.parse_pitm(data, 0, len(content))
+
+    def test_valid_pitm_still_parses(self):
+        self.assertEqual(hr.parse_pitm(b'\x00\x00\x00\x00\x00\x07', 0, 6), 7)
+        self.assertEqual(
+            hr.parse_pitm(b'\x01\x00\x00\x00\x00\x01\x00\x00', 0, 8), 65536)
+
+    def test_cli_reports_truncated_pitm_without_traceback(self):
+        def box(t, c):
+            return struct.pack('>I4s', len(c) + 8, t) + c
+        # ftyp + meta whose only child is a pitm cut off at EOF
+        meta = box(b'meta', b'\x00\x00\x00\x00' + box(b'pitm', b'\x00\x00\x00'))
+        blob = box(b'ftyp', b'heic\x00\x00\x00\x00mif1') + meta
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        path = os.path.join(tmpdir, 'bad.heic')
+        with open(path, 'wb') as f:
+            f.write(blob)
+        for args in (('info', path), ('rotate', '90', path, path + '.out')):
+            with self.subTest(args=args[0]):
+                rc, out, err = run_cli(*args)
+                self.assertEqual(rc, hr.ERROR_EXIT_CODE, out + err)
+                self.assertIn('error:', err)
+                self.assertNotIn('Traceback', err)
+
+
 class TestSyntheticRoundTrips(unittest.TestCase):
     """Exercises the full apply_rotation/reverse_rotation pipeline against
     minimal synthetic files covering both box-layout orders. This is the
@@ -319,6 +362,42 @@ class TestSyntheticRoundTrips(unittest.TestCase):
                         f"irot={target_irot} must sync Exif Orientation to "
                         f"{expected_exif}, matching documented real-world "
                         f"exiftool behavior")
+
+    def test_exif_sync_preserves_mirrored_orientation(self):
+        """Mirrored Exif Orientation values (2/4/5/7) must stay mirrored
+        after rotation - only the rotation component may change.
+        Ground truth is the exiftool value names (flip horizontal, then
+        rotate; delta is CCW quarter-turns added to the displayed image):
+          2 flip   5 flip+270CW(=90CCW)   4 flip+180   7 flip+90CW(=270CCW)
+        """
+        expected = {  # (start_exif, delta_turns) -> synced exif value
+            (2, 1): 5, (2, 2): 4, (2, 3): 7,
+            (5, 1): 4, (5, 2): 7, (5, 3): 2,
+            (4, 1): 7, (4, 2): 2, (4, 3): 5,
+            (7, 1): 2, (7, 2): 5, (7, 3): 4,
+        }
+
+        def read_exif_orientation(data):
+            info = hr.locate_structures(data)
+            field = hr.find_exif_orientation_field(
+                data, info['meta_body_start'], info['meta_hdr'][3])
+            return None if field is None else field[2]
+
+        for layout in ('mdat_first', 'meta_first'):
+            for (start, delta), want in expected.items():
+                with self.subTest(layout=layout, start=start, delta=delta):
+                    original = build_synthetic_heic(
+                        layout=layout, include_irot=False,
+                        include_exif=True, exif_orientation=start)
+                    rotated = hr.apply_rotation(original, delta, verbose=False)
+                    self.assertEqual(read_exif_orientation(rotated), want)
+                    self.assertEqual(
+                        hr.reverse_rotation(rotated, verbose=False), original)
+        # rotate 0 must leave a mirrored value alone
+        for start in (2, 4, 5, 7):
+            original = build_synthetic_heic(include_exif=True, exif_orientation=start)
+            rotated = hr.apply_rotation(original, 0, verbose=False)
+            self.assertEqual(read_exif_orientation(rotated), start)
 
     def test_rotate_zero_preserves_existing_rotation(self):
         """rotate 0 on a file that already has a nonzero irot must leave
