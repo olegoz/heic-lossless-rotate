@@ -37,6 +37,7 @@ No third-party dependencies. Python 3 standard library only.
   - [`info`](#info)
 - [How rotation values map to the container format](#how-rotation-values-map-to-the-container-format)
 - [Options](#options)
+  - [`--proceed-unsafe`](#--proceed-unsafe)
 - [Exit codes](#exit-codes)
 - [Known limitations](#known-limitations)
 - [Development install](#development-install)
@@ -488,25 +489,45 @@ shows the formats a release supports).
 | `--dry-run` | `rotate`, `reverse` | Do everything except write the output file |
 | `-f`, `--force` | `rotate`, `reverse` | Overwrite the output file if it already exists (refused by default) |
 | `--no-exif-sync` | `rotate` | Don't sync the legacy embedded Exif `Orientation` tag |
-| `--proceed-unsafe` | `reverse`, `info` | Proceed past checks that would otherwise refuse: for `reverse`, that the file appears to have been modified by something else since the last edit this tool made; for both, metadata entries this release doesn't know, which are then ignored. Each check it overrides is reported on stderr, even with `-q` (see note below) |
+| `--proceed-unsafe` | `reverse`, `info` | Proceed past some checks on the input file that would otherwise refuse, reporting each one it overrides on stderr, even with `-q` (see [`--proceed-unsafe`](#--proceed-unsafe) below) |
 
 All top-level flags (`-q`, `--dry-run`, `-f`) may be given either before or
 after the subcommand name.
 
-> **Note:** `-f`/`--force` and `--proceed-unsafe` control two
-> different things. `-f`/`--force` is purely about not clobbering an
-> existing *output* file. `--proceed-unsafe` overrides checks on the
-> *input* file. On `reverse`, it overrides a CRC mismatch indicating the
-> file was changed by something other than this tool since its last
-> edit — reversing in that situation could silently discard those other
-> changes. On `reverse` and `info`, it ignores metadata entries this
-> release doesn't know, which a newer release may have added: they may
-> change what `info` should report or what `reverse` should restore
-> (`reverse` still checks that the result matches the original file's
-> CRC32). Both are refused unless you explicitly opt in, and every check
-> it overrides is reported as a `warning (would be an error without
-> --proceed-unsafe): ...` line on stderr. `rotate` has no such option:
-> it would have to drop the unknown entries.
+`-f`/`--force` and `--proceed-unsafe` control two different things.
+`-f`/`--force` is purely about not clobbering an existing *output* file.
+`--proceed-unsafe` is about the *input* file.
+
+### `--proceed-unsafe`
+
+Without this option, each of these conditions is an error. With it, the
+command goes ahead:
+
+- **The file was modified by something else since this tool's last edit**
+  (its checksum doesn't match the one recorded then). Affects `reverse`
+  only (`info` doesn't check this). `reverse` restores the original
+  anyway, which can discard those other changes. Exit code `10` without
+  the option.
+- **The file's metadata has entries this release doesn't know**, as a
+  newer release may add. Affects `reverse` and `info`. The entries are
+  ignored, though they may change what `info` should report or what
+  `reverse` should restore. Exit code `11` without the option.
+
+Each condition it overrides is reported as a line on stderr, even with
+`-q`:
+
+```
+warning (would be an error without --proceed-unsafe): ...
+```
+
+It never overrides:
+
+- `reverse`'s final check that the restored file matches the original
+  file's checksum, so it still never writes a wrong file.
+- A newer metadata format, or a file mirrored by a newer release (exit
+  code `11`): update heic-lossless-rotate instead.
+- Anything in `rotate`, which has no such option: it would have to drop
+  the unknown entries.
 
 ## Exit codes
 
