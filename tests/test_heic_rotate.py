@@ -969,14 +969,14 @@ def _make_v2_style_record(original: bytes, rotated: bytes) -> bytes:
     'irot', an empty OIRT plus the pristine 'ipma' flags (OIPF)."""
     info = hr.locate_structures(original)
     iprp_hdr = info['iprp_hdr']
-    had_irot, irot_byte, ipma_flags = hr._extract_irot_state(
-        original, iprp_hdr[2], iprp_hdr[3], info['primary_item_id'])
+    model = hr.IprpModel(original, iprp_hdr[0], iprp_hdr[2], iprp_hdr[3])
+    found = model.first_assoc(info['primary_item_id'], b'irot')
     entries = _common_entries(rotated)
-    if had_irot:
-        entries[b'OIRT'] = bytes([irot_byte])
+    if found is not None:
+        entries[b'OIRT'] = bytes([model.payload_byte(found[1])])
     else:
         entries[b'OIRT'] = b''
-        entries[b'OIPF'] = struct.pack('>I', ipma_flags)[1:]
+        entries[b'OIPF'] = struct.pack('>I', model.ipma_flags)[1:]
     return _replace_record(rotated, 2, entries)
 
 
@@ -985,8 +985,9 @@ class TestProvenanceFormats(unittest.TestCase):
     'ipma' associations and 'ipco' properties that changed, OIPD/OIPC) -
     and `reverse` still correctly handles records written by older
     releases (v1: full 'iprp' snapshot, OPRP; v2: the 'irot' property
-    only, OIRT/OIPF), converting them to v3 on the next edit rather
-    than requiring them to be reversed first."""
+    only, OIRT/OIPF). `rotate` on such a file restores the original and
+    re-applies the recorded rotation plus the new one with current
+    code, rather than carrying the old record forward."""
 
     OLD_FORMATS = ((1, _make_v1_style_record), (2, _make_v2_style_record))
 
@@ -1090,34 +1091,134 @@ class TestProvenanceFormats(unittest.TestCase):
                     info = hr.gather_info(old_style)
                     self.assertEqual(info['delta_quarter_turns'], 1)
 
-    def test_next_edit_converts_old_record_to_current_format(self):
+    def test_rotate_replays_old_record_from_the_original(self):
+        """The result must be byte-identical to rotating the original by
+        the recorded rotation plus the new one, wrapped to 0-3 quarter
+        turns (e.g. 270 + 180 = 90) - nothing of the old edit is carried
+        forward."""
         for old_version, make in self.OLD_FORMATS:
             for include_irot in (True, False):
-                with self.subTest(old_version=old_version, fast_path=include_irot):
-                    original = build_synthetic_heic(layout='mdat_first',
-                                                      include_irot=include_irot)
-                    once_rotated = hr.apply_rotation(original, 1, verbose=False)
-                    old_style = make(original, once_rotated)
+                for old_turns, delta in ((1, 0), (1, 1), (3, 2), (3, 1), (2, 3)):
+                    with self.subTest(old_version=old_version,
+                                      fast_path=include_irot,
+                                      old_turns=old_turns, delta=delta):
+                        original = build_synthetic_heic(layout='mdat_first',
+                                                          include_irot=include_irot)
+                        old_style = make(original, hr.apply_rotation(
+                            original, old_turns, verbose=False))
+                        replayed = hr.apply_rotation(old_style, delta, verbose=False)
+                        self.assertEqual(
+                            replayed,
+                            hr.apply_rotation(original, (old_turns + delta) % 4,
+                                              verbose=False))
+                        self.assertEqual(
+                            hr.reverse_rotation(replayed, verbose=False), original)
 
-                    twice_rotated = hr.apply_rotation(old_style, 1, verbose=False)
-                    hr.verify_structure(twice_rotated)
+    def test_requested_rotation_for_each_format(self):
+        """v1/v2 releases changed raw 'irot' by the requested angle even
+        for photos mirrored after rotation; v3 changes it the opposite
+        way for those, so the requested angle is the displayed change."""
+        for original_turns in range(4):
+            for requested in range(4):
+                for mirrored in (False, True):
+                    with self.subTest(original=original_turns,
+                                      requested=requested, mirrored=mirrored):
+                        old_current = (original_turns + requested) % 4
+                        v3_current = (original_turns
+                                      + (-requested if mirrored else requested)) % 4
+                        for version in (1, 2):
+                            self.assertEqual(hr.requested_rotation(
+                                version, original_turns, old_current, mirrored),
+                                requested)
+                        self.assertEqual(hr.requested_rotation(
+                            3, original_turns, v3_current, mirrored), requested)
+        with self.assertRaises(hr.ProvenanceError):
+            hr.requested_rotation(hr.FORMAT_VERSION + 1, 0, 1, False)
 
-                    info = hr.locate_structures(twice_rotated)
-                    version, entries = hr.parse_provenance(
-                        twice_rotated, info['provenance_hdr'])
-                    self.assertEqual(version, hr.FORMAT_VERSION)
-                    self.assertIn(b'OIPD', entries)
-                    for old_tag in (b'OIRT', b'OIPF', b'OPRP', b'OIPM'):
-                        self.assertNotIn(old_tag, entries)
+    def test_v3_records_replay_correctly_after_a_future_format_bump(self):
+        """Pretend the next format bump has happened (FORMAT_VERSION 4):
+        records written today (v3) are then replayed from the original,
+        and must give exactly the bytes of rotating the original
+        directly - including photos mirrored after rotation, where v3's
+        raw 'irot' moved the opposite way to the requested angle."""
+        for kwargs in (dict(include_irot=True, irot_value=1),
+                       dict(include_irot=True, irot_value=1, imir_axis=1,
+                            include_exif=True),
+                       dict(include_irot=True, irot_value=0, imir_axis=0,
+                            imir_before_irot=True),
+                       dict(include_irot=False, imir_axis=1),
+                       dict(include_irot=True, irot_value=0, imir_axis=1,
+                            tmap='shared')):
+            for chain in ([1], [3], [1, 2]):
+                for delta in (0, 1):
+                    with self.subTest(chain=chain, delta=delta, **kwargs):
+                        original = build_synthetic_heic(layout='mdat_first', **kwargs)
+                        v3 = original
+                        for step in chain:
+                            v3 = hr.apply_rotation(v3, step, verbose=False)
+                        with unittest.mock.patch.object(hr, 'FORMAT_VERSION', 4), \
+                                unittest.mock.patch.object(
+                                    hr, 'SUPPORTED_REVERSE_FORMAT_VERSIONS',
+                                    (1, 2, 3, 4)):
+                            replayed = hr.apply_rotation(v3, delta, verbose=False)
+                            expected = hr.apply_rotation(
+                                original, (sum(chain) + delta) % 4, verbose=False)
+                        self.assertEqual(replayed, expected)
 
-                    after = hr.gather_info(twice_rotated)
-                    self.assertEqual(after['delta_quarter_turns'], 2)
+    def test_newer_format_is_refused_without_parsing_past_the_version(self):
+        """A record in a format newer than this release is refused by
+        `rotate`, `reverse` and `info` alike, right after its version
+        byte: the rest is deliberately garbage here (not even valid
+        entry framing), and must never be parsed."""
+        original = build_synthetic_heic(layout='mdat_first')
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        p_start, _, _, p_end, _ = hr.locate_structures(rotated)['provenance_hdr']
+        body = (hr.PROVENANCE_UUID + bytes([hr.FORMAT_VERSION + 1])
+                + b'\xff\x00garbage, not entries')
+        newer = (rotated[:p_start] + struct.pack('>I4s', len(body) + 8, b'uuid')
+                 + body + rotated[p_end:])
+        for name, call in (
+                ('rotate', lambda: hr.apply_rotation(newer, 1, verbose=False)),
+                ('reverse', lambda: hr.reverse_rotation(newer, verbose=False)),
+                ('info', lambda: hr.gather_info(newer))):
+            with self.subTest(command=name):
+                with self.assertRaises(hr.ProvenanceError) as ctx:
+                    call()
+                self.assertIn(f"format v{hr.FORMAT_VERSION + 1}, newer than "
+                              f"this release supports", str(ctx.exception))
+        tmpdir = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmpdir, 'newer.heic')
+            with open(path, 'wb') as f:
+                f.write(newer)
+            code, _, err = run_cli('info', path)
+            self.assertEqual(code, 10)
+            self.assertIn('newer than this release supports', err)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
-                    restored = hr.reverse_rotation(twice_rotated, verbose=False)
-                    self.assertEqual(restored, original,
-                                      "must still reverse all the way back to "
-                                      "the TRUE original after converting an "
-                                      f"old v{old_version} record")
+    def test_rotate_refuses_old_record_whose_original_cannot_be_restored(self):
+        """If `reverse` fails on an old-format record, `rotate` must not
+        guess: it refuses, and tells the user the two steps to do by
+        hand - reverse with the release that wrote the record, then
+        rotate with this one by the recorded plus the requested angle,
+        wrapped (here 270 + 180 = 90)."""
+        original = build_synthetic_heic(layout='mdat_first')
+        old_style = bytearray(_make_v2_style_record(
+            original, hr.apply_rotation(original, 3, verbose=False)))
+        info = hr.locate_structures(bytes(old_style))
+        _, entries = hr.parse_provenance(bytes(old_style), info['provenance_hdr'])
+        entries[b'TVER'] = bytes([1, 7, 1])
+        old_style = bytearray(_replace_record(bytes(old_style), 2, entries))
+        old_style[len(old_style) // 2] ^= 0xFF  # inside mdat: original is gone
+        with self.assertRaises(hr.ProvenanceError) as ctx:
+            hr.apply_rotation(bytes(old_style), 2, verbose=False)
+        message = str(ctx.exception)
+        self.assertIn("1. Run `reverse` on this file with "
+                      "heic-lossless-rotate 1.7.1", message)
+        self.assertIn("2. Run `rotate 90` on the restored file with this "
+                      "release: the 270 deg the earlier release added, plus "
+                      "the 180 deg requested now", message)
 
 
 def _display_state(data):
@@ -1158,7 +1259,7 @@ class TestMirroringAndGainMaps(unittest.TestCase):
 
     def test_exif_mapping_of_heif_transforms_matches_real_iphone_files(self):
         # (irot, imir axis) -> Exif Orientation, as written together by an
-        # iPhone (IMG_2804/2805/2806 in testdata)
+        # iPhone front camera
         cases = {(0, 1): 2, (1, 1): 7, (1, 0): 5}
         for (irot, axis), exif in cases.items():
             t = hr.compose_imir(hr.compose_irot((False, 0), irot), axis)
@@ -1266,6 +1367,42 @@ class TestMirroringAndGainMaps(unittest.TestCase):
             self.assertNotIn(b'OIRT', entries)
             self.assertIn(b'OIPD', entries)
             self.assertEqual(hr.reverse_rotation(data, verbose=False), original)
+
+    def test_rotate_0_repairs_files_rotated_by_releases_before_1_8_0(self):
+        """Releases before 1.8.0 changed 'irot' by the raw requested angle
+        (wrong direction for mirrored photos) and didn't know about 'tmap'
+        items (gain map left unrotated, shared 'irot' changed in place,
+        tmap 'ispe' left at the old shape). Hiding the mirror and tmap
+        from apply_rotation reproduces exactly that, and those releases
+        wrote v1/v2 records. `rotate 0` must then produce the very bytes
+        a 1.8.0 rotation of the original does."""
+        for kwargs in (dict(include_irot=False, tmap='own'),
+                       dict(include_irot=True, irot_value=0, tmap='shared'),
+                       dict(include_irot=True, irot_value=1, tmap='own'),
+                       dict(include_irot=True, irot_value=0, imir_axis=1,
+                            include_exif=True)):
+            for delta in (1, 2, 3):
+                with self.subTest(delta=delta, **kwargs):
+                    original = build_synthetic_heic(layout='mdat_first', **kwargs)
+                    with unittest.mock.patch.object(
+                            hr, 'find_tmap_items', return_value=[]), \
+                            unittest.mock.patch.object(
+                                hr, '_rotation_sign', return_value=1):
+                        legacy = hr.apply_rotation(original, delta, verbose=False)
+                    legacy = _make_v2_style_record(original, legacy)
+                    # info reports what was requested (and what rotate 0
+                    # re-applies), even where the old release displayed
+                    # it differently (mirrored photos), and says how to
+                    # bring the file up to date
+                    info = hr.gather_info(legacy)
+                    self.assertEqual(info['delta_quarter_turns'], delta)
+                    self.assertIn('`rotate 0` brings the file up to date',
+                                  hr.format_info(info)[0])
+                    repaired = hr.apply_rotation(legacy, 0, verbose=False)
+                    self.assertNotIn('`rotate 0`', hr.format_info(
+                        hr.gather_info(repaired))[0])
+                    self.assertEqual(
+                        repaired, hr.apply_rotation(original, delta, verbose=False))
 
     def test_shared_ispe_is_copied_not_changed_for_the_primary(self):
         original = build_synthetic_heic(include_irot=True, irot_value=0,

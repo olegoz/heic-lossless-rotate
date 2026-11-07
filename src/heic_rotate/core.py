@@ -30,8 +30,9 @@ class ProvenanceError(Exception):
 
 
 # The provenance format version every record is WRITTEN in. Older
-# records (v1/v2) are still read, and are converted to this version the
-# next time `rotate` edits such a file.
+# records (v1/v2) are still read by `reverse`/`info`; `rotate` on such a
+# file restores the original first and re-applies everything (see
+# _replay_from_original).
 FORMAT_VERSION = 3
 
 # Which provenance/metadata format versions `reverse` knows how to restore.
@@ -931,14 +932,22 @@ def find_provenance_box(data):
 
 
 def parse_provenance(data, hdr):
-    """Parse our provenance box content into (version, entries dict)."""
+    """Parse our provenance box content into (version, entries dict).
+
+    A record in a format NEWER than FORMAT_VERSION is refused right after
+    reading its version byte: nothing past it is parsed or interpreted,
+    since a newer format may have changed anything (`rotate`, `reverse`
+    and `info` all go through here)."""
     c_start, c_end = hdr[2], hdr[3]
     pos = c_start + 16  # skip the 16-byte uuid
+    if pos >= c_end:
+        raise ProvenanceError("provenance box truncated before its format version")
     version = data[pos]; pos += 1
     if version > FORMAT_VERSION:
         raise ProvenanceError(
-            f"provenance box format version {version} is newer than this "
-            f"script understands (max {FORMAT_VERSION}) - update heic-lossless-rotate")
+            f"this file's heic-lossless-rotate metadata is format "
+            f"v{version}, newer than this release supports (v{FORMAT_VERSION}) "
+            f"- update heic-lossless-rotate to rotate, reverse or inspect it")
     entry_count = data[pos]; pos += 1
     entries = {}
     for _ in range(entry_count):
@@ -1024,38 +1033,6 @@ def _rotation_from_iprp_range(data, iprp_c_start, iprp_c_end, primary_item_id):
     return 0
 
 
-def _extract_irot_state(data, iprp_c_start, iprp_c_end, primary_item_id):
-    """Given an 'iprp' byte range (ipco+ipma) and a primary item id,
-    return (had_irot, irot_byte, ipma_flags):
-      - had_irot=True: the primary item already has an 'irot' property
-        associated with it; irot_byte is that property's raw content
-        byte (unmasked - preserved exactly, not just the 2-bit angle),
-        ipma_flags is None (not needed for this case).
-      - had_irot=False: no such property; irot_byte is None, ipma_flags
-        is the (pre-insertion) 'ipma' box's own flags value, needed to
-        correctly restore 'ipma' on reverse if inserting 'irot' later
-        required setting the 15-bit-index ("wide") flag bit.
-    Works whether `data` is a whole file or a standalone snapshot buffer
-    (e.g. an old-format OPRP snapshot being migrated forward), as long
-    as the offsets given are correct within whichever buffer was
-    passed. No longer used to WRITE records (v2's OIRT/OIPF were built
-    from it); kept for reading/inspecting v1 'iprp' snapshots."""
-    ipco_hdr = find_unique_child(data, iprp_c_start, iprp_c_end, b'ipco', "'iprp'")
-    ipma_hdr = find_unique_child(data, iprp_c_start, iprp_c_end, b'ipma', "'iprp'")
-    if ipco_hdr is None or ipma_hdr is None:
-        raise BoxParseError("'iprp' is missing 'ipco' or 'ipma'")
-    ipco_children = parse_ipco_children(data, ipco_hdr[2], ipco_hdr[3])
-    _, ipma_flags, ipma_entries = parse_ipma(data, ipma_hdr[2], ipma_hdr[3])
-    primary_entry = next((e for e in ipma_entries if e[0] == primary_item_id), None)
-    if primary_entry is not None:
-        for prop_index, essential in primary_entry[1]:
-            if 1 <= prop_index <= len(ipco_children):
-                child = ipco_children[prop_index - 1]
-                if child[4] == b'irot':
-                    return True, data[child[2]], None
-    return False, None, ipma_flags
-
-
 def get_current_rotation(data):
     """Read the CURRENTLY-applied rotation (0-3 quarter turns) from the
     primary item's live 'irot' property, or 0 if it has none. This is
@@ -1074,26 +1051,6 @@ def get_rotation_from_iprp_snapshot(iprp_box_bytes, primary_item_id):
     was at the time heic-lossless-rotate first touched the file."""
     return _rotation_from_iprp_range(iprp_box_bytes, 8, len(iprp_box_bytes),
                                       primary_item_id)
-
-
-def parse_provenance_lenient(data, hdr):
-    """Like parse_provenance, but tolerates a provenance record whose
-    version is newer than this script knows about: it still returns
-    whatever entries it can structurally read (the outer TLV framing is
-    kept stable across format versions by design), rather than raising.
-    Used by `info`, which only reports what it finds rather than relying
-    on it for a byte-exact reconstruction the way `reverse` does."""
-    c_start, c_end = hdr[2], hdr[3]
-    pos = c_start + 16
-    version = data[pos]; pos += 1
-    entry_count = data[pos]; pos += 1
-    entries = {}
-    for _ in range(entry_count):
-        tag = bytes(data[pos:pos + 4]); pos += 4
-        length = struct.unpack_from('>I', data, pos)[0]; pos += 4
-        value = bytes(data[pos:pos + length]); pos += length
-        entries[tag] = value
-    return version, entries, (pos == c_end)
 
 
 # ---------------------------------------------------------------------------
@@ -1275,6 +1232,119 @@ def _splice_iprp(data, struct_info, new_iprp_box, verbose, label):
     return out, delta
 
 
+def requested_rotation(record_version, original_turns, current_turns,
+                       mirrored_after_rotation):
+    """The cumulative rotation (0-3 quarter turns) that was REQUESTED from
+    the release(s) that wrote a provenance record of format
+    `record_version`, given the primary item's raw 'irot' value in the
+    original file and now, and whether its 'imir' is applied after its
+    'irot' (an odd number of 'imir' following it - see _rotation_sign;
+    the order never changes between edits, so the current file's
+    answers for the original too).
+
+    How the requested angle maps to raw 'irot' depends on which releases
+    wrote the record:
+      v1, v2: raw 'irot' was changed by exactly the requested angle,
+        mirrored or not (those releases didn't know about 'imir', so a
+        photo mirrored after rotation displayed the opposite way).
+      v3: raw 'irot' is changed in the OPPOSITE direction for a photo
+        mirrored after rotation, so that it displays the requested way;
+        the requested angle is the displayed change.
+    Raises ProvenanceError for a format it doesn't know - add a case
+    here whenever FORMAT_VERSION is bumped, before records of the
+    previous format get replayed (see _replay_from_original)."""
+    raw = (current_turns - original_turns) % 4
+    if record_version in (1, 2):
+        return raw
+    if record_version == 3:
+        return (-raw) % 4 if mirrored_after_rotation else raw
+    raise ProvenanceError(
+        f"don't know how a format v{record_version} provenance record "
+        f"stores the requested rotation")
+
+
+def _mirrored_after_rotation(data):
+    """Whether `data`'s primary item has an odd number of 'imir'
+    properties applied after its 'irot' (see _rotation_sign)."""
+    info = locate_structures(data)
+    iprp_hdr = info['iprp_hdr']
+    model = IprpModel(data, iprp_hdr[0], iprp_hdr[2], iprp_hdr[3])
+    return _rotation_sign(model.prop_types(info['primary_item_id'])) < 0
+
+
+def _recorded_rotation(data, record_version, entries, original=None):
+    """requested_rotation() for `data`, a file with a format
+    `record_version` provenance record holding `entries`. The original
+    'irot' value is read from `original` (the restored original file)
+    if given, otherwise straight from the record - so it is known even
+    if the original can't be restored."""
+    if original is not None:
+        original_turns = get_current_rotation(original)
+    else:
+        info = locate_structures(data)
+        original_turns = get_rotation_from_iprp_snapshot(
+            _pristine_iprp_bytes(data, info, entries), info['primary_item_id'])
+    return requested_rotation(record_version, original_turns,
+                              get_current_rotation(data),
+                              _mirrored_after_rotation(data))
+
+
+def _replay_from_original(data, record_version, entries, delta_turns,
+                          sync_exif, verbose):
+    """apply_rotation() for a file whose provenance record is in an OLDER
+    format than FORMAT_VERSION: rather than carrying forward (and having
+    to repair) state written by an older release, restore the original
+    file with `reverse` - which verifies it against the recorded
+    original-file CRC - and rotate it with this release's code by the
+    rotation the older release added plus `delta_turns`, mod 4: the same
+    as a single first edit of the original by that total angle.
+
+    `reverse` only reads each older format's normal final record; it
+    makes no attempt to recover from bugs in the releases that wrote
+    them. If it fails, nothing is written and the user is told the two
+    steps to do by hand instead."""
+    delta_turns %= 4
+    try:
+        original = reverse_rotation(data, verbose=False)
+    except (ProvenanceError, BoxParseError) as e:
+        try:
+            added = _recorded_rotation(data, record_version, entries)
+        except (ProvenanceError, BoxParseError):
+            added = None
+        tver = entries.get(b'TVER')
+        writer = (f"heic-lossless-rotate {'.'.join(map(str, tver))}"
+                  if tver is not None and len(tver) == 3
+                  else "a heic-lossless-rotate release before 1.6.0")
+        if added is not None:
+            total = (added + delta_turns) % 4
+            step2 = (f"Run `rotate {total * 90}` on the restored file with "
+                     f"this release: the {added * 90} deg the earlier release "
+                     f"added, plus the {delta_turns * 90} deg requested now")
+        else:
+            step2 = (f"Run `rotate` on the restored file with this release, "
+                     f"by the angle the earlier release was asked to add "
+                     f"plus the {delta_turns * 90} deg requested now (minus "
+                     f"360 deg if the sum is 360 or more)")
+        raise ProvenanceError(
+            f"cannot upgrade this file's metadata (format v{record_version}, "
+            f"written by {writer}): restoring the original file failed: "
+            f"{str(e).rstrip('.')}.\n"
+            f"To fix:\n"
+            f"  1. Run `reverse` on this file with {writer}, the release "
+            f"that wrote this metadata (it verified at the time that the "
+            f"original could be restored from it).\n"
+            f"  2. {step2}.") from None
+    added = _recorded_rotation(data, record_version, entries, original)
+    total = (added + delta_turns) % 4
+    if verbose:
+        print(f"[provenance] metadata format v{record_version} predates "
+              f"v{FORMAT_VERSION}: restored the original (CRC verified); "
+              f"rotating it by {total * 90} deg - the {added * 90} deg the "
+              f"earlier release added, plus the {delta_turns * 90} deg "
+              f"requested now")
+    return apply_rotation(original, total, sync_exif, verbose)
+
+
 def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     """Rotate the image by `delta_turns` quarter-turns ON TOP OF whatever
     rotation is already recorded (0 if none) - NOT to an absolute angle.
@@ -1324,7 +1394,12 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     # -- edit instead of getting back to the true original. --
     existing_provenance = None
     if struct_info['provenance_hdr'] is not None:
-        _, existing_provenance = parse_provenance(data, struct_info['provenance_hdr'])
+        record_version, existing_provenance = parse_provenance(
+            data, struct_info['provenance_hdr'])
+        if record_version < FORMAT_VERSION:
+            return _replay_from_original(data, record_version,
+                                         existing_provenance, delta_turns,
+                                         sync_exif, verbose)
         if verbose:
             print("[info] existing provenance record found - this file has "
                   "been edited by heic-lossless-rotate before; preserving its "
@@ -1496,9 +1571,10 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     # 'ipco' children differ from the edited 'iprp' (see
     # iprp_diff_entries).
     # Recomputed on every edit from the PRISTINE 'iprp' - captured live
-    # on a first-ever edit, reconstructed from the existing record (any
-    # supported format, so v1/v2 records are converted here) otherwise -
-    # so that a property first touched by THIS edit is covered too.
+    # on a first-ever edit, reconstructed from the existing (always
+    # current-format: older ones go through _replay_from_original)
+    # record otherwise - so that a property first touched by THIS edit
+    # is covered too.
     entries = {}
     if existing_provenance is None:
         pristine_iprp = bytes(data[iprp_start:iprp_c_end])
@@ -1515,9 +1591,6 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         for tag in (b'OILC', b'OMSZ', b'OEXO', b'PCRC'):
             if tag in existing_provenance:
                 entries[tag] = existing_provenance[tag]
-        if verbose and b'OIPC' not in existing_provenance:
-            print(f"[provenance] converting the existing (older-format) "
-                  f"record to format v{FORMAT_VERSION}")
     edited_iprp_hdr = locate_structures(out)['iprp_hdr']
     edited_iprp = bytes(out[edited_iprp_hdr[0]:edited_iprp_hdr[3]])
     try:
@@ -1544,11 +1617,11 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     #   - old_prov_size == new_prov_size: the common case for every edit
     #     after the first (only CCRC's and TVER's fixed-width VALUES
     #     change, never the box's overall size) - no iloc patching needed.
-    #   - old_prov_size != new_prov_size (both nonzero): a one-time
-    #     migration - e.g. an on-disk record written by an older
-    #     heic-lossless-rotate that predates an entry tag this version adds
-    #     (such as TVER itself, the first time a pre-1.6.0-edited file is
-    #     rotated again by 1.6.0+) is being resized to fit the new set.
+    #   - old_prov_size != new_prov_size (both nonzero): this edit
+    #     changed which 'iprp' properties/associations differ from the
+    #     original (OIPC/OIPD - e.g. a gain-map 'tmap' item needing its
+    #     own copy of a box for the first time), or the record lacks a
+    #     tag this version writes.
     info_now = locate_structures(out)
     old_prov_hdr = info_now['provenance_hdr']
     if old_prov_hdr is not None:
@@ -1589,8 +1662,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
                       "(metadata precedes media data in this file's "
                       "layout)")
         if verbose and old_prov_size:
-            print(f"[provenance] existing record predates an entry tag "
-                  f"this tool version writes - migrating it in place "
+            print(f"[provenance] existing record resized in place "
                   f"({old_prov_size} -> {new_prov_size} bytes)")
 
     # Now compute the REAL CCRC over the file as it will be immediately
@@ -2048,15 +2120,21 @@ def gather_info(data):
       original_quarter_turns : 0-3, what the rotation was at the time
                                 heic-lossless-rotate FIRST touched the file
                                 (if has_provenance)
-      delta_quarter_turns    : 0-3, how much heic-lossless-rotate has added on
-                                top of that original, cumulatively across
-                                every edit since (if has_provenance) -
-                                THIS is the number that answers "what did
-                                this tool do to it", as opposed to
-                                current_quarter_turns which also reflects
-                                whatever rotation the file started with
+      delta_quarter_turns    : 0-3, the rotation REQUESTED from
+                                heic-lossless-rotate on top of that
+                                original, cumulatively across every edit
+                                since (if has_provenance; see
+                                requested_rotation) - THIS is the number
+                                that answers "what did this tool do to
+                                it", as opposed to current_quarter_turns
+                                which also reflects whatever rotation the
+                                file started with. For a latest-format
+                                record it is what viewers show; for an
+                                older record of a photo that release
+                                displayed wrongly (mirrored photos before
+                                1.8.0) it can differ from the screen, and
+                                is what `rotate 0` re-applies
       version                : provenance format version (if has_provenance)
-      version_supported      : bool - False if newer than FORMAT_VERSION
       tool_version            : (major, minor, patch) tuple - the
                                  heic-lossless-rotate version that most
                                  recently UPDATED (rotated) the file (if
@@ -2077,9 +2155,8 @@ def gather_info(data):
       has_iloc_snapshot, has_exif_snapshot : bool (if has_provenance)
       mirrored_after_rotation : bool (if has_provenance) - the primary
                                  item's 'imir' is applied after its
-                                 'irot', so delta_quarter_turns (the
-                                 DISPLAYED rotation added) runs opposite
-                                 to the change in the raw 'irot' value
+                                 'irot', so the displayed image turns
+                                 opposite to the raw 'irot' value
     """
     current_quarter_turns = get_current_rotation(data)
     result = {
@@ -2092,37 +2169,27 @@ def gather_info(data):
     if prov_hdr is None:
         return result
 
-    version, entries, well_formed = parse_provenance_lenient(data, prov_hdr)
+    # Raises for a format newer than this release (see parse_provenance)
+    # or a corrupt record - `info` doesn't guess at either.
+    version, entries = parse_provenance(data, prov_hdr)
     result['has_provenance'] = True
     result['version'] = version
-    result['version_supported'] = (version <= FORMAT_VERSION) and well_formed
     result['has_iloc_snapshot'] = b'OILC' in entries
     result['has_exif_snapshot'] = b'OEXO' in entries
 
-    # The live 'irot' delta, converted to the DISPLAYED rotation's
-    # direction: opposite if the primary item is mirrored after its
-    # rotation (see _rotation_sign).
-    iprp_hdr = info['iprp_hdr']
-    sign = _rotation_sign(IprpModel(data, iprp_hdr[0], iprp_hdr[2], iprp_hdr[3])
-                          .prop_types(info['primary_item_id']))
-    result['mirrored_after_rotation'] = sign < 0
+    mirrored = _mirrored_after_rotation(data)
+    result['mirrored_after_rotation'] = mirrored
 
+    original_quarter_turns = None
     if b'OIPC' in entries:
         try:
             original_quarter_turns = get_rotation_from_iprp_snapshot(
                 _pristine_iprp_bytes(data, info, entries), info['primary_item_id'])
         except (BoxParseError, ProvenanceError, KeyError):
-            original_quarter_turns = None
-        if original_quarter_turns is not None:
-            result['original_quarter_turns'] = original_quarter_turns
-            result['delta_quarter_turns'] = (
-                sign * (current_quarter_turns - original_quarter_turns) % 4)
+            pass
     elif b'OPRP' in entries:
         original_quarter_turns = get_rotation_from_iprp_snapshot(
             entries[b'OPRP'], info['primary_item_id'])
-        result['original_quarter_turns'] = original_quarter_turns
-        result['delta_quarter_turns'] = (
-            sign * (current_quarter_turns - original_quarter_turns) % 4)
     elif b'OIRT' in entries:
         oirt = entries[b'OIRT']
         # length 1: 'irot' already existed originally - its original
@@ -2130,9 +2197,14 @@ def gather_info(data):
         # tool reads a live 'irot' byte) is the original rotation.
         # length 0: no 'irot' existed - absence implies 0 deg per spec.
         original_quarter_turns = (oirt[0] & 0x3) if len(oirt) == 1 else 0
+
+    if original_quarter_turns is not None:
         result['original_quarter_turns'] = original_quarter_turns
-        result['delta_quarter_turns'] = (
-            sign * (current_quarter_turns - original_quarter_turns) % 4)
+        # The rotation REQUESTED, cumulatively - the same rule `rotate`
+        # uses to replay older records (see requested_rotation). For a
+        # latest-format record it is exactly what viewers show.
+        result['delta_quarter_turns'] = requested_rotation(
+            version, original_quarter_turns, current_quarter_turns, mirrored)
 
     if b'PCRC' in entries:
         result['pcrc'] = struct.unpack('>I', entries[b'PCRC'])[0]
@@ -2174,10 +2246,7 @@ def format_info(result, quiet=False):
     tool_version_str = (f" v{tool_version[0]}.{tool_version[1]}.{tool_version[2]}"
                          if tool_version is not None else "")
     lines = [f"Rotated with heic-lossless-rotate{tool_version_str}, "
-             f"provenance format v{result['version']}"
-             + ("" if result['version_supported'] else
-                f" (NEWER than this script's v{FORMAT_VERSION} - shown info "
-                f"may be incomplete)") + "."]
+             f"provenance format v{result['version']}."]
     if delta_degrees is not None:
         lines.append(f"  heic-lossless-rotate has added: {delta_degrees} deg")
         if result.get('mirrored_after_rotation'):
@@ -2189,11 +2258,16 @@ def format_info(result, quiet=False):
             lines.append(f"  file's rotation: {original_degrees} deg originally "
                           f"-> {current_degrees} deg now")
     else:
-        # OPRP missing (shouldn't normally happen - it's always saved on
-        # first edit) - fall back to reporting only the absolute value.
+        # Original rotation unreadable (shouldn't normally happen - it's
+        # always saved on first edit) - report only the absolute value.
         lines.append(f"  currently at: {current_degrees} deg (original "
                       f"rotation snapshot unavailable - can't compute what "
                       f"this tool added specifically)")
+    if result['version'] < FORMAT_VERSION:
+        lines.append(f"  metadata format is older than this release's "
+                      f"(v{FORMAT_VERSION}): `rotate 0` brings the file up "
+                      f"to date, re-applying the rotation added above with "
+                      f"this release's code")
     if 'pcrc' in result:
         lines.append(f"  original file CRC32:      {result['pcrc']:#010x}")
     extras = []

@@ -113,9 +113,11 @@ same as heic-lossless-rotate itself. Requires Python 3.
    entry tag, and the post-rotate reversibility self-check that `rotate`
    now always runs before writing output. A helper, `_strip_provenance_
    tag`, builds a self-consistent "legacy-style" record (missing a given
-   tag, with `iloc` correctly patched to match) to simulate what a file
-   edited by an older tool version genuinely looks like on disk, rather
-   than just deleting bytes and hoping. Includes a `rotate 0` case,
+   tag, with `iloc` correctly patched to match) to simulate a record
+   lacking a newer tag, rather than just deleting bytes and hoping.
+   (Since 1.8.0, real records from older releases are in an older
+   format and are replayed from the original instead - see
+   `TestProvenanceFormats`.) Includes a `rotate 0` case,
    confirming that command can be used purely to bring an old file's
    metadata up to date without touching its displayed rotation, and a
    mocked-failure case confirming `rotate` writes nothing at all if the
@@ -129,8 +131,18 @@ same as heic-lossless-rotate itself. Requires Python 3.
    still reverses, that such a record is measurably smaller than
    the old v1 format for a file with unrelated `iprp` content, that
    `reverse` still correctly restores old v1 (full `iprp` snapshot) and
-   v2 (`irot` property only) records directly, and that `rotate`
-   converts either to v3 the next time it edits such a file. Helpers,
+   v2 (`irot` property only) records directly, that `rotate` on either
+   produces exactly the bytes of rotating the restored original by the
+   recorded plus the new rotation (wrapped past 360°, e.g. 270 + 180 =
+   90), and that if the original can't be restored it refuses, giving
+   the two manual steps: `reverse` with the release that wrote the
+   record, then `rotate` by the combined angle with this release.
+   `requested_rotation()` (how each format stores the requested angle:
+   raw `irot` change for v1/v2, displayed change for v3) is checked
+   against a full table, and its v3 case - unused until the next format
+   bump - end to end by patching `FORMAT_VERSION` to 4 so that today's
+   v3 records are replayed.
+   Helpers,
    `_make_v1_style_record` / `_make_v2_style_record`, build those
    fixtures from a real rotation result plus the original bytes, for
    testing without needing actual files left over from older releases.
@@ -249,6 +261,39 @@ same as heic-lossless-rotate itself. Requires Python 3.
      rather than wrapping it in `bytes()` first; pinned directly since
      nothing else would fail if that copy were silently reintroduced
      (bytes and bytearray compare equal).
+
+7. **Mirrored and HDR gain-map photos** (`TestMirroringAndGainMaps`).
+   Regression tests for two real-world bugs found on iPhone and Samsung
+   files (fixed in 1.8.0):
+   - **Mirrored photos.** A mirror (`imir`) listed after the rotation
+     (`irot`) reverses the visible direction of the rotation. The tests
+     check that the displayed image turns the requested way for every
+     mirror axis, property order, starting rotation and angle. They also
+     check the Exif Orientation sync, `info`'s reported delta, and that
+     `reverse` gets back the original.
+   - **HDR gain-map photos.** The tests check that each `tmap` item
+     keeps an identity transform and an `ispe` equal to the main
+     image's displayed size, and that the gain map turns together with
+     the main image. They cover both the "own" and the "shared"
+     property layouts, across single edits, chains of edits and the
+     slow path. A shared `ispe`/`irot` must be copied, never changed in
+     place for the main image.
+   - **Repair of files rotated by releases before 1.8.0.** Those
+     releases are reproduced by hiding the `tmap` item and the mirror
+     direction from `apply_rotation` (mocking `find_tmap_items` and
+     `_rotation_sign`), with the v2 record they wrote. The test checks
+     that `rotate 0` then produces exactly the bytes of a 1.8.0
+     rotation of the original.
+
+   `synth_heic.py` gained three parameters for this group:
+   - `imir_axis` (None, or 0/1 to add a mirror property),
+   - `imir_before_irot` (property order),
+   - `tmap` (None, `'own'` or `'shared'`). Adds a gain-map item and a
+     `tmap` item referencing the main image and the gain map. `'own'`
+     gives the `tmap` item its own `ispe`/`irot`. `'shared'` shares the
+     main image's, as iPhones do for an unrotated photo. `'shared'`
+     requires an `irot` of 0, because that's the only value an encoder
+     would share.
 
 ## Adding your own files to `testdata/`
 

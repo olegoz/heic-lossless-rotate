@@ -120,13 +120,25 @@ file, byte for byte:
     refuse rather than silently corrupting it)
   - a 1-byte format VERSION, so a future version of this script can
     detect old-format provenance records and apply the correct legacy
-    reverse algorithm instead of misreading a newer/older layout.
+    reverse algorithm instead of misreading a newer/older layout. A
+    record in a format NEWER than this release knows is refused by
+    `rotate`, `reverse` and `info` alike, right after reading the
+    version byte - nothing else in it is parsed.
     Every record is written as v3 (described above). Older releases
     wrote v1 (the WHOLE pristine 'iprp' box) or v2 (only the 'irot'
     property's pristine byte, or a marker plus 'ipma's original flags
     if 'irot' had to be inserted) - `reverse` still supports reading
-    those directly, and `rotate` converts one to v3 the next time it
-    edits such a file.
+    those directly. `rotate` on such a file restores the original first
+    (checked against the recorded CRC), then applies the rotation the
+    old record says was added plus the requested one with this
+    release's code - so files are never carried forward, or repaired,
+    from state an older release wrote. The angles add up mod 360
+    (e.g. 270 recorded + `rotate 180` = 90). `reverse` itself only reads
+    each older format's normal final record; it never tries to recover
+    from bugs in the releases that wrote them. If the original can't be
+    restored, `rotate` writes nothing and gives the two steps to do by
+    hand: `reverse` with the release that wrote the record, then
+    `rotate` the restored file with this release by the combined angle.
   - the heic-lossless-rotate version (major.minor.patch) that most recently
     UPDATED the file - shown by `info` as "Rotated with heic-lossless-rotate
     vX.Y.Z". Written by `rotate` only, as part of the same edit whose
@@ -175,6 +187,12 @@ and refused with a clear error rather than silently mis-editing the file:
     decoders - e.g. Nokia's HEIF reference implementation - are written
     to read it), but rebuilding 'iprp' from just the first match found
     would silently discard any associations recorded in a second one.
+    Likewise an 'iprp' holding any other box, or an 'ipco'/'ipma' with a
+    64-bit size field: the provenance record couldn't restore it exactly.
+  - An HDR gain map with a rotation property of its own, not shared with
+    the primary item, isn't rotated - `rotate` prints a warning instead
+    (HDR viewers may show it misaligned). None of the real photos tested
+    has this.
   - The legacy embedded Exif Orientation sync only handles the Exif item
     being stored via an absolute file offset (iloc construction_method
     0). If it's stored via 'idat' (construction_method 1) or another

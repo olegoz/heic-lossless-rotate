@@ -246,7 +246,7 @@ heic-rotate -V | --version
 
 Regardless of which command you're running, the tool itself always
 identifies as **heic-lossless-rotate** in its own output — e.g. `-V`
-prints `heic-lossless-rotate 1.7.0` even when invoked as `heic-rotate -V`.
+prints `heic-lossless-rotate <version>` even when invoked as `heic-rotate -V`.
 
 (See [Options](#options) below for the full list of flags, including a
 couple of less-common ones not shown here.)
@@ -295,8 +295,8 @@ heic-rotate --dry-run 180 IMG_0001.heic
 # Check whether/how this tool has previously touched a file
 heic-rotate info IMG_0001_rotated.heic
 
-# Bring an old file's metadata up to date (e.g. add version tracking to
-# a file rotated by an older release) without changing how it displays
+# Bring a file rotated by an older release up to date (current metadata
+# format, plus any fixes made since), keeping the rotation you asked for
 heic-rotate 0 IMG_0001_rotated.heic IMG_0001_updated.heic
 
 # Undo every edit this tool has made, restoring the exact original bytes
@@ -344,8 +344,8 @@ does nothing to those files (`0 image files updated`).
   offsets affected by the size change are patched.
 
 It also keeps a legacy embedded Exif `Orientation` tag (if present) in sync
-with the new `irot` value, since some non-strict HEIF readers fall back to
-that instead.
+with the new orientation (the rotation, plus the mirroring for mirrored
+photos), since some non-strict HEIF readers fall back to that instead.
 
 **Only container/box bytes are ever touched.** The `mdat` payload (the
 actual compressed image data) is never read or rewritten, so every edit is
@@ -358,23 +358,41 @@ guaranteed lossless with respect to image content.
 Applying a rotation stores a compact provenance record in a private
 top-level `uuid` box (the standard ISOBMFF mechanism for vendor-private
 data, silently skipped by compliant readers). The record holds the
-`irot` property's pristine state (its original byte if one already
-existed, or a marker plus `ipma`'s original flags if it didn't), the
-pristine `iloc` content and `meta` size field, the legacy Exif
-orientation byte if present, CRC32 checksums used to detect if the
-file is modified by something else afterward, and the tool version
-that most recently updated the file (shown by `info`).
+original state of only the item properties and associations the tool
+changed (the `irot` value, or the fact that there was none, and for HDR
+gain-map photos the `tmap` item's properties), the pristine `iloc`
+content and `meta` size field, the legacy Exif orientation byte if
+present, CRC32 checksums used to detect if the file is modified by
+something else afterward, and the tool version that most recently
+updated the file (shown by `info`).
 
-Rotating an already-edited file updates only the live rotation value, the
-"current file" checksum, and the recorded tool version; the original
-pristine snapshot captured on the very first edit is never overwritten,
-so `reverse` can always undo every edit made since, no matter how many
-times you've rotated the file. If the file's existing record predates a
-field the current version adds, or uses an older, larger record format,
-it's migrated in place on the next edit. Which means **`rotate 0` can be
-used purely to bring an old file's provenance record up to date** (adding
-new fields, or shrinking its record to the current format) without
-changing how the image displays.
+Rotating a file whose record is in the current metadata format just goes
+forward from its current state. It updates the rotation (and, for HDR
+gain-map photos, the `tmap` item), the record's list of what has changed,
+the "current file" checksum and the recorded tool version. The original
+state captured on the very first edit is never overwritten, so `reverse`
+can always undo every edit made since, no matter how many times you've
+rotated the file.
+
+If the file's record was written in an older metadata format, `rotate N`
+instead first restores the original file (checked against the recorded
+checksum). It then rotates the original
+with the current version's code by the angle the older release was asked
+to add, plus N. For example, 270° plus `rotate 180` gives 90°, since a
+total of 360° or more wraps around. So `rotate 0` brings a file rotated
+by an older release up to date, including any fixes made since, and
+keeps the rotation you asked for. If the original can't be restored,
+`rotate` writes nothing, and tells you the two steps to do by hand:
+`reverse` the file with the release that wrote the record, then rotate
+the restored file with the current version by the combined angle.
+
+**Recovering from a bug in an earlier release.** The recommended way is
+to run `reverse` with the latest release (it can also reverse records
+written by earlier releases), check the restored file yourself, then
+rotate it with the latest release. `rotate` on the already-rotated file does the same in one step,
+but the angle you give it is added to what you asked the earlier release
+for, not to what you see on screen. Those differ when a bug made the
+earlier release show the photo wrongly, as with mirrored photos below.
 
 Before writing anything, `rotate` also reverses its own freshly-produced
 output in memory and confirms that reconstructs the original exactly —
@@ -402,9 +420,18 @@ not this final one.
 tool* has added to a file, distinct from the file's absolute current
 orientation (which may include rotation the file already had before you
 ever ran this script on it), plus which tool version most
-recently updated the file, e.g. `Rotated with heic-lossless-rotate v1.7.0,
-provenance format v3.` (omitted for files rotated before version
-tracking was added).
+recently updated the file and the record's metadata format, e.g.
+`Rotated with heic-lossless-rotate v<version>, provenance format v<format>.`
+(omitted for files rotated before version tracking was added).
+
+The rotation it reports is the one you asked for. For a file rotated by
+the latest release, that is exactly what viewers show, mirrored or not:
+`rotate 90` on the original shows the photo turned 90° counter-clockwise,
+and `info` reports 90. A file rotated by an older release that displayed
+it wrongly (mirrored photos, before 1.8.0) can look different from what
+`info` reports. `info` then says the metadata is in an older format, and
+`rotate 0` brings the file up to date by re-applying the reported
+rotation with the latest release's code.
 
 ## How rotation values map to the container format
 
@@ -424,21 +451,26 @@ few kinds of file get extra handling:
   in the opposite direction, because the mirror reverses the visible
   rotation. `info` labels such files as mirrored, since their raw `irot`
   value then moves the opposite way to what the tool reports it added.
+  Releases before 1.8.0 turned these photos the wrong way. If you rotated
+  one with such a release, see "Recovering from a bug in an earlier
+  release" above.
 - **HDR photos with a gain map** (recent iPhones and Samsung Galaxy
   phones): these contain a second, tone-mapped (`tmap`) image that
   HDR-capable viewers show instead of the main one. Its stored size is
   updated to the new orientation, and its own rotation is kept separate
   from the main image's. Without this, viewers show the rotated photo
-  inside a frame of the old shape, cropped and with blank bars. If you
-  rotated such a file with an earlier release, run `rotate 0` on it to fix
-  it. `reverse` still restores the true original.
+  inside a frame of the old shape, cropped and with blank bars. The gain
+  map itself turns together with the main image. Releases before 1.8.0
+  didn't handle these photos. If you rotated one with such a release,
+  see "Recovering from a bug in an earlier release" above.
 
-Every edit writes its provenance record in the current metadata format
-(format 3). Records written by earlier releases (formats 1 and 2) can
-still be reversed, and are converted to format 3 the next time the file
-is edited. Releases before this one refuse to `reverse` a format 3
-record rather than guessing, so reverse a file with this release (or a
-newer one) once it has been edited by it.
+Every edit writes its provenance record in the latest metadata format.
+Records in older formats, written by earlier releases, can still be
+reversed, and `rotate` replaces them as described above. A record in a
+format newer than the running release knows is refused outright, by
+`rotate`, `reverse` and `info` alike: beyond its format number, nothing
+in it is read. So once a newer release has edited a file, use that
+release or a later one (`-V` shows the formats a release supports).
 
 ## Options
 
@@ -473,7 +505,7 @@ script can branch on the result without parsing text output:
 | `0` | No provenance record found — this tool has never touched the file |
 | `1` / `2` / `3` | This tool's cumulative contribution is `90°` / `180°` / `270°` |
 | `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. `rotate 0` was used just to add tracking, or opposing rotations cancelled out) |
-| `10` | A genuine error occurred (e.g. unreadable file, refused overwrite) — deliberately outside `0`–`4` so it's never mistaken for a rotation-state result |
+| `10` | A genuine error occurred (e.g. unreadable file, refused overwrite, metadata in a format newer than this release) — deliberately outside `0`–`4` so it's never mistaken for a rotation-state result |
 
 ## Known limitations
 
@@ -488,7 +520,13 @@ refused with a clear error rather than silently mis-editing the file:
 - More than one `ipma` (or `ipco`) box inside a single `iprp` is refused.
   The standard allows this, but rebuilding `iprp` from just the first
   match found would silently discard associations recorded in a second
-  one — so it's refused instead of guessed.
+  one — so it's refused instead of guessed. Likewise, an `iprp` holding
+  any other box, or an `ipco`/`ipma` box with a 64-bit size field, is
+  refused, since the provenance record couldn't restore it exactly.
+- If an HDR photo's gain map has a rotation property of its own that
+  isn't shared with the main image, the gain map isn't rotated: `rotate`
+  prints a warning, and HDR viewers may show it misaligned. No phone
+  photo tested is built like this.
 - The legacy embedded Exif `Orientation` sync only handles the Exif item
   being stored via an absolute file offset. If it's stored via `idat` or
   another item's data, the sync is silently skipped — safe, just
