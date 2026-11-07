@@ -403,7 +403,7 @@ tool* has added to a file, distinct from the file's absolute current
 orientation (which may include rotation the file already had before you
 ever ran this script on it), plus which tool version most
 recently updated the file, e.g. `Rotated with heic-lossless-rotate v1.7.0,
-provenance format v2.` (omitted for files rotated before version
+provenance format v3.` (omitted for files rotated before version
 tracking was added).
 
 ## How rotation values map to the container format
@@ -415,6 +415,30 @@ directly into the ISOBMFF `irot` box's 2-bit angle field, per
 that spec, the angle is **counter-clockwise**: `rotate 90` turns the image
 90° counter-clockwise, and `rotate 270` turns it 90° clockwise (270°
 counter-clockwise is the same as 90° clockwise).
+
+The angle you give always describes how the *displayed* image turns, so a
+few kinds of file get extra handling:
+
+- **Mirrored photos** (for example iPhone front-camera shots, which have an
+  `imir` mirror property applied after `irot`): the `irot` value is changed
+  in the opposite direction, because the mirror reverses the visible
+  rotation. `info` labels such files as mirrored, since their raw `irot`
+  value then moves the opposite way to what the tool reports it added.
+- **HDR photos with a gain map** (recent iPhones and Samsung Galaxy
+  phones): these contain a second, tone-mapped (`tmap`) image that
+  HDR-capable viewers show instead of the main one. Its stored size is
+  updated to the new orientation, and its own rotation is kept separate
+  from the main image's. Without this, viewers show the rotated photo
+  inside a frame of the old shape, cropped and with blank bars. If you
+  rotated such a file with an earlier release, run `rotate 0` on it to fix
+  it. `reverse` still restores the true original.
+
+Every edit writes its provenance record in the current metadata format
+(format 3). Records written by earlier releases (formats 1 and 2) can
+still be reversed, and are converted to format 3 the next time the file
+is edited. Releases before this one refuse to `reverse` a format 3
+record rather than guessing, so reverse a file with this release (or a
+newer one) once it has been edited by it.
 
 ## Options
 

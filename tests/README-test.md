@@ -121,19 +121,21 @@ same as heic-lossless-rotate itself. Requires Python 3.
    mocked-failure case confirming `rotate` writes nothing at all if the
    self-check ever fails.
 
-   `TestProvenanceLeanFormat` covers the leaner v2 provenance format,
-   which stores only the `irot` property's pristine state (a marker plus
-   `ipma`'s original flags, if it didn't already exist; its original byte
-   value, if it did) instead of a full snapshot of the whole `iprp` box -
-   including that a v2 record is measurably smaller than the old v1
-   format for a file with unrelated `iprp` content, that `reverse` still
-   correctly restores old v1-format records directly, and that `rotate`
-   migrates a v1 record to v2 the next time it edits such a file. A
-   helper, `_make_v1_style_record`, builds a v1-style fixture from a
-   real v2 rotation result plus the original bytes, for testing without
-   needing an actual file left over from before this format existed.
-   The tamper-recovery tests in group 2 were updated for this: v2 can
-   still recover tampering to the specific bytes it saves (the live
+   `TestProvenanceFormats` covers the provenance record formats: every
+   edit writes format v3 (only the `ipma` association lists and `ipco`
+   properties that changed, instead of a full snapshot of the whole
+   `iprp` box; the full pristine `ipma` only as a fallback) - including
+   that unchanged `ipma` lists cost just a header, that the fallback
+   still reverses, that such a record is measurably smaller than
+   the old v1 format for a file with unrelated `iprp` content, that
+   `reverse` still correctly restores old v1 (full `iprp` snapshot) and
+   v2 (`irot` property only) records directly, and that `rotate`
+   converts either to v3 the next time it edits such a file. Helpers,
+   `_make_v1_style_record` / `_make_v2_style_record`, build those
+   fixtures from a real rotation result plus the original bytes, for
+   testing without needing actual files left over from older releases.
+   The tamper-recovery tests in group 2 were updated for this: the
+   record can still recover tampering to the specific bytes it saves (the live
    `irot` byte in the fast-path case; the discarded inserted box in the
    slow-path case) with `--ignore-tamper-check`, but - unlike v1's
    blanket `iprp` overwrite - tampering with anything else in `iprp` is

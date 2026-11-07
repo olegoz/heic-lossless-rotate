@@ -26,7 +26,9 @@ def _fullbox(boxtype: bytes, version: int, flags: int, content: bytes) -> bytes:
 def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAKE_PIXEL_DATA' * 20,
                           include_irot: bool = False, irot_value: int = 0,
                           include_exif: bool = False, exif_orientation: int = 1,
-                          exif_position: str = 'end', extra_mdat: bool = False) -> bytes:
+                          exif_position: str = 'end', extra_mdat: bool = False,
+                          imir_axis=None, imir_before_irot: bool = False,
+                          tmap=None) -> bytes:
     """Build a minimal, single-image synthetic HEIC file.
 
     layout: 'mdat_first' (ftyp, mdat, meta) or 'meta_first' (ftyp, meta, mdat)
@@ -58,6 +60,23 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
                   'mdat' box (rare in practice, but legal per ISO/IEC
                   14496-12) - this exercises that a spare, unreferenced
                   one doesn't confuse anything.
+    imir_axis: if not None (0 = top-bottom, 1 = left-right), adds an 'imir'
+                  property to the primary item - listed AFTER its 'irot'
+                  (the order iPhones write for mirrored captures, where
+                  the rotation appears reversed), or before it if
+                  imir_before_irot.
+    tmap: if not None, adds an HDR gain-map pair the way recent iPhones
+                  and Samsung phones do: a gain-map item (sharing the
+                  primary's 'irot'/'imir' properties, own 'ispe') and a
+                  'tmap' derived image item ('dimg' -> primary, gain map)
+                  whose 'ispe' is the primary's DISPLAYED size and whose
+                  own 'irot' is 0. Modes:
+                    'own'    - the tmap has its own 'ispe' and 'irot' boxes
+                               (seen when the primary is rotated).
+                    'shared' - the tmap SHARES the primary's 'ispe' and
+                               'irot' boxes (encoders de-duplicate them
+                               when the primary is unrotated, so this
+                               needs irot_value 0).
     """
     item_id = 1
     exif_item_id = 2
@@ -101,9 +120,17 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
 
     pitm = _fullbox(b'pitm', 0, 0, struct.pack('>H', item_id))
 
+    gain_item_id = 3
+    tmap_item_id = 4
+    if tmap not in (None, 'own', 'shared'):
+        raise ValueError(f"unknown tmap mode {tmap!r}")
+
     infe_items = [(item_id, b'hvc1')]
     if include_exif:
         infe_items.append((exif_item_id, b'Exif'))
+    if tmap:
+        infe_items.append((gain_item_id, b'hvc1'))
+        infe_items.append((tmap_item_id, b'tmap'))
     infe_boxes = b''
     for iid, itype in infe_items:
         infe_content = struct.pack('>H', iid) + struct.pack('>H', 0) + itype + b'\x00'
@@ -111,25 +138,62 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
     iinf = _fullbox(b'iinf', 0, 0, struct.pack('>H', len(infe_items)) + infe_boxes)
 
     # ipco: one 'ispe' (required-ish spatial extent), optionally 'irot'
-    ispe = _fullbox(b'ispe', 0, 0, struct.pack('>II', 100, 200))
-    ipco_children = ispe
-    n_props = 1
+    props = []
+
+    def add_prop(box):
+        props.append(box)
+        return len(props)
+
+    ispe_index = add_prop(_fullbox(b'ispe', 0, 0, struct.pack('>II', 100, 200)))
     irot_index = None
     if include_irot:
-        ipco_children += _box(b'irot', bytes([irot_value & 0x3]))
-        n_props += 1
-        irot_index = n_props
-    ipco = _box(b'ipco', ipco_children)
+        irot_index = add_prop(_box(b'irot', bytes([irot_value & 0x3])))
+    imir_index = None
+    if imir_axis is not None:
+        imir_index = add_prop(_box(b'imir', bytes([imir_axis & 0x1])))
 
-    assocs = [(1, True)]  # ispe
-    if include_irot:
-        assocs.append((irot_index, True))
-    ipma_entry = struct.pack('>H', item_id) + bytes([len(assocs)])
-    for idx, essential in assocs:
-        ipma_entry += bytes([(0x80 if essential else 0) | idx])
-    ipma = _fullbox(b'ipma', 0, 0, struct.pack('>I', 1) + ipma_entry)
+    # transformative properties, in the order they're applied
+    transforms = []
+    if irot_index:
+        transforms.append((irot_index, True))
+    if imir_index:
+        if imir_before_irot:
+            transforms.insert(0, (imir_index, True))
+        else:
+            transforms.append((imir_index, True))
+
+    assocs = [(ispe_index, True)] + transforms
+    item_assocs = [(item_id, assocs)]
+    if tmap:
+        gain_ispe = add_prop(_fullbox(b'ispe', 0, 0, struct.pack('>II', 50, 100)))
+        item_assocs.append((gain_item_id, [(gain_ispe, False)] + transforms))
+        displayed = (200, 100) if (irot_value & 1) and include_irot else (100, 200)
+        if tmap == 'shared':
+            if include_irot and irot_value & 0x3:
+                raise ValueError("tmap='shared' needs an unrotated primary")
+            tmap_assocs = [(ispe_index, False)]
+            if irot_index:
+                tmap_assocs.append((irot_index, True))
+        else:
+            tmap_ispe = add_prop(_fullbox(b'ispe', 0, 0, struct.pack('>II', *displayed)))
+            tmap_irot = add_prop(_box(b'irot', b'\x00'))
+            tmap_assocs = [(tmap_ispe, False), (tmap_irot, True)]
+        item_assocs.append((tmap_item_id, tmap_assocs))
+    ipco = _box(b'ipco', b''.join(props))
+
+    ipma_entries = b''
+    for iid, a in item_assocs:
+        ipma_entries += struct.pack('>H', iid) + bytes([len(a)])
+        for idx, essential in a:
+            ipma_entries += bytes([(0x80 if essential else 0) | idx])
+    ipma = _fullbox(b'ipma', 0, 0, struct.pack('>I', len(item_assocs)) + ipma_entries)
 
     iprp = _box(b'iprp', ipco + ipma)
+
+    iref = b''
+    if tmap:
+        dimg = _box(b'dimg', struct.pack('>HHHH', tmap_item_id, 2, item_id, gain_item_id))
+        iref = _fullbox(b'iref', 0, 0, dimg)
 
     # iloc: version 1 (so construction_method field exists), one extent per
     # item. Per ISO/IEC 14496-12, for construction_method 0 the item's data
@@ -157,9 +221,15 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
         if include_exif:
             iloc_items_bytes += iloc_item_bytes(exif_item_id, 0, 0,
                                                  exif_item_abs_offset, len(exif_blob))
+        if tmap:
+            # placeholder payloads: both point into the main item's bytes
+            iloc_items_bytes += iloc_item_bytes(gain_item_id, 0, 0,
+                                                 main_item_abs_offset, 8)
+            iloc_items_bytes += iloc_item_bytes(tmap_item_id, 0, 0,
+                                                 main_item_abs_offset + 8, 8)
         iloc = _fullbox(b'iloc', iloc_version, 0,
                          bytes([0x44]) + bytes([0x40]) + iloc_items + bytes(iloc_items_bytes))
-        meta_content = hdlr + iinf + pitm + iprp + iloc
+        meta_content = hdlr + iinf + pitm + iref + iprp + iloc
         return _fullbox(b'meta', 0, 0, meta_content)
 
     # Pass 1: build with placeholder (0) offsets just to measure meta's

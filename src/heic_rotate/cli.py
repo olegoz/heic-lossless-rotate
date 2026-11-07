@@ -93,19 +93,24 @@ Every edit records enough information - in a private top-level 'uuid'
 box, the standard ISOBMFF mechanism for vendor-private data that
 spec-compliant readers silently skip - to reconstruct the exact original
 file, byte for byte:
-  - the pristine (pre-edit) 'irot' state ONLY - not a snapshot of the
-    whole 'iprp' box, which may hold other properties (an embedded ICC
-    colour profile, say) heic-lossless-rotate never reads or modifies and so
-    has no need to carry a copy of:
-      * if 'irot' already existed: its original 1 byte, restored by
-        overwriting that byte back in place on `reverse`.
-      * if it didn't: a 0-length marker, plus 'ipma's original 3-byte
-        flags (in case inserting 'irot' needed to set the "wide" index
-        flag bit) - `reverse` removes exactly the property it inserted
-        (always the LAST 'ipco' child, with an association always
-        appended as the LAST entry for the primary item, so no index
-        bookkeeping needs to be saved to find it again) and restores
-        those flags.
+  - the original association lists of only those items in 'ipma'
+    (item -> property associations) whose list the edit changed -
+    usually none, or just the primary item when an 'irot' had to be
+    inserted, or the gain-map item when it had to be given its own
+    copies of boxes it shared (just an 8-byte header when nothing
+    changed; the whole pristine 'ipma' box only as a fallback, if
+    that can't reproduce it byte for byte), plus the original bytes
+    of only those 'ipco' properties the edit changed in place (the
+    'irot' value, and for HDR gain-map photos the 'tmap' item's
+    'ispe') - not a snapshot of the whole 'iprp' box, which may hold
+    other properties
+    (an embedded ICC colour profile, say) heic-lossless-rotate never
+    reads or modifies and so has no need to carry a copy of. New
+    properties are only ever APPENDED to 'ipco' (a new 'irot' when the
+    file had none; the gain-map item's own copies of boxes it used to
+    share with the primary item), so `reverse` truncates 'ipco' back
+    to its original property count, puts the saved bytes back, and
+    puts the saved association lists back into 'ipma'.
   - the pristine bytes of the 'iloc' box content
   - the pristine 4-byte 'meta' box size field
   - the pristine 2-byte legacy Exif Orientation value (if present)
@@ -115,11 +120,13 @@ file, byte for byte:
     refuse rather than silently corrupting it)
   - a 1-byte format VERSION, so a future version of this script can
     detect old-format provenance records and apply the correct legacy
-    reverse algorithm instead of misreading a newer/older layout. v1
-    records (written before this optimization existed) saved the WHOLE
-    pristine 'iprp' box instead of just 'irot' - `reverse` still
-    supports reading those directly, and `rotate` migrates one to the
-    leaner v2 layout the next time it edits such a file.
+    reverse algorithm instead of misreading a newer/older layout.
+    Every record is written as v3 (described above). Older releases
+    wrote v1 (the WHOLE pristine 'iprp' box) or v2 (only the 'irot'
+    property's pristine byte, or a marker plus 'ipma's original flags
+    if 'irot' had to be inserted) - `reverse` still supports reading
+    those directly, and `rotate` converts one to v3 the next time it
+    edits such a file.
   - the heic-lossless-rotate version (major.minor.patch) that most recently
     UPDATED the file - shown by `info` as "Rotated with heic-lossless-rotate
     vX.Y.Z". Written by `rotate` only, as part of the same edit whose
