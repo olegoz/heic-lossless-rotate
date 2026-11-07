@@ -35,6 +35,8 @@ Covers, in order:
 No third-party dependencies - stdlib only (unittest + subprocess),
 matching heic_rotate.py's own zero-dependency approach.
 """
+import contextlib
+import io
 import os
 import shutil
 import struct
@@ -412,7 +414,7 @@ class TestSyntheticRoundTrips(unittest.TestCase):
         (OIRT) and unconditionally overwritten back into place on
         reverse, regardless of whatever value is currently sitting
         there - so tampering specifically with that live byte still
-        recovers cleanly with --ignore-tamper-check."""
+        recovers cleanly with --proceed-unsafe."""
         original = build_synthetic_heic(layout='mdat_first', include_irot=True, irot_value=1)
         rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))  # fast path, 90->180
 
@@ -425,8 +427,8 @@ class TestSyntheticRoundTrips(unittest.TestCase):
         rotated[irot_child[2]] = 0xFF  # garbage - not even a valid 2-bit angle
 
         with self.assertRaises(hr.ProvenanceError):
-            hr.reverse_rotation(bytes(rotated), ignore_tamper=False, verbose=False)
-        restored = hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
+            hr.reverse_rotation(bytes(rotated), proceed_unsafe=False, verbose=False)
+        restored = hr.reverse_rotation(bytes(rotated), proceed_unsafe=True, verbose=False)
         self.assertEqual(restored, original)
 
     def test_tamper_of_discarded_irot_box_recovers_with_force_slow_path(self):
@@ -434,7 +436,7 @@ class TestSyntheticRoundTrips(unittest.TestCase):
         reverse (its content was never meaningful pre-insertion - OIRT
         is just a 0-length marker), so tampering with that box's own
         bytes (as opposed to anything else in 'iprp') still recovers
-        cleanly with --ignore-tamper-check."""
+        cleanly with --proceed-unsafe."""
         original = build_synthetic_heic(layout='mdat_first', include_irot=False)
         rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))  # slow path
 
@@ -447,8 +449,8 @@ class TestSyntheticRoundTrips(unittest.TestCase):
         rotated[last_child[2]] = 0xFF  # garbage, inside the box reverse discards outright
 
         with self.assertRaises(hr.ProvenanceError):
-            hr.reverse_rotation(bytes(rotated), ignore_tamper=False, verbose=False)
-        restored = hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
+            hr.reverse_rotation(bytes(rotated), proceed_unsafe=False, verbose=False)
+        restored = hr.reverse_rotation(bytes(rotated), proceed_unsafe=True, verbose=False)
         self.assertEqual(restored, original)
 
     def test_tamper_elsewhere_in_iprp_still_refused_even_with_force(self):
@@ -457,7 +459,7 @@ class TestSyntheticRoundTrips(unittest.TestCase):
         the old full-'iprp'-snapshot format - the current record does
         NOT blindly overwrite it on reverse. Tampering with it (here,
         inside the unrelated 'ispe' property) must still be caught by
-        the final CRC self-check, even with --ignore-tamper-check -
+        the final CRC self-check, even with --proceed-unsafe -
         this is the accepted trade-off for not storing a full 'iprp'
         snapshot: reverse can only guarantee recovering what it
         explicitly tracks, and correctly detects (rather than silently
@@ -475,23 +477,23 @@ class TestSyntheticRoundTrips(unittest.TestCase):
                 rotated[ispe_hdr[2]] ^= 0xFF  # inside 'ispe', unrelated to 'irot'
 
                 with self.assertRaises(hr.ProvenanceError):
-                    hr.reverse_rotation(bytes(rotated), ignore_tamper=False, verbose=False)
+                    hr.reverse_rotation(bytes(rotated), proceed_unsafe=False, verbose=False)
                 with self.assertRaises(hr.ProvenanceError):
-                    hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
+                    hr.reverse_rotation(bytes(rotated), proceed_unsafe=True, verbose=False)
 
     def test_tamper_outside_restored_region_still_refused_even_with_force(self):
         """Tampering somewhere reverse does NOT touch (e.g. 'ftyp') must
         still be caught by the final CRC safety net, even with
-        --ignore-tamper-check - recovering silently-wrong bytes would be
+        --proceed-unsafe - recovering silently-wrong bytes would be
         worse than refusing."""
         original = build_synthetic_heic(layout='mdat_first', include_irot=False)
         rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))
         rotated[10] ^= 0xFF  # inside 'ftyp' - never touched by reverse at all
 
         with self.assertRaises(hr.ProvenanceError):
-            hr.reverse_rotation(bytes(rotated), ignore_tamper=False, verbose=False)
+            hr.reverse_rotation(bytes(rotated), proceed_unsafe=False, verbose=False)
         with self.assertRaises(hr.ProvenanceError):
-            hr.reverse_rotation(bytes(rotated), ignore_tamper=True, verbose=False)
+            hr.reverse_rotation(bytes(rotated), proceed_unsafe=True, verbose=False)
 
 
 class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
@@ -506,19 +508,19 @@ class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
     tests cross-check the two directly against every scenario the rest
     of the suite exercises, rather than testing either in isolation."""
 
-    def _assert_agree(self, rotated, ignore_tamper=False):
+    def _assert_agree(self, rotated, proceed_unsafe=False):
         """Run both functions against the same input and assert they
         reach an identical verdict - either both raise, or both succeed.
         Returns reverse_rotation's actual reconstructed bytes (or None,
         if both raised) for the caller to inspect further."""
         reverse_exc = restored = verify_exc = None
         try:
-            restored = hr.reverse_rotation(rotated, ignore_tamper=ignore_tamper,
+            restored = hr.reverse_rotation(rotated, proceed_unsafe=proceed_unsafe,
                                             verbose=False)
         except (hr.ProvenanceError, hr.BoxParseError) as e:
             reverse_exc = e
         try:
-            hr.verify_reversible(rotated, ignore_tamper=ignore_tamper, verbose=False)
+            hr.verify_reversible(rotated, proceed_unsafe=proceed_unsafe, verbose=False)
         except (hr.ProvenanceError, hr.BoxParseError) as e:
             verify_exc = e
 
@@ -610,8 +612,8 @@ class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
         rotated[irot_child[2]] = 0xFF
         rotated = bytes(rotated)
 
-        self._assert_agree(rotated, ignore_tamper=False)
-        restored = self._assert_agree(rotated, ignore_tamper=True)
+        self._assert_agree(rotated, proceed_unsafe=False)
+        restored = self._assert_agree(rotated, proceed_unsafe=True)
         self.assertEqual(restored, original)
 
     def test_agrees_on_tamper_elsewhere_in_iprp(self):
@@ -627,8 +629,8 @@ class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
                 rotated[ispe_hdr[2]] ^= 0xFF
                 rotated = bytes(rotated)
 
-                self._assert_agree(rotated, ignore_tamper=False)
-                self._assert_agree(rotated, ignore_tamper=True)
+                self._assert_agree(rotated, proceed_unsafe=False)
+                self._assert_agree(rotated, proceed_unsafe=True)
 
     def test_agrees_on_tamper_outside_restored_region(self):
         original = build_synthetic_heic(layout='mdat_first', include_irot=False)
@@ -636,8 +638,8 @@ class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
         rotated[10] ^= 0xFF  # inside 'ftyp' - never touched by either function
         rotated = bytes(rotated)
 
-        self._assert_agree(rotated, ignore_tamper=False)
-        self._assert_agree(rotated, ignore_tamper=True)
+        self._assert_agree(rotated, proceed_unsafe=False)
+        self._assert_agree(rotated, proceed_unsafe=True)
 
     def test_agrees_on_tampered_mid_stream_exif_byte(self):
         """A file with an embedded, mid-stream Exif item whose CURRENT
@@ -659,8 +661,8 @@ class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
         rotated[field[0]] ^= 0xFF  # corrupt the live Exif Orientation byte
         rotated = bytes(rotated)
 
-        self._assert_agree(rotated, ignore_tamper=False)
-        self._assert_agree(rotated, ignore_tamper=True)
+        self._assert_agree(rotated, proceed_unsafe=False)
+        self._assert_agree(rotated, proceed_unsafe=True)
 
 
     def test_avoids_full_file_size_allocation(self):
@@ -681,7 +683,7 @@ class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
         tracemalloc.start()
         try:
             snap_before = tracemalloc.take_snapshot()
-            hr.verify_reversible(rotated, ignore_tamper=False, verbose=False)
+            hr.verify_reversible(rotated, proceed_unsafe=False, verbose=False)
             snap_after = tracemalloc.take_snapshot()
         finally:
             tracemalloc.stop()
@@ -943,11 +945,12 @@ def _replace_record(rotated: bytes, version: int, entries: dict) -> bytes:
 def _common_entries(rotated: bytes) -> dict:
     """The current record's entries that every format shares (OMSZ,
     OILC, OEXO, PCRC, CCRC, TVER) - i.e. without the format-specific
-    'iprp' entries."""
+    'iprp' entries or the v3-only requested transform (REQT)."""
     _, entries = hr.parse_provenance(
         rotated, hr.locate_structures(rotated)['provenance_hdr'])
     return {k: v for k, v in entries.items()
-            if k not in (b'OIPD', b'OIPM', b'OIPC', b'OIRT', b'OIPF', b'OPRP')}
+            if k not in (b'OIPD', b'OIPM', b'OIPC', b'OIRT', b'OIPF', b'OPRP',
+                         b'REQT')}
 
 
 def _make_v1_style_record(original: bytes, rotated: bytes) -> bytes:
@@ -1114,26 +1117,33 @@ class TestProvenanceFormats(unittest.TestCase):
                         self.assertEqual(
                             hr.reverse_rotation(replayed, verbose=False), original)
 
-    def test_requested_rotation_for_each_format(self):
+    def test_requested_transform_for_each_format(self):
         """v1/v2 releases changed raw 'irot' by the requested angle even
-        for photos mirrored after rotation; v3 changes it the opposite
-        way for those, so the requested angle is the displayed change."""
+        for photos mirrored after rotation, and stored nothing else, so
+        the request is the raw 'irot' delta; v3 stores it in REQT,
+        independently of the 'irot' values."""
         for original_turns in range(4):
             for requested in range(4):
-                for mirrored in (False, True):
-                    with self.subTest(original=original_turns,
-                                      requested=requested, mirrored=mirrored):
-                        old_current = (original_turns + requested) % 4
-                        v3_current = (original_turns
-                                      + (-requested if mirrored else requested)) % 4
-                        for version in (1, 2):
-                            self.assertEqual(hr.requested_rotation(
-                                version, original_turns, old_current, mirrored),
-                                requested)
-                        self.assertEqual(hr.requested_rotation(
-                            3, original_turns, v3_current, mirrored), requested)
+                with self.subTest(original=original_turns, requested=requested):
+                    current = (original_turns + requested) % 4
+                    for version in (1, 2):
+                        self.assertEqual(hr.requested_transform(
+                            version, {}, original_turns, current),
+                            (False, requested))
+                        self.assertIsNone(hr.requested_transform(
+                            version, {}, None, current))
+                    entries = {b'REQT': hr.encode_requested_transform(
+                        (False, requested))}
+                    self.assertEqual(hr.requested_transform(
+                        3, entries, original_turns, 0), (False, requested))
+                    self.assertEqual(hr.requested_transform(
+                        3, entries, None, None), (False, requested))
+                    mirrored = {b'REQT': hr.encode_requested_transform(
+                        (True, requested))}
+                    with self.assertRaises(hr.ProvenanceError):
+                        hr.requested_transform(3, mirrored, original_turns, 0)
         with self.assertRaises(hr.ProvenanceError):
-            hr.requested_rotation(hr.FORMAT_VERSION + 1, 0, 1, False)
+            hr.requested_transform(hr.FORMAT_VERSION + 1, {}, 0, 1)
 
     def test_v3_records_replay_correctly_after_a_future_format_bump(self):
         """Pretend the next format bump has happened (FORMAT_VERSION 4):
@@ -1165,37 +1175,62 @@ class TestProvenanceFormats(unittest.TestCase):
                                 original, (sum(chain) + delta) % 4, verbose=False)
                         self.assertEqual(replayed, expected)
 
-    def test_newer_format_is_refused_without_parsing_past_the_version(self):
+    def test_newer_format_is_refused_naming_its_writer(self):
         """A record in a format newer than this release is refused by
-        `rotate`, `reverse` and `info` alike, right after its version
-        byte: the rest is deliberately garbage here (not even valid
-        entry framing), and must never be parsed."""
+        `rotate`, `reverse` and `info` alike (NewerVersionError, CLI exit
+        11). Only the frozen entry framing is read from it, to name the
+        release that wrote it from its TVER; when even that doesn't
+        parse (garbage here), the error says "a newer release" instead."""
         original = build_synthetic_heic(layout='mdat_first')
         rotated = hr.apply_rotation(original, 1, verbose=False)
         p_start, _, _, p_end, _ = hr.locate_structures(rotated)['provenance_hdr']
-        body = (hr.PROVENANCE_UUID + bytes([hr.FORMAT_VERSION + 1])
-                + b'\xff\x00garbage, not entries')
-        newer = (rotated[:p_start] + struct.pack('>I4s', len(body) + 8, b'uuid')
-                 + body + rotated[p_end:])
-        for name, call in (
-                ('rotate', lambda: hr.apply_rotation(newer, 1, verbose=False)),
-                ('reverse', lambda: hr.reverse_rotation(newer, verbose=False)),
-                ('info', lambda: hr.gather_info(newer))):
-            with self.subTest(command=name):
-                with self.assertRaises(hr.ProvenanceError) as ctx:
-                    call()
-                self.assertIn(f"format v{hr.FORMAT_VERSION + 1}, newer than "
-                              f"this release supports", str(ctx.exception))
+
+        def with_body(body):
+            return (rotated[:p_start] + struct.pack('>I4s', len(body) + 8, b'uuid')
+                    + body + rotated[p_end:])
+
+        newer_version = bytes([hr.FORMAT_VERSION + 1])
+        garbage = with_body(hr.PROVENANCE_UUID + newer_version
+                            + b'\xff\x00garbage, not entries')
+        framed = with_body(
+            hr.build_provenance_box(hr.FORMAT_VERSION + 1, {
+                b'TVER': bytes([1, 9, 0]), b'ZNEW': b'anything'})[8:])
+        for data, writer in ((garbage, 'a newer heic-lossless-rotate release'),
+                             (framed, 'heic-lossless-rotate 1.9.0')):
+            for name, call in (
+                    ('rotate', lambda: hr.apply_rotation(data, 1, verbose=False)),
+                    ('reverse', lambda: hr.reverse_rotation(data, verbose=False)),
+                    ('info', lambda: hr.gather_info(data))):
+                with self.subTest(writer=writer, command=name):
+                    with self.assertRaises(hr.NewerVersionError) as ctx:
+                        call()
+                    self.assertIn(
+                        f"this file was last updated by {writer} (this is "
+                        f"{hr.VERSION}): its heic-lossless-rotate metadata is "
+                        f"format v{hr.FORMAT_VERSION + 1}, newer than this "
+                        f"release supports", str(ctx.exception))
         tmpdir = tempfile.mkdtemp()
         try:
             path = os.path.join(tmpdir, 'newer.heic')
             with open(path, 'wb') as f:
-                f.write(newer)
+                f.write(framed)
             code, _, err = run_cli('info', path)
-            self.assertEqual(code, 10)
+            self.assertEqual(code, 11)
+            self.assertIn('last updated by heic-lossless-rotate 1.9.0', err)
             self.assertIn('newer than this release supports', err)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_corrupt_framing_in_current_format_is_an_ordinary_error(self):
+        """Only a NEWER format gets the "update the tool" treatment; a
+        current-format record whose framing doesn't parse is corrupt."""
+        original = build_synthetic_heic(layout='mdat_first')
+        rotated = bytearray(hr.apply_rotation(original, 1, verbose=False))
+        p_start = hr.locate_structures(bytes(rotated))['provenance_hdr'][0]
+        rotated[p_start + 8 + 16 + 1] ^= 0x7f  # entry count
+        with self.assertRaises(hr.ProvenanceError) as ctx:
+            hr.gather_info(bytes(rotated))
+        self.assertNotIsInstance(ctx.exception, hr.NewerVersionError)
 
     def test_rotate_refuses_old_record_whose_original_cannot_be_restored(self):
         """If `reverse` fails on an old-format record, `rotate` must not
@@ -1219,6 +1254,226 @@ class TestProvenanceFormats(unittest.TestCase):
         self.assertIn("2. Run `rotate 90` on the restored file with this "
                       "release: the 270 deg the earlier release added, plus "
                       "the 180 deg requested now", message)
+
+
+def _reqt(data):
+    """The raw REQT entry of `data`'s provenance record, or None."""
+    _, entries = hr.parse_provenance(
+        data, hr.locate_structures(data)['provenance_hdr'])
+    return entries.get(b'REQT')
+
+
+class TestRequestedTransform(unittest.TestCase):
+    """Format v3's REQT entry: the cumulative change to the DISPLAYED
+    image requested from heic-lossless-rotate, stored explicitly rather
+    than inferred from 'irot'/'imir' - so that a v3 record can be
+    replayed from the original by what was asked rather than by what the
+    release that wrote it did, and so that a later release can add
+    mirroring without a format bump. This release only rotates, and
+    refuses a record whose REQT includes mirroring in every command."""
+
+    CASES = (dict(include_irot=True, irot_value=1),
+             dict(include_irot=False),
+             dict(include_irot=True, irot_value=1, imir_axis=1),
+             dict(include_irot=True, irot_value=0, imir_axis=0,
+                  imir_before_irot=True),
+             dict(include_irot=True, irot_value=0, imir_axis=1, tmap='shared'))
+
+    def test_encoding_is_fixed(self):
+        """Frozen with format v3: bit 2 = mirror, bits 0-1 = turns."""
+        self.assertEqual(hr.encode_requested_transform((False, 0)), b'\x00')
+        self.assertEqual(hr.encode_requested_transform((False, 3)), b'\x03')
+        self.assertEqual(hr.encode_requested_transform((True, 0)), b'\x04')
+        self.assertEqual(hr.encode_requested_transform((True, 1)), b'\x05')
+        for turns in range(4):
+            self.assertEqual(hr.decode_requested_transform(
+                {b'REQT': hr.encode_requested_transform((False, turns))}),
+                (False, turns))
+
+    def test_compose_transforms_matches_irot_and_imir(self):
+        elements = [(f, t) for f in (False, True) for t in range(4)]
+        for t in elements:
+            for k in range(4):
+                self.assertEqual(hr.compose_irot(t, k),
+                                 hr.compose_transforms((False, k), t))
+            self.assertEqual(hr.compose_imir(t, 1),
+                             hr.compose_transforms((True, 0), t))
+            self.assertEqual(hr.compose_imir(t, 0),
+                             hr.compose_transforms((True, 2), t))
+        for a in elements:
+            for b in elements:
+                for c in elements:
+                    self.assertEqual(
+                        hr.compose_transforms(a, hr.compose_transforms(b, c)),
+                        hr.compose_transforms(hr.compose_transforms(a, b), c))
+
+    def test_records_the_cumulative_requested_rotation(self):
+        for kwargs in self.CASES:
+            for chain in ([0], [1], [3], [1, 2], [3, 3, 1]):
+                with self.subTest(chain=chain, **kwargs):
+                    data = build_synthetic_heic(**kwargs)
+                    for step in chain:
+                        data = hr.apply_rotation(data, step, verbose=False)
+                    total = sum(chain) % 4
+                    self.assertEqual(_reqt(data),
+                                     hr.encode_requested_transform((False, total)))
+                    info = hr.gather_info(data)
+                    self.assertEqual(info['delta_quarter_turns'], total)
+
+    def test_mirroring_recorded_by_a_later_release_is_refused(self):
+        """A v3 record whose REQT includes mirroring - as a later release
+        that can mirror will write (simulated here by setting REQT
+        alone) - is refused by `rotate`, `reverse` and `info` alike
+        (CLI exit 11), saying this release doesn't support mirroring yet
+        and naming the release that did it."""
+        original = build_synthetic_heic(layout='mdat_first', include_irot=True,
+                                        irot_value=0)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        _, entries = hr.parse_provenance(
+            rotated, hr.locate_structures(rotated)['provenance_hdr'])
+        entries[b'TVER'] = bytes([1, 9, 0])
+        for request in ((True, 0), (True, 1), (True, 2)):
+            with self.subTest(request=request):
+                entries[b'REQT'] = hr.encode_requested_transform(request)
+                mirrored = _replace_record(rotated, 3, entries)
+                for name, call in (
+                        ('rotate', lambda: hr.apply_rotation(mirrored, 1,
+                                                             verbose=False)),
+                        ('reverse', lambda: hr.reverse_rotation(mirrored,
+                                                                verbose=False)),
+                        ('info', lambda: hr.gather_info(mirrored))):
+                    with self.subTest(command=name):
+                        with self.assertRaises(hr.NewerVersionError) as ctx:
+                            call()
+                        self.assertIn(
+                            f"this file was last updated by heic-lossless-"
+                            f"rotate 1.9.0 (this is {hr.VERSION}): it was "
+                            f"mirrored, which this release doesn't support "
+                            f"yet", str(ctx.exception))
+        tmpdir = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmpdir, 'mirrored.heic')
+            with open(path, 'wb') as f:
+                f.write(mirrored)
+            for args in (('info', path), ('reverse', path),
+                         ('rotate', '90', path)):
+                with self.subTest(cli=args[0]):
+                    code, _, err = run_cli(*args)
+                    self.assertEqual(code, 11)
+                    self.assertIn("doesn't support yet", err)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_unknown_tag_is_refused_unless_proceed_unsafe(self):
+        """A tag this release doesn't know - as a later release may add
+        to v3 without a format bump - is refused by every command.
+        `info` and `reverse` proceed with --proceed-unsafe, ignoring it,
+        and say so on stderr; `rotate` has no override, since it would
+        drop the tag. Old-format records are checked against their own
+        format's tags."""
+        original = build_synthetic_heic(layout='mdat_first', include_irot=True)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        _, entries = hr.parse_provenance(
+            rotated, hr.locate_structures(rotated)['provenance_hdr'])
+        entries[b'XNEW'] = b'\x01'
+        newer = _replace_record(rotated, 3, entries)
+        old_entries = _common_entries(rotated)
+        old_entries[b'OPRP'] = original[
+            hr.locate_structures(original)['iprp_hdr'][0]:
+            hr.locate_structures(original)['iprp_hdr'][3]]
+        old_entries[b'OIPC'] = b''  # a v3 tag is unknown in a v1 record
+        old_unknown = _replace_record(rotated, 1, old_entries)
+        for label, data, names in (('v3', newer, 'XNEW'),
+                                   ('v1', old_unknown, 'OIPC')):
+            with self.subTest(record=label):
+                for name, call in (
+                        ('rotate', lambda: hr.apply_rotation(data, 1, verbose=False)),
+                        ('reverse', lambda: hr.reverse_rotation(data, verbose=False)),
+                        ('info', lambda: hr.gather_info(data))):
+                    with self.subTest(command=name):
+                        with self.assertRaises(hr.NewerVersionError) as ctx:
+                            call()
+                        self.assertIn(f"this file was last updated by "
+                                      f"heic-lossless-rotate {hr.VERSION} "
+                                      f"(this is {hr.VERSION}): its metadata "
+                                      f"has entries this release doesn't know "
+                                      f"({names})", str(ctx.exception))
+                        if name != 'rotate':
+                            self.assertIn(f"re-run `{name}` with --proceed-unsafe",
+                                          str(ctx.exception))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(hr.gather_info(
+                        data, proceed_unsafe=True)['delta_quarter_turns'], 1)
+                    self.assertEqual(hr.reverse_rotation(
+                        data, proceed_unsafe=True, verbose=False), original)
+                self.assertEqual(err.getvalue().count(
+                    f"warning (would be an error without --proceed-unsafe): "
+                    f"this file was last updated by heic-lossless-rotate "
+                    f"{hr.VERSION} (this is {hr.VERSION}): its metadata has "
+                    f"entries this release doesn't know ({names}). Ignoring "
+                    f"them"), 2)
+
+    def test_v3_record_without_reqt_is_refused_but_reversible(self):
+        """Only pre-release builds wrote v3 without REQT. `rotate` and
+        `info` refuse it with a clear message; `reverse` doesn't need
+        REQT and still restores the original."""
+        original = build_synthetic_heic(include_irot=False)
+        stripped = _strip_provenance_tag(
+            hr.apply_rotation(original, 1, verbose=False), b'REQT')
+        for name, call in (
+                ('rotate', lambda: hr.apply_rotation(stripped, 1, verbose=False)),
+                ('info', lambda: hr.gather_info(stripped))):
+            with self.subTest(command=name):
+                with self.assertRaises(hr.ProvenanceError) as ctx:
+                    call()
+                self.assertIn('no REQT entry', str(ctx.exception))
+        self.assertEqual(hr.reverse_rotation(stripped, verbose=False), original)
+
+    def test_malformed_reqt_is_refused(self):
+        original = build_synthetic_heic(layout='mdat_first')
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        _, entries = hr.parse_provenance(
+            rotated, hr.locate_structures(rotated)['provenance_hdr'])
+        for bad in (b'\x08', b'\x81', b'\x01\x00', b''):
+            with self.subTest(reqt=bad):
+                entries[b'REQT'] = bad
+                broken = _replace_record(rotated, 3, entries)
+                for call in (lambda: hr.gather_info(broken),
+                             lambda: hr.apply_rotation(broken, 1, verbose=False),
+                             lambda: hr.reverse_rotation(broken, verbose=False)):
+                    with self.assertRaises(hr.NewerVersionError) as ctx:
+                        call()
+                    self.assertIn("doesn't understand", str(ctx.exception))
+
+    def test_edit_that_does_not_display_as_requested_is_refused(self):
+        """Ignoring the mirror (as releases before 1.8.0 did) turns a
+        photo mirrored after rotation the wrong way: the check against
+        the requested change catches it and nothing is written."""
+        original = build_synthetic_heic(include_irot=True, irot_value=1,
+                                        imir_axis=1)
+        with unittest.mock.patch.object(hr, '_rotation_sign', return_value=1):
+            with self.assertRaises(hr.BoxParseError) as ctx:
+                hr.apply_rotation(original, 1, verbose=False)
+        self.assertIn('not by the requested', str(ctx.exception))
+
+    def test_rotation_by_another_tool_in_between_is_not_recorded(self):
+        """REQT holds only what heic-lossless-rotate was asked for, and
+        the check is against the file as this edit found it - so a
+        rotation another tool applied in between neither counts as
+        requested nor makes the next edit fail."""
+        data = bytearray(hr.apply_rotation(
+            build_synthetic_heic(include_irot=True, irot_value=0), 1,
+            verbose=False))
+        info = hr.locate_structures(bytes(data))
+        iprp = info['iprp_hdr']
+        ipco = hr.find_unique_child(data, iprp[2], iprp[3], b'ipco', "'iprp'")
+        irot = next(c for c in hr.parse_ipco_children(data, ipco[2], ipco[3])
+                    if c[4] == b'irot')
+        data[irot[2]] = (data[irot[2]] + 1) & 0x3  # e.g. exiftool
+        again = hr.apply_rotation(bytes(data), 1, verbose=False)
+        self.assertEqual(_reqt(again), hr.encode_requested_transform((False, 2)))
+        self.assertEqual(hr.get_current_rotation(again), 3)
 
 
 def _display_state(data):
@@ -1373,8 +1628,9 @@ class TestMirroringAndGainMaps(unittest.TestCase):
         (wrong direction for mirrored photos) and didn't know about 'tmap'
         items (gain map left unrotated, shared 'irot' changed in place,
         tmap 'ispe' left at the old shape). Hiding the mirror and tmap
-        from apply_rotation reproduces exactly that, and those releases
-        wrote v1/v2 records. `rotate 0` must then produce the very bytes
+        from apply_rotation (and skipping its check that the display
+        turned as requested, which those releases lacked) reproduces
+        exactly that, and those releases wrote v1/v2 records. `rotate 0` must then produce the very bytes
         a 1.8.0 rotation of the original does."""
         for kwargs in (dict(include_irot=False, tmap='own'),
                        dict(include_irot=True, irot_value=0, tmap='shared'),
@@ -1387,7 +1643,9 @@ class TestMirroringAndGainMaps(unittest.TestCase):
                     with unittest.mock.patch.object(
                             hr, 'find_tmap_items', return_value=[]), \
                             unittest.mock.patch.object(
-                                hr, '_rotation_sign', return_value=1):
+                                hr, '_rotation_sign', return_value=1), \
+                            unittest.mock.patch.object(
+                                hr, '_check_display_change'):
                         legacy = hr.apply_rotation(original, delta, verbose=False)
                     legacy = _make_v2_style_record(original, legacy)
                     # info reports what was requested (and what rotate 0
@@ -1489,10 +1747,10 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(rc2, 1, err2)
         self.assertIn(f"heic-lossless-rotate v{hr.VERSION}, provenance format", out2)
 
-    def test_reverse_force_overwrites_and_ignore_tamper_check_is_separate(self):
+    def test_reverse_force_overwrites_and_proceed_unsafe_is_separate(self):
         # -f/--force on `reverse` now means "overwrite the output file",
         # NOT the old tamper-override behavior (renamed to
-        # --ignore-tamper-check).
+        # --proceed-unsafe).
         rotated_path = os.path.join(self.tmpdir, 'rotated.heic')
         restored_path = os.path.join(self.tmpdir, 'restored.heic')
         rc, _, err = run_cli('rotate', '90', self.input_path, rotated_path)
@@ -1506,11 +1764,62 @@ class TestCLI(unittest.TestCase):
         rc3, _, err3 = run_cli('reverse', rotated_path, restored_path, '-f')
         self.assertEqual(rc3, 0, err3)
 
-        # --ignore-tamper-check is still accepted as its own flag.
+        # --proceed-unsafe is still accepted as its own flag, and
+        # reports nothing when there was nothing to override.
         untampered_path = os.path.join(self.tmpdir, 'restored2.heic')
         rc4, _, err4 = run_cli('reverse', rotated_path, untampered_path,
-                                '--ignore-tamper-check')
+                                '--proceed-unsafe')
         self.assertEqual(rc4, 0, err4)
+        self.assertNotIn('warning', err4)
+
+    def test_proceed_unsafe_reports_every_override_even_when_quiet(self):
+        """`reverse --proceed-unsafe` on a file that is both modified by
+        something else (CCRC mismatch) and carries an unknown entry
+        names both conditions on stderr, even with -q; `info` names the
+        one it overrides. Without the flag both refuse, with exit 11 (made
+        by a later release)."""
+        original = build_synthetic_heic(layout='mdat_first', include_irot=True,
+                                        irot_value=1)
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        _, entries = hr.parse_provenance(
+            rotated, hr.locate_structures(rotated)['provenance_hdr'])
+        entries[b'XNEW'] = b''
+        unsafe = bytearray(_replace_record(rotated, 3, entries))
+        info = hr.locate_structures(bytes(unsafe))
+        iprp = info['iprp_hdr']
+        ipco = hr.find_unique_child(unsafe, iprp[2], iprp[3], b'ipco', "'iprp'")
+        irot = next(c for c in hr.parse_ipco_children(unsafe, ipco[2], ipco[3])
+                    if c[4] == b'irot')
+        unsafe[irot[2]] ^= 0x1  # changed by "another tool"; OIPC restores it
+        path = os.path.join(self.tmpdir, 'unsafe.heic')
+        with open(path, 'wb') as f:
+            f.write(unsafe)
+        out_path = os.path.join(self.tmpdir, 'unsafe_restored.heic')
+
+        for args in (('reverse', path, out_path), ('info', path)):
+            with self.subTest(command=args[0], flag=False):
+                rc, _, err = run_cli(*args)
+                self.assertEqual(rc, 11)
+                self.assertIn('--proceed-unsafe', err)
+
+        prefix = 'warning (would be an error without --proceed-unsafe): '
+        rc, out, err = run_cli('-q', 'reverse', path, out_path, '--proceed-unsafe')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, '')
+        self.assertIn(prefix + "this file was last updated by "
+                      f"heic-lossless-rotate {hr.VERSION} (this is "
+                      f"{hr.VERSION}): its metadata has entries this release "
+                      "doesn't know (XNEW). Ignoring them", err)
+        self.assertIn(prefix + 'file appears to have been modified by '
+                      'something else', err)
+        with open(out_path, 'rb') as f:
+            self.assertEqual(f.read(), original)
+
+        rc, out, err = run_cli('info', path, '-q', '--proceed-unsafe')
+        self.assertNotEqual(rc, 10, err)
+        self.assertEqual(out, '')
+        self.assertEqual(err.count(prefix), 1)
+        self.assertIn("doesn't know (XNEW)", err)
 
     def test_flag_before_subcommand_works(self):
         out_path = os.path.join(self.tmpdir, 'out1.heic')

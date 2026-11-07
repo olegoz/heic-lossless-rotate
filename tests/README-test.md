@@ -137,11 +137,26 @@ same as heic-lossless-rotate itself. Requires Python 3.
    90), and that if the original can't be restored it refuses, giving
    the two manual steps: `reverse` with the release that wrote the
    record, then `rotate` by the combined angle with this release.
-   `requested_rotation()` (how each format stores the requested angle:
-   raw `irot` change for v1/v2, displayed change for v3) is checked
-   against a full table, and its v3 case - unused until the next format
-   bump - end to end by patching `FORMAT_VERSION` to 4 so that today's
-   v3 records are replayed.
+   `requested_transform()` (how each format stores the requested
+   change: raw `irot` change for v1/v2, the `REQT` entry for v3) is
+   checked against a full table, and its v3 case - unused until the
+   next format bump - end to end by patching `FORMAT_VERSION` to 4 so
+   that today's v3 records are replayed. `TestRequestedTransform`
+   covers `REQT` itself: its frozen 1-byte encoding (bit 2 = mirror,
+   bits 0-1 = turns), `compose_transforms()` against
+   `compose_irot`/`compose_imir`, that it accumulates every requested
+   rotation, that a record whose `REQT` includes mirroring (as a later
+   release will write) is refused by `rotate`, `reverse` and `info`
+   (API and CLI, exit 11, naming the release from `TVER`), that a record holding a tag its format
+   doesn't define (v3, or a v3 tag in a v1 record) is refused by
+   `rotate`, `reverse` and `info`, and that `--proceed-unsafe` makes
+   `info`/`reverse` ignore it - really dropping it before the record is
+   read - with a warning on stderr, that a v3
+   record without `REQT` (pre-release builds only) is refused by
+   `rotate`/`info` but still reversible, that a malformed one is
+   refused, that an edit which wouldn't display as requested is
+   refused, and that a rotation applied by another tool in between is
+   neither recorded nor makes the next edit fail.
    Helpers,
    `_make_v1_style_record` / `_make_v2_style_record`, build those
    fixtures from a real rotation result plus the original bytes, for
@@ -149,7 +164,7 @@ same as heic-lossless-rotate itself. Requires Python 3.
    The tamper-recovery tests in group 2 were updated for this: the
    record can still recover tampering to the specific bytes it saves (the live
    `irot` byte in the fast-path case; the discarded inserted box in the
-   slow-path case) with `--ignore-tamper-check`, but - unlike v1's
+   slow-path case) with `--proceed-unsafe`, but - unlike v1's
    blanket `iprp` overwrite - tampering with anything else in `iprp` is
    now correctly refused rather than silently masked, which is now its
    own explicit test rather than an accidental side effect of the old
@@ -163,7 +178,10 @@ same as heic-lossless-rotate itself. Requires Python 3.
    no-args showing full help, `-V`/`--version` reporting the script and
    metadata format versions, output-overwrite protection (refused by
    default, allowed with `-f`/`--force`) for both `rotate` and `reverse`,
-   `reverse`'s separate `--ignore-tamper-check` flag, `--dry-run` never
+   `reverse`'s separate `--proceed-unsafe` flag (silent when nothing
+   was overridden; with `-q`, still naming on stderr every check it
+   overrode - tamper and unknown entry - for both `reverse` and `info`),
+   `--dry-run` never
    writing a file, `info`'s exit codes (0/1/2/3/4) and its recorded-
    tool-version line, `rotate`'s "reversibility self-check passed"
    message (and that `-q` suppresses it), and the error exit code (10)

@@ -15,6 +15,7 @@ malformed input. See heic_rotate.cli for the command-line interface and
 its own module docstring for user-facing usage/design documentation.
 """
 import struct
+import sys
 import zlib
 import uuid as uuid_mod
 
@@ -29,6 +30,15 @@ class ProvenanceError(Exception):
     pass
 
 
+class NewerVersionError(ProvenanceError):
+    """Refusing a file because a later release of heic-lossless-rotate
+    produced something in it this release doesn't support: a newer
+    provenance format, record entries it doesn't know, or a requested
+    change it can't handle (mirroring). The CLI exits with
+    NEWER_VERSION_EXIT_CODE for it, so scripts can tell "update the
+    tool" apart from other errors."""
+
+
 # The provenance format version every record is WRITTEN in. Older
 # records (v1/v2) are still read by `reverse`/`info`; `rotate` on such a
 # file restores the original first and re-applies everything (see
@@ -39,7 +49,9 @@ FORMAT_VERSION = 3
 # v1: the pristine 'iprp' box (ipco+ipma) was saved in full (OPRP). v2:
 # only the 'irot' property itself is saved (OIRT, +OIPF for the slow-path
 # case). v3: only the 'ipma' associations (OIPD) and 'ipco' children
-# (OIPC) that changed - see iprp_diff_entries - see apply_rotation()'s
+# (OIPC) that changed - see iprp_diff_entries - plus the requested change
+# to the displayed image, rotation and mirroring (REQT - see
+# requested_transform); see apply_rotation()'s
 # "Update / create the provenance box" section and
 # _pristine_iprp_bytes() for what each format actually stores and how
 # each is reconstructed. Kept as its own constant (rather than inlining
@@ -513,6 +525,16 @@ def compose_imir(transform, axis):
     return (not flip), (2 - turns) & 0x3
 
 
+def compose_transforms(outer, inner):
+    """The transform `inner` followed by `outer`. With (flip, turns) ==
+    R(turns) * F^flip: R(t1) * F^f1 * R(t2) * F^f2 == R(t1 +- t2) * F^(f1+f2),
+    with t2 negated when f1 flips it. compose_irot(t, k) is
+    compose_transforms((False, k), t)."""
+    f1, t1 = outer
+    f2, t2 = inner
+    return bool(f1) != bool(f2), (t1 + (-t2 if f1 else t2)) & 0x3
+
+
 def transform_to_exif_orientation(transform):
     flip, turns = transform
     if flip:
@@ -931,35 +953,131 @@ def find_provenance_box(data):
     return None
 
 
+# FROZEN ACROSS ALL FORMAT VERSIONS, past and future: the record's
+# framing - 16-byte uuid, format version (u8), entry count (u8), then
+# that many (tag: 4 bytes, length: u32, value) entries filling the box
+# exactly - and its TVER entry (3 bytes: major, minor, patch of the
+# release that last updated the file). A format bump may change what
+# any OTHER entry means, but never these, so that every release can
+# name the release a newer record came from (see parse_provenance).
+
+def _parse_entries(data, pos, c_end):
+    """Parse the frozen entry framing from `pos` (the entry count) to
+    `c_end`. Returns the entries dict, or None if it doesn't fit."""
+    if pos >= c_end:
+        return None
+    entry_count = data[pos]; pos += 1
+    entries = {}
+    for _ in range(entry_count):
+        if pos + 8 > c_end:
+            return None
+        tag = bytes(data[pos:pos + 4]); pos += 4
+        length = struct.unpack_from('>I', data, pos)[0]; pos += 4
+        if pos + length > c_end:
+            return None
+        entries[tag] = bytes(data[pos:pos + length]); pos += length
+    return entries if pos == c_end else None
+
+
+def _tver_string(entries):
+    """'MAJOR.MINOR.PATCH' from a record's TVER entry, or None."""
+    tver = (entries or {}).get(b'TVER')
+    if tver is None or len(tver) != 3:
+        return None
+    return '.'.join(str(b) for b in tver)
+
+
+def newer_version_error(problem, entries, advice=None):
+    """A NewerVersionError saying `problem` (what this release can't
+    handle), naming the release that last updated the file from the
+    record's TVER if it has one, and ending with `advice` (default: to
+    update heic-lossless-rotate)."""
+    writer = _tver_string(entries)
+    who = (f"heic-lossless-rotate {writer}" if writer is not None
+           else "a newer heic-lossless-rotate release")
+    if advice is None:
+        advice = "Update heic-lossless-rotate to rotate, reverse or inspect it"
+    return NewerVersionError(
+        f"this file was last updated by {who} (this is {VERSION}): "
+        f"{problem}. {advice}")
+
+
 def parse_provenance(data, hdr):
     """Parse our provenance box content into (version, entries dict).
 
     A record in a format NEWER than FORMAT_VERSION is refused right after
-    reading its version byte: nothing past it is parsed or interpreted,
-    since a newer format may have changed anything (`rotate`, `reverse`
-    and `info` all go through here)."""
+    reading its version byte (`rotate`, `reverse` and `info` all go
+    through here), since a newer format may have changed what anything
+    means. Only the frozen framing is read from it, for its TVER, so the
+    error can name the release that wrote it."""
     c_start, c_end = hdr[2], hdr[3]
     pos = c_start + 16  # skip the 16-byte uuid
     if pos >= c_end:
         raise ProvenanceError("provenance box truncated before its format version")
     version = data[pos]; pos += 1
     if version > FORMAT_VERSION:
+        raise newer_version_error(
+            f"its heic-lossless-rotate metadata is format v{version}, newer "
+            f"than this release supports (v{FORMAT_VERSION})",
+            _parse_entries(data, pos, c_end))
+    entries = _parse_entries(data, pos, c_end)
+    if entries is None:
         raise ProvenanceError(
-            f"this file's heic-lossless-rotate metadata is format "
-            f"v{version}, newer than this release supports (v{FORMAT_VERSION}) "
-            f"- update heic-lossless-rotate to rotate, reverse or inspect it")
-    entry_count = data[pos]; pos += 1
-    entries = {}
-    for _ in range(entry_count):
-        tag = bytes(data[pos:pos + 4]); pos += 4
-        length = struct.unpack_from('>I', data, pos)[0]; pos += 4
-        value = bytes(data[pos:pos + length]); pos += length
-        entries[tag] = value
-    if pos != c_end:
-        raise ProvenanceError(
-            f"provenance box parse mismatch: consumed {pos - c_start}, "
-            f"expected {c_end - c_start} (corrupt or truncated?)")
+            "provenance box entries don't match its size (corrupt or "
+            "truncated?)")
     return version, entries
+
+
+# Every entry tag a record of each format version may hold. A record
+# with any other tag was most likely written by a later release that
+# extended the format (adding a tag doesn't need a format bump), so
+# every command refuses it (see check_known_entries): `rotate` rebuilds
+# the record from the tags it knows and would silently drop it - which
+# may be what that release needs to reverse or replay its edit - and
+# `info`/`reverse` can't know what it changes about the file. `info` and
+# `reverse` can be told to ignore it with --proceed-unsafe; `reverse`
+# still verifies its result against PCRC either way.
+_COMMON_TAGS = frozenset((b'OMSZ', b'OILC', b'OEXO', b'PCRC', b'CCRC', b'TVER'))
+RECORD_TAGS = {
+    1: _COMMON_TAGS | {b'OPRP'},
+    2: _COMMON_TAGS | {b'OIRT', b'OIPF'},
+    3: _COMMON_TAGS | {b'OIPC', b'OIPD', b'OIPM', b'REQT'},
+}
+
+
+def warn_unsafe(message):
+    """Report, on stderr - regardless of -q, so it can't go unnoticed - a
+    condition that would have been an error without --proceed-unsafe."""
+    print(f"warning (would be an error without --proceed-unsafe): {message}",
+          file=sys.stderr)
+
+
+def check_known_entries(version, entries, command, proceed_unsafe=False):
+    """Return `entries` (a format `version` record's) without any tag
+    that format doesn't define (see RECORD_TAGS) - but raise if there is
+    one, unless `proceed_unsafe`, in which
+    case `command` ('info' or 'reverse') proceeds after reporting it via
+    warn_unsafe(). Callers must use the returned entries, so an ignored
+    tag can't still affect how the record is read (e.g. a v3 tag in an
+    older record). `rotate` can't be overridden: it would drop them.
+    Raises NewerVersionError, naming the release that wrote them."""
+    known = RECORD_TAGS[version]
+    unknown = sorted(set(entries) - known)
+    if not unknown:
+        return entries
+    problem = (f"its metadata has entries this release doesn't know "
+               f"({', '.join(t.decode('ascii', 'replace') for t in unknown)})")
+    if proceed_unsafe and command != 'rotate':
+        warn_unsafe(str(newer_version_error(problem, entries,
+                                            "Ignoring them")))
+        return {tag: value for tag, value in entries.items() if tag in known}
+    if command == 'rotate':
+        raise newer_version_error(problem, entries,
+                                  "Update heic-lossless-rotate to rotate it")
+    raise newer_version_error(
+        problem, entries,
+        f"Update heic-lossless-rotate, or re-run `{command}` with "
+        f"--proceed-unsafe to ignore them")
 
 
 def build_provenance_box(version, entries: dict):
@@ -1232,35 +1350,98 @@ def _splice_iprp(data, struct_info, new_iprp_box, verbose, label):
     return out, delta
 
 
-def requested_rotation(record_version, original_turns, current_turns,
-                       mirrored_after_rotation):
-    """The cumulative rotation (0-3 quarter turns) that was REQUESTED from
-    the release(s) that wrote a provenance record of format
-    `record_version`, given the primary item's raw 'irot' value in the
-    original file and now, and whether its 'imir' is applied after its
-    'irot' (an odd number of 'imir' following it - see _rotation_sign;
-    the order never changes between edits, so the current file's
-    answers for the original too).
+def encode_requested_transform(transform):
+    """The 1-byte REQT provenance entry for `transform`, a (flip, turns)
+    change to the DISPLAYED image (see compose_irot): bit 2 = mirror
+    left-right, bits 0-1 = quarter turns counter-clockwise applied after
+    it, bits 3-7 reserved (zero).
 
-    How the requested angle maps to raw 'irot' depends on which releases
-    wrote the record:
-      v1, v2: raw 'irot' was changed by exactly the requested angle,
-        mirrored or not (those releases didn't know about 'imir', so a
-        photo mirrored after rotation displayed the opposite way).
-      v3: raw 'irot' is changed in the OPPOSITE direction for a photo
-        mirrored after rotation, so that it displays the requested way;
-        the requested angle is the displayed change.
+    One mirror bit covers every orientation: a top-bottom flip is a
+    left-right flip followed by a half turn, (True, 2), so the 8 values
+    are exactly the 8 orientations Exif Orientation can describe. This
+    release only ever writes flip == False; mirroring is reserved for a
+    later one."""
+    flip, turns = transform
+    return bytes([(0x4 if flip else 0) | (turns & 0x3)])
+
+
+def check_request_supported(entries):
+    """Raise NewerVersionError unless the REQT entry in a record's
+    `entries` is one this release can handle: a single byte with the
+    mirror bit and reserved bits clear. Called by every command
+    (`rotate`, `reverse`, `info`), so a file a later release has
+    mirrored - or recorded something newer in REQT for - is refused with
+    a clear message rather than misreported, rotated around its
+    mirroring or reversed by a release that doesn't know what the record
+    means."""
+    value = entries[b'REQT']
+    if len(value) != 1 or value[0] & ~0x7:
+        raise newer_version_error(
+            "its metadata records a change this release doesn't understand "
+            "(unexpected REQT entry - or the metadata is corrupt)", entries)
+    if value[0] & 0x4:
+        raise newer_version_error(
+            "it was mirrored, which this release doesn't support yet",
+            entries)
+
+
+def decode_requested_transform(entries):
+    """Inverse of encode_requested_transform() for a format v3 record's
+    `entries`. Raises ProvenanceError if REQT is missing, or
+    NewerVersionError if this release doesn't support it (see
+    check_request_supported)."""
+    value = entries.get(b'REQT')
+    if value is None:
+        raise ProvenanceError(
+            "provenance record has no REQT entry (the requested transform), "
+            "which format v3 requires - it was probably written by a "
+            "pre-release build of heic-lossless-rotate. `reverse` can "
+            "still restore the original; rotate that again")
+    check_request_supported(entries)
+    return bool(value[0] & 0x4), value[0] & 0x3
+
+
+def requested_transform(record_version, entries, original_turns, current_turns):
+    """The cumulative change to the DISPLAYED image that was REQUESTED
+    from the release(s) that wrote a provenance record of format
+    `record_version` holding `entries`, as (flip, turns) - see
+    compose_irot. `original_turns`/`current_turns` are the primary
+    item's raw 'irot' value in the original file and now (0-3), or None
+    if unknown.
+
+    How each format stores it:
+      v1, v2: not stored. Those releases only rotated, and changed raw
+        'irot' by exactly the requested angle, mirrored or not (they
+        didn't know about 'imir', so a photo mirrored after rotation
+        displayed the opposite way) - so it is (False, raw 'irot'
+        delta), or None if either 'irot' value is unknown.
+      v3: stored explicitly in REQT, so that it's known independently of
+        how 'irot'/'imir' were edited to achieve it - a future release
+        that fixes a bug in that, or adds mirroring, replays it as is.
+        Raises if it includes mirroring, which this release doesn't
+        support (see check_request_supported).
     Raises ProvenanceError for a format it doesn't know - add a case
     here whenever FORMAT_VERSION is bumped, before records of the
     previous format get replayed (see _replay_from_original)."""
-    raw = (current_turns - original_turns) % 4
     if record_version in (1, 2):
-        return raw
+        if original_turns is None or current_turns is None:
+            return None
+        return False, (current_turns - original_turns) % 4
     if record_version == 3:
-        return (-raw) % 4 if mirrored_after_rotation else raw
+        return decode_requested_transform(entries)
     raise ProvenanceError(
         f"don't know how a format v{record_version} provenance record "
         f"stores the requested rotation")
+
+
+def _check_display_change(before, after, request):
+    """Raise unless the display transform `after` an edit is `request`
+    applied on top of the one `before` it."""
+    if after != compose_transforms(request, before):
+        raise BoxParseError(
+            f"internal error: this edit would change the primary item's "
+            f"display transform from {before} to {after}, not by the "
+            f"requested {request} - nothing written")
 
 
 def _mirrored_after_rotation(data):
@@ -1273,20 +1454,23 @@ def _mirrored_after_rotation(data):
 
 
 def _recorded_rotation(data, record_version, entries, original=None):
-    """requested_rotation() for `data`, a file with a format
-    `record_version` provenance record holding `entries`. The original
-    'irot' value is read from `original` (the restored original file)
-    if given, otherwise straight from the record - so it is known even
-    if the original can't be restored."""
-    if original is not None:
+    """The rotation (0-3 quarter turns) requested_transform() says was
+    requested for `data`, a file with a format `record_version`
+    provenance record holding `entries`. The original 'irot' value (only
+    needed for formats that don't store the request) is read from
+    `original` (the restored original file) if given, otherwise straight
+    from the record - so it is known even if the original can't be
+    restored."""
+    if record_version >= 3:
+        original_turns = None
+    elif original is not None:
         original_turns = get_current_rotation(original)
     else:
         info = locate_structures(data)
         original_turns = get_rotation_from_iprp_snapshot(
             _pristine_iprp_bytes(data, info, entries), info['primary_item_id'])
-    return requested_rotation(record_version, original_turns,
-                              get_current_rotation(data),
-                              _mirrored_after_rotation(data))
+    return requested_transform(record_version, entries, original_turns,
+                               get_current_rotation(data))[1]
 
 
 def _replay_from_original(data, record_version, entries, delta_turns,
@@ -1306,6 +1490,8 @@ def _replay_from_original(data, record_version, entries, delta_turns,
     delta_turns %= 4
     try:
         original = reverse_rotation(data, verbose=False)
+    except NewerVersionError:
+        raise
     except (ProvenanceError, BoxParseError) as e:
         try:
             added = _recorded_rotation(data, record_version, entries)
@@ -1393,13 +1579,16 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     # -- recapture, or `reverse` would only be able to undo the latest
     # -- edit instead of getting back to the true original. --
     existing_provenance = None
+    prior_request = (False, 0)
     if struct_info['provenance_hdr'] is not None:
         record_version, existing_provenance = parse_provenance(
             data, struct_info['provenance_hdr'])
+        check_known_entries(record_version, existing_provenance, 'rotate')
         if record_version < FORMAT_VERSION:
             return _replay_from_original(data, record_version,
                                          existing_provenance, delta_turns,
                                          sync_exif, verbose)
+        prior_request = decode_requested_transform(existing_provenance)
         if verbose:
             print("[info] existing provenance record found - this file has "
                   "been edited by heic-lossless-rotate before; preserving its "
@@ -1569,7 +1758,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     # ---- Update / create the provenance box ----
     # Always format v3: whichever original 'ipma' association lists and
     # 'ipco' children differ from the edited 'iprp' (see
-    # iprp_diff_entries).
+    # iprp_diff_entries), and the requested transform (REQT, below).
     # Recomputed on every edit from the PRISTINE 'iprp' - captured live
     # on a first-ever edit, reconstructed from the existing (always
     # current-format: older ones go through _replay_from_original)
@@ -1599,6 +1788,25 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         raise BoxParseError(
             f"cannot record how to reverse this edit: {e}") from None
 
+    # REQT: the cumulative change to the DISPLAYED image requested from
+    # heic-lossless-rotate since the original - this edit's request
+    # composed onto the previous one. Stored rather than derived from
+    # 'irot'/'imir' so that it doesn't depend on those having been edited
+    # correctly (see requested_transform). Fixed width, so it updates in
+    # place like CCRC and TVER. The check guards that dependency the
+    # other way: THIS edit must change the primary's display transform
+    # by exactly what was requested (checked against the file's state
+    # just before it, not the original's, so a rotation applied by
+    # another tool since doesn't count against it).
+    this_request = (False, delta_turns)
+    _check_display_change(
+        IprpModel(data, iprp_start, iprp_c_start, iprp_c_end).transform(
+            primary_item_id),
+        IprpModel.from_box(edited_iprp).transform(primary_item_id),
+        this_request)
+    entries[b'REQT'] = encode_requested_transform(
+        compose_transforms(this_request, prior_request))
+
     # TVER: the heic-lossless-rotate version performing THIS update, whose
     # reversibility is about to be self-checked below (in _run()) before
     # anything is written. Always the CURRENTLY RUNNING tool's version,
@@ -1615,8 +1823,9 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     # handled uniformly rather than as separate code paths:
     #   - old_prov_size == 0: first-time insertion.
     #   - old_prov_size == new_prov_size: the common case for every edit
-    #     after the first (only CCRC's and TVER's fixed-width VALUES
-    #     change, never the box's overall size) - no iloc patching needed.
+    #     after the first (only CCRC's, TVER's and REQT's fixed-width
+    #     VALUES change, never the box's overall size) - no iloc patching
+    #     needed.
     #   - old_prov_size != new_prov_size (both nonzero): this edit
     #     changed which 'iprp' properties/associations differ from the
     #     original (OIPC/OIPD - e.g. a gain-map 'tmap' item needing its
@@ -1885,7 +2094,7 @@ def _restore_meta_provenance_span(span, entries, verbose=False):
     return span
 
 
-def _prepare_reversal(data, ignore_tamper, verbose):
+def _prepare_reversal(data, proceed_unsafe, verbose):
     """All of the setup shared by reverse_rotation() and
     verify_reversible(), up to (but not including) actually assembling
     the reconstructed file's bytes: locate the provenance record, check
@@ -1916,6 +2125,13 @@ def _prepare_reversal(data, ignore_tamper, verbose):
             f"provenance record is format version {version}; this script "
             f"only knows how to reverse version(s) {supported}. Use a "
             f"matching version of heic-lossless-rotate.")
+    # REQT isn't needed to restore the original, so a record lacking it
+    # (pre-release v3 builds) still reverses - but one recording a change
+    # this release doesn't support (mirroring) is refused, like
+    # everywhere else.
+    entries = check_known_entries(version, entries, 'reverse', proceed_unsafe)
+    if b'REQT' in entries:
+        check_request_supported(entries)
 
     prov_start, _, _, prov_end, _ = prov_hdr
     current_ccrc = crc32_excluding_range(data, prov_start, prov_end)
@@ -1925,10 +2141,10 @@ def _prepare_reversal(data, ignore_tamper, verbose):
                f"the last heic-lossless-rotate edit (CRC32 mismatch: file is "
                f"{current_ccrc:#010x}, provenance expects {stored_ccrc:#010x}). "
                f"Reversing now could silently clobber those other changes.")
-        if not ignore_tamper:
-            raise ProvenanceError(msg + " Re-run with --ignore-tamper-check to override.")
-        elif verbose:
-            print(f"[warning] {msg} Proceeding anyway (--ignore-tamper-check).")
+        if not proceed_unsafe:
+            raise ProvenanceError(
+                msg + " Re-run `reverse` with --proceed-unsafe to override.")
+        warn_unsafe(msg + " Proceeding anyway.")
 
     # 'mdat' - excluded from this span in both supported layouts, since
     # the provenance box is always inserted as 'meta''s immediate next
@@ -2008,10 +2224,16 @@ def _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
         yield view[prov_end:]
 
 
-def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
+def reverse_rotation(data: bytes, proceed_unsafe=False, verbose=True):
     """Undo heic-lossless-rotate's own edit(s), reconstructing the exact
     original file (verified by CRC32 against the PCRC recorded on the
     file's first-ever edit).
+
+    `proceed_unsafe` (the CLI's --proceed-unsafe) proceeds past checks
+    that would otherwise refuse - the file was modified by something
+    else since the last edit (CCRC mismatch), or the record holds
+    entries this release doesn't know - reporting each one it overrides
+    via warn_unsafe(). The final PCRC check is never skipped.
 
     Structural fact this relies on, and that verify_reversible() below
     also depends on: every edit made here falls either inside the
@@ -2034,7 +2256,7 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
     CRC32 and discard).
     """
     entries, meta_start, prov_end, span, exif_patch = _prepare_reversal(
-        data, ignore_tamper, verbose)
+        data, proceed_unsafe, verbose)
 
     out = bytearray()
     crc = None
@@ -2059,9 +2281,9 @@ def reverse_rotation(data: bytes, ignore_tamper=False, verbose=True):
     return out
 
 
-def verify_reversible(data, ignore_tamper=False, verbose=False):
+def verify_reversible(data, proceed_unsafe=False, verbose=False):
     """Equivalent, in terms of pass/fail and the error(s) raised, to
-    calling reverse_rotation(data, ignore_tamper, verbose) and
+    calling reverse_rotation(data, proceed_unsafe, verbose) and
     discarding the result - but computes the final CRC32 comparison
     without ever materializing a second full-file buffer. Intended for
     rotate's post-edit self-check (see cli.py), which only needs to know
@@ -2082,7 +2304,7 @@ def verify_reversible(data, ignore_tamper=False, verbose=False):
     only for one to additionally keep a copy of them.
     """
     entries, meta_start, prov_end, span, exif_patch = _prepare_reversal(
-        data, ignore_tamper, verbose)
+        data, proceed_unsafe, verbose)
 
     crc = None
     for chunk in _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
@@ -2105,11 +2327,13 @@ def verify_reversible(data, ignore_tamper=False, verbose=False):
 # Info: cheap, read-only summary - no reconstruction, no heavy verification.
 # ---------------------------------------------------------------------------
 
-def gather_info(data):
+def gather_info(data, proceed_unsafe=False):
     """Read-only summary of heic-lossless-rotate provenance state and the file's
     live rotation. Does none of the "heavy" work reverse/rotate do (no
     byte-level reconstruction, no final CRC-of-reconstructed-file check) -
-    just parses what's already sitting in the file.
+    just parses what's already sitting in the file. `proceed_unsafe`
+    ignores record entries this release doesn't know instead of
+    refusing, reporting it via warn_unsafe() (see check_known_entries).
 
     Returns a dict:
       current_quarter_turns  : 0-3, the live 'irot' value on the primary
@@ -2124,7 +2348,7 @@ def gather_info(data):
                                 heic-lossless-rotate on top of that
                                 original, cumulatively across every edit
                                 since (if has_provenance; see
-                                requested_rotation) - THIS is the number
+                                requested_transform) - THIS is the number
                                 that answers "what did this tool do to
                                 it", as opposed to current_quarter_turns
                                 which also reflects whatever rotation the
@@ -2172,6 +2396,7 @@ def gather_info(data):
     # Raises for a format newer than this release (see parse_provenance)
     # or a corrupt record - `info` doesn't guess at either.
     version, entries = parse_provenance(data, prov_hdr)
+    entries = check_known_entries(version, entries, 'info', proceed_unsafe)
     result['has_provenance'] = True
     result['version'] = version
     result['has_iloc_snapshot'] = b'OILC' in entries
@@ -2200,11 +2425,13 @@ def gather_info(data):
 
     if original_quarter_turns is not None:
         result['original_quarter_turns'] = original_quarter_turns
-        # The rotation REQUESTED, cumulatively - the same rule `rotate`
-        # uses to replay older records (see requested_rotation). For a
-        # latest-format record it is exactly what viewers show.
-        result['delta_quarter_turns'] = requested_rotation(
-            version, original_quarter_turns, current_quarter_turns, mirrored)
+    # The change REQUESTED, cumulatively - the same rule `rotate` uses to
+    # replay older records (see requested_transform). For a
+    # latest-format record it is exactly what viewers show.
+    requested = requested_transform(version, entries, original_quarter_turns,
+                                    current_quarter_turns)
+    if requested is not None:
+        result['delta_quarter_turns'] = requested[1]
 
     if b'PCRC' in entries:
         result['pcrc'] = struct.unpack('>I', entries[b'PCRC'])[0]
@@ -2327,6 +2554,8 @@ def verify_structure(data):
     return True
 
 
+NEWER_VERSION_EXIT_CODE = 11  # refused: made by a later release (see
+                              # NewerVersionError)
 ERROR_EXIT_CODE = 10  # kept out of 0-3 so it never collides with `info`'s
                        # rotation-degrees exit codes
 

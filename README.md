@@ -362,7 +362,8 @@ original state of only the item properties and associations the tool
 changed (the `irot` value, or the fact that there was none, and for HDR
 gain-map photos the `tmap` item's properties), the pristine `iloc`
 content and `meta` size field, the legacy Exif orientation byte if
-present, CRC32 checksums used to detect if the file is modified by
+present, the total rotation you've asked the tool for (shown by
+`info`), CRC32 checksums used to detect if the file is modified by
 something else afterward, and the tool version that most recently
 updated the file (shown by `info`).
 
@@ -409,10 +410,11 @@ edits this tool has made at once and returning the file to be
 byte-for-byte identical to the true original. It does a final CRC
 self-check before ever writing output — it refuses to write rather
 than risk producing a silently-wrong file. This final check is
-unconditional and never skipped by `--ignore-tamper-check`: that flag
-only affects whether `reverse` proceeds past the *earlier* check for
-whether something else modified the file since this tool's last edit,
-not this final one.
+unconditional and never skipped by `--proceed-unsafe`: that flag only
+affects whether `reverse` proceeds past the *earlier* checks (whether
+something else modified the file since this tool's last edit, and
+whether its metadata has entries this release doesn't know), not this
+final one.
 
 ### `info`
 
@@ -468,9 +470,13 @@ Every edit writes its provenance record in the latest metadata format.
 Records in older formats, written by earlier releases, can still be
 reversed, and `rotate` replaces them as described above. A record in a
 format newer than the running release knows is refused outright, by
-`rotate`, `reverse` and `info` alike: beyond its format number, nothing
-in it is read. So once a newer release has edited a file, use that
-release or a later one (`-V` shows the formats a release supports).
+`rotate`, `reverse` and `info` alike, with exit code `11`: beyond its
+format number, only the version of the release that last updated the
+file is read from it, so the error can name that release. The same
+applies to a record in a known format that a newer release extended
+(with entries this release doesn't know, or with mirroring). So once a
+newer release has edited a file, use that release or a later one (`-V`
+shows the formats a release supports).
 
 ## Options
 
@@ -482,30 +488,39 @@ release or a later one (`-V` shows the formats a release supports).
 | `--dry-run` | `rotate`, `reverse` | Do everything except write the output file |
 | `-f`, `--force` | `rotate`, `reverse` | Overwrite the output file if it already exists (refused by default) |
 | `--no-exif-sync` | `rotate` | Don't sync the legacy embedded Exif `Orientation` tag |
-| `--ignore-tamper-check` | `reverse` | Proceed even if the file appears to have been modified by something else since the last edit this tool made (see note below) |
+| `--proceed-unsafe` | `reverse`, `info` | Proceed past checks that would otherwise refuse: for `reverse`, that the file appears to have been modified by something else since the last edit this tool made; for both, metadata entries this release doesn't know, which are then ignored. Each check it overrides is reported on stderr, even with `-q` (see note below) |
 
 All top-level flags (`-q`, `--dry-run`, `-f`) may be given either before or
 after the subcommand name.
 
-> **Note:** `-f`/`--force` and `--ignore-tamper-check` control two
+> **Note:** `-f`/`--force` and `--proceed-unsafe` control two
 > different things. `-f`/`--force` is purely about not clobbering an
-> existing *output* file. `--ignore-tamper-check` (on `reverse` only)
-> overrides a CRC mismatch indicating the *input* file was changed by
-> something other than this tool since its last edit — reversing in
-> that situation could silently discard those other changes, so it's
-> refused unless you explicitly opt in.
+> existing *output* file. `--proceed-unsafe` overrides checks on the
+> *input* file. On `reverse`, it overrides a CRC mismatch indicating the
+> file was changed by something other than this tool since its last
+> edit — reversing in that situation could silently discard those other
+> changes. On `reverse` and `info`, it ignores metadata entries this
+> release doesn't know, which a newer release may have added: they may
+> change what `info` should report or what `reverse` should restore
+> (`reverse` still checks that the result matches the original file's
+> CRC32). Both are refused unless you explicitly opt in, and every check
+> it overrides is reported as a `warning (would be an error without
+> --proceed-unsafe): ...` line on stderr. `rotate` has no such option:
+> it would have to drop the unknown entries.
 
 ## Exit codes
 
 `rotate` and `reverse` exit `0` on success. `info` uses its own scheme so a
-script can branch on the result without parsing text output:
+script can branch on the result without parsing text output. Exit codes
+`10` and `11` apply to all commands:
 
 | Exit code | Meaning |
 |---|---|
 | `0` | No provenance record found — this tool has never touched the file |
 | `1` / `2` / `3` | This tool's cumulative contribution is `90°` / `180°` / `270°` |
 | `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. `rotate 0` was used just to add tracking, or opposing rotations cancelled out) |
-| `10` | A genuine error occurred (e.g. unreadable file, refused overwrite, metadata in a format newer than this release) — deliberately outside `0`–`4` so it's never mistaken for a rotation-state result |
+| `10` | A genuine error occurred (e.g. unreadable file, refused overwrite) — deliberately outside `0`–`4` so it's never mistaken for a rotation-state result |
+| `11` | Refused because a later release of this tool produced something in the file that this release doesn't support: a newer metadata format, metadata entries it doesn't know, or mirroring. The error names the release that last updated the file. Update heic-lossless-rotate (for unknown entries, `info`/`reverse` can also proceed with `--proceed-unsafe`) |
 
 ## Known limitations
 

@@ -7,8 +7,8 @@ reversible.
 USAGE
 -----
     %(prog)s rotate <0|90|180|270> <input.heic> [output.heic] [-f]
-    %(prog)s reverse <input.heic> [output.heic] [-f] [--ignore-tamper-check]
-    %(prog)s info <input.heic>
+    %(prog)s reverse <input.heic> [output.heic] [-f] [--proceed-unsafe]
+    %(prog)s info <input.heic> [--proceed-unsafe]
     %(prog)s -V | --version
 
 The 'rotate' subcommand name may be omitted: if the first non-option
@@ -22,11 +22,12 @@ heic-lossless-rotate provenance record without doing the heavier
 reconstruction/verification `reverse` does.
 
 By default, rotate/reverse refuse to overwrite an existing output file;
-pass -f/--force to allow it. (This is a different flag from `reverse`'s
---ignore-tamper-check, which controls whether `reverse` proceeds despite
-a CRC mismatch suggesting the file was modified by something else since
-the last edit - that flag used to be named --force, before -f/--force was
-repurposed for output-overwrite as described above.)
+pass -f/--force to allow it. (This is a different flag from
+--proceed-unsafe, on `reverse` and `info`, which proceeds past checks
+that would otherwise refuse: for `reverse`, a CRC mismatch suggesting the
+file was modified by something else since the last edit; for both,
+metadata entries this release doesn't know, as a newer release may
+write. Every check it overrides is reported on stderr, even with -q.)
 
 Run with no arguments, or with -h, for full help.
 
@@ -208,6 +209,7 @@ import argparse
 
 from .core import (
     BoxParseError,
+    NewerVersionError,
     ProvenanceError,
     apply_rotation,
     reverse_rotation,
@@ -216,6 +218,7 @@ from .core import (
     format_info,
     verify_structure,
     ERROR_EXIT_CODE,
+    NEWER_VERSION_EXIT_CODE,
     _version_string,
 )
 
@@ -286,11 +289,14 @@ def build_parser():
     rev.add_argument('input', help='input .heic file (previously edited by this tool)')
     rev.add_argument('output', nargs='?',
                       help='output .heic file (default: <input>_restored.heic)')
-    rev.add_argument('--ignore-tamper-check', action='store_true',
+    rev.add_argument('--proceed-unsafe', action='store_true',
                       help="reverse even if the file appears to have been "
-                           "modified by something else since the last edit "
-                           "(was previously named --force; -f/--force now "
-                           "means 'overwrite the output file' instead)")
+                           "modified by something else since the last "
+                           "edit, or its metadata has entries this release "
+                           "doesn't know (ignoring them); each check "
+                           "overridden is reported on stderr. The "
+                           "reconstructed file is still verified against "
+                           "the original's CRC32")
     rev.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS,
                       help="do everything except write the output file: "
                            "useful as a check for whether this file was "
@@ -330,8 +336,16 @@ def build_parser():
                      "cancelled out). A genuine error "
                      f"(e.g. unreadable file) exits {ERROR_EXIT_CODE}, "
                      "kept outside 0-4 so it's never mistaken for a "
-                     "rotation-state result.")
+                     "rotation-state result; refusing a file because a "
+                     "later heic-lossless-rotate release made something "
+                     "in it this one doesn't support exits "
+                     f"{NEWER_VERSION_EXIT_CODE}.")
     inf.add_argument('input', help='input .heic file')
+    inf.add_argument('--proceed-unsafe', action='store_true',
+                      help="report even if the file's metadata has entries "
+                           "this release doesn't know, ignoring them (they "
+                           "may change what this reports); reported on "
+                           "stderr")
     inf.add_argument('-q', '--quiet', action='store_true', default=argparse.SUPPRESS,
                       help="no text output; exit code alone reports state "
                            "(see command help above)")
@@ -379,6 +393,9 @@ def main():
         with open(args.input, 'rb') as f:
             data = f.read()
         _run(args, data)
+    except NewerVersionError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(NEWER_VERSION_EXIT_CODE)
     except (BoxParseError, ProvenanceError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(ERROR_EXIT_CODE)
@@ -386,7 +403,7 @@ def main():
 
 def _run(args, data):
     if args.cmd == 'info':
-        result = gather_info(data)
+        result = gather_info(data, proceed_unsafe=args.proceed_unsafe)
         text, exit_code = format_info(result, quiet=args.quiet)
         if text is not None:
             print(text)
@@ -415,7 +432,7 @@ def _run(args, data):
         # themselves are never used, so there's no reason to pay for a
         # second full-file copy just to discard it.)
         try:
-            verify_reversible(out, ignore_tamper=False, verbose=False)
+            verify_reversible(out, proceed_unsafe=False, verbose=False)
         except (BoxParseError, ProvenanceError) as e:
             raise ProvenanceError(
                 f"post-rotate reversibility self-check failed - refusing "
@@ -435,7 +452,7 @@ def _run(args, data):
             else:
                 out_path = in_stem + '_rotated.heic'
     else:
-        out = reverse_rotation(data, ignore_tamper=args.ignore_tamper_check,
+        out = reverse_rotation(data, proceed_unsafe=args.proceed_unsafe,
                                 verbose=not args.quiet)
         verify_structure(out)
         if not args.quiet:
