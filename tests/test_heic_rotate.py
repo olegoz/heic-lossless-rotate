@@ -254,8 +254,8 @@ class TestPitmBoundsChecking(unittest.TestCase):
         for args in (('info', path), ('rotate', '90', path, path + '.out')):
             with self.subTest(args=args[0]):
                 rc, out, err = run_cli(*args)
-                self.assertEqual(rc, hr.ERROR_EXIT_CODE, out + err)
-                self.assertIn('error:', err)
+                self.assertEqual(rc, hr.EXIT_UNSUPPORTED_FILE, out + err)
+                self.assertIn(f'ERROR Hard {hr.EXIT_UNSUPPORTED_FILE}:', err)
                 self.assertNotIn('Traceback', err)
 
 
@@ -917,7 +917,7 @@ class TestProvenanceVersionAndSelfCheck(unittest.TestCase):
             with unittest.mock.patch.object(
                     hr_cli, 'verify_reversible',
                     side_effect=hr.ProvenanceError("simulated failure")):
-                with self.assertRaises(hr.ProvenanceError) as ctx:
+                with self.assertRaises(hr.SelfCheckError) as ctx:
                     hr_cli._run(args, data)
 
             self.assertIn('self-check', str(ctx.exception).lower())
@@ -1178,7 +1178,7 @@ class TestProvenanceFormats(unittest.TestCase):
     def test_newer_format_is_refused_naming_its_writer(self):
         """A record in a format newer than this release is refused by
         `rotate`, `reverse` and `info` alike (NewerVersionError, CLI exit
-        11). Only the frozen entry framing is read from it, to name the
+        56). Only the frozen entry framing is read from it, to name the
         release that wrote it from its TVER; when even that doesn't
         parse (garbage here), the error says "a newer release" instead."""
         original = build_synthetic_heic(layout='mdat_first')
@@ -1215,7 +1215,7 @@ class TestProvenanceFormats(unittest.TestCase):
             with open(path, 'wb') as f:
                 f.write(framed)
             code, _, err = run_cli('info', path)
-            self.assertEqual(code, 11)
+            self.assertEqual(code, hr.EXIT_NEWER_RELEASE)
             self.assertIn('last updated by heic-lossless-rotate 1.9.0', err)
             self.assertIn('newer than this release supports', err)
         finally:
@@ -1324,7 +1324,7 @@ class TestRequestedTransform(unittest.TestCase):
         """A v3 record whose REQT includes mirroring - as a later release
         that can mirror will write (simulated here by setting REQT
         alone) - is refused by `rotate`, `reverse` and `info` alike
-        (CLI exit 11), saying this release doesn't support mirroring yet
+        (CLI exit 56), saying this release doesn't support mirroring yet
         and naming the release that did it."""
         original = build_synthetic_heic(layout='mdat_first', include_irot=True,
                                         irot_value=0)
@@ -1359,7 +1359,7 @@ class TestRequestedTransform(unittest.TestCase):
                          ('rotate', '90', path)):
                 with self.subTest(cli=args[0]):
                     code, _, err = run_cli(*args)
-                    self.assertEqual(code, 11)
+                    self.assertEqual(code, hr.EXIT_NEWER_RELEASE)
                     self.assertIn("doesn't support yet", err)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1402,14 +1402,18 @@ class TestRequestedTransform(unittest.TestCase):
                             self.assertIn(f"re-run `{name}` with --proceed-unsafe",
                                           str(ctx.exception))
                 err = io.StringIO()
-                with contextlib.redirect_stderr(err):
+                with contextlib.redirect_stderr(err), \
+                        contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(hr.gather_info(
                         data, proceed_unsafe=True)['delta_quarter_turns'], 1)
                     self.assertEqual(hr.reverse_rotation(
-                        data, proceed_unsafe=True, verbose=False), original)
+                        data, proceed_unsafe=True, verbose=True), original)
+                    # not verbose (the CLI's -q): overcome, but not reported
+                    hr.gather_info(data, proceed_unsafe=True, verbose=False)
+                    hr.reverse_rotation(data, proceed_unsafe=True, verbose=False)
                 self.assertEqual(err.getvalue().count(
-                    f"warning (would be an error without --proceed-unsafe): "
-                    f"this file was last updated by heic-lossless-rotate "
+                    f"ERROR Soft {hr.EXIT_UNKNOWN_ENTRIES} (overridden by "
+                    f"--proceed-unsafe): this file was last updated by heic-lossless-rotate "
                     f"{hr.VERSION} (this is {hr.VERSION}): its metadata has "
                     f"entries this release doesn't know ({names}). Ignoring "
                     f"them"), 2)
@@ -1453,7 +1457,7 @@ class TestRequestedTransform(unittest.TestCase):
         original = build_synthetic_heic(include_irot=True, irot_value=1,
                                         imir_axis=1)
         with unittest.mock.patch.object(hr, '_rotation_sign', return_value=1):
-            with self.assertRaises(hr.BoxParseError) as ctx:
+            with self.assertRaises(hr.InternalError) as ctx:
                 hr.apply_rotation(original, 1, verbose=False)
         self.assertIn('not by the requested', str(ctx.exception))
 
@@ -1689,7 +1693,7 @@ class TestCLI(unittest.TestCase):
 
     def test_no_args_shows_help_and_exits_nonzero(self):
         rc, out, err = run_cli()
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, hr.EXIT_USAGE)
         combined = out + err
         self.assertIn('rotate', combined)
         self.assertIn('reverse', combined)
@@ -1772,12 +1776,12 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(rc4, 0, err4)
         self.assertNotIn('warning', err4)
 
-    def test_proceed_unsafe_reports_every_override_even_when_quiet(self):
+    def test_proceed_unsafe_reports_every_override_except_with_q(self):
         """`reverse --proceed-unsafe` on a file that is both modified by
         something else (CCRC mismatch) and carries an unknown entry
-        names both conditions on stderr, even with -q; `info` names the
-        one it overrides. Without the flag both refuse, with exit 11 (made
-        by a later release)."""
+        names both soft errors on stderr, and `info` the one it
+        overcomes - but -q suppresses them. Without the flag both refuse,
+        with exit 20 (unknown entries: checked before the tamper check)."""
         original = build_synthetic_heic(layout='mdat_first', include_irot=True,
                                         irot_value=1)
         rotated = hr.apply_rotation(original, 1, verbose=False)
@@ -1799,26 +1803,32 @@ class TestCLI(unittest.TestCase):
         for args in (('reverse', path, out_path), ('info', path)):
             with self.subTest(command=args[0], flag=False):
                 rc, _, err = run_cli(*args)
-                self.assertEqual(rc, 11)
+                self.assertEqual(rc, hr.EXIT_UNKNOWN_ENTRIES)
                 self.assertIn('--proceed-unsafe', err)
 
-        prefix = 'warning (would be an error without --proceed-unsafe): '
+        overridden = ' (overridden by --proceed-unsafe): '
         rc, out, err = run_cli('-q', 'reverse', path, out_path, '--proceed-unsafe')
+        self.assertEqual((rc, out, err), (0, '', ''))
+        os.remove(out_path)
+        rc, out, err = run_cli('reverse', path, out_path, '--proceed-unsafe')
         self.assertEqual(rc, 0, err)
-        self.assertEqual(out, '')
-        self.assertIn(prefix + "this file was last updated by "
+        self.assertIn(f"ERROR Soft {hr.EXIT_UNKNOWN_ENTRIES}" + overridden +
+                      "this file was last updated by "
                       f"heic-lossless-rotate {hr.VERSION} (this is "
                       f"{hr.VERSION}): its metadata has entries this release "
                       "doesn't know (XNEW). Ignoring them", err)
-        self.assertIn(prefix + 'file appears to have been modified by '
-                      'something else', err)
+        self.assertIn(f"ERROR Soft {hr.EXIT_MODIFIED_SINCE_EDIT}" + overridden +
+                      'file appears to have been modified by something else',
+                      err)
         with open(out_path, 'rb') as f:
             self.assertEqual(f.read(), original)
 
         rc, out, err = run_cli('info', path, '-q', '--proceed-unsafe')
-        self.assertNotEqual(rc, 10, err)
-        self.assertEqual(out, '')
-        self.assertEqual(err.count(prefix), 1)
+        self.assertIn(rc, (1, 2, 3, 4), err)
+        self.assertEqual((out, err), ('', ''))
+        rc, out, err = run_cli('info', path, '--proceed-unsafe')
+        self.assertIn(rc, (1, 2, 3, 4), err)
+        self.assertEqual(err.count(overridden), 1)
         self.assertIn("doesn't know (XNEW)", err)
 
     def test_flag_before_subcommand_works(self):
@@ -1906,8 +1916,233 @@ class TestCLI(unittest.TestCase):
 
     def test_error_exit_code_isolated_from_info_codes(self):
         rc, out, err = run_cli('info', os.path.join(self.tmpdir, 'nonexistent.heic'))
-        self.assertEqual(rc, hr.ERROR_EXIT_CODE)
+        self.assertEqual(rc, hr.EXIT_FILE_ERROR)
         self.assertNotIn(rc, (0, 1, 2, 3, 4))
+
+    def test_exit_code_ranges(self):
+        """Errors are 20 and up: 20-49 are exactly the soft errors (an
+        option overcomes them), one code each, and 50 and up the hard
+        ones. Codes are distinct, and tagged accordingly."""
+        overridable = (hr.EXIT_OUTPUT_EXISTS, hr.EXIT_MODIFIED_SINCE_EDIT,
+                       hr.EXIT_UNKNOWN_ENTRIES)
+        hard = (hr.EXIT_FILE_ERROR, hr.EXIT_USAGE,
+                hr.EXIT_UNSUPPORTED_FILE, hr.EXIT_NO_RECORD, hr.EXIT_BAD_RECORD,
+                hr.EXIT_NEWER_RELEASE, hr.EXIT_INTERNAL,
+                hr.EXIT_SELF_CHECK_FAILED)
+        self.assertEqual(len(set(overridable + hard)), len(overridable + hard))
+        self.assertTrue(all(20 <= c < 50 for c in overridable))
+        self.assertTrue(all(c >= 50 for c in hard))
+        for c in overridable:
+            self.assertEqual(hr.error_tag(c), f'ERROR Soft {c}')
+        for c in hard:
+            self.assertEqual(hr.error_tag(c), f'ERROR Hard {c}')
+        self.assertEqual(hr.ModifiedSinceEditError.exit_code,
+                         hr.EXIT_MODIFIED_SINCE_EDIT)
+        self.assertEqual(hr.UnknownEntriesError.exit_code, hr.EXIT_UNKNOWN_ENTRIES)
+        self.assertEqual(hr.InternalError.exit_code, hr.EXIT_INTERNAL)
+        self.assertEqual(hr.SelfCheckError.exit_code, hr.EXIT_SELF_CHECK_FAILED)
+        self.assertEqual(hr_cli.OutputExistsError.exit_code, hr.EXIT_OUTPUT_EXISTS)
+
+    def test_runs_until_first_error_soft_errors_overcome_by_options(self):
+        """Without the overcoming options a run stops at its first error,
+        soft or hard, exiting with its code; with them it goes on past
+        every soft error, reporting each, and stops only at a hard one -
+        or reaches the end with a non-error exit code. --dry-run
+        behaves the same. Every error line is tagged."""
+        rotated = os.path.join(self.tmpdir, 'rotated.heic')
+        self.assertEqual(run_cli('rotate', '90', self.input_path, rotated, '-q')[0], 0)
+        with open(rotated, 'rb') as f:
+            data = f.read()
+        info = hr.locate_structures(data)
+        p_start, _, _, p_end, _ = info['provenance_hdr']
+        _, entries = hr.parse_provenance(data, info['provenance_hdr'])
+        entries[b'XNEW'] = b''
+        box = hr.build_provenance_box(3, entries)
+        delta = len(box) - (p_end - p_start)
+        out = bytearray(data)
+        iloc_content, changed = hr.patch_iloc_offsets_at_threshold(
+            data, info['iloc_hdr'], p_end, delta)
+        if changed:
+            out[info['iloc_hdr'][2]:info['iloc_hdr'][3]] = iloc_content
+        out[p_start:p_end] = box
+        # the inserted 'irot' (restorable) changed too: modified since edit
+        loc = hr.locate_structures(bytes(out))
+        ipco = hr.find_unique_child(out, loc['iprp_hdr'][2], loc['iprp_hdr'][3],
+                                    b'ipco', "'iprp'")
+        irot = hr.parse_ipco_children(out, ipco[2], ipco[3])[-1]
+        out[irot[2]] ^= 0x1
+        all_soft = os.path.join(self.tmpdir, 'all_soft.heic')
+        with open(all_soft, 'wb') as f:
+            f.write(out)
+        existing = os.path.join(self.tmpdir, 'existing.heic')
+        with open(existing, 'wb') as f:
+            f.write(b'')
+
+        def tags(err):
+            return [line.split(':')[0] for line in err.splitlines()
+                    if line.startswith('ERROR ')]
+
+        soft = 'ERROR Soft {} (overridden by {})'
+        for dry_run in ((), ('--dry-run',)):
+            with self.subTest(dry_run=bool(dry_run)):
+                # no options: stops at the first soft error (unknown entries)
+                rc, _, err = run_cli('reverse', all_soft, existing, *dry_run)
+                self.assertEqual(rc, hr.EXIT_UNKNOWN_ENTRIES)
+                self.assertEqual(tags(err), [f'ERROR Soft {hr.EXIT_UNKNOWN_ENTRIES}'])
+                # --proceed-unsafe only: goes on to the next soft error
+                rc, _, err = run_cli('reverse', all_soft, existing,
+                                     '--proceed-unsafe', *dry_run)
+                self.assertEqual(rc, hr.EXIT_OUTPUT_EXISTS)
+                self.assertEqual(tags(err), [
+                    soft.format(hr.EXIT_UNKNOWN_ENTRIES, '--proceed-unsafe'),
+                    soft.format(hr.EXIT_MODIFIED_SINCE_EDIT, '--proceed-unsafe'),
+                    f'ERROR Soft {hr.EXIT_OUTPUT_EXISTS}'])
+                # both options: reaches the end, every soft error reported -
+                # except with -q
+                rc, _, err = run_cli('-q', 'reverse', all_soft, existing, '-f',
+                                     '--proceed-unsafe', '--dry-run')
+                self.assertEqual((rc, err), (0, ''))
+                # ...but -q never hides the error a run stops at
+                rc, _, err = run_cli('-q', 'reverse', all_soft, existing,
+                                     '--proceed-unsafe', *dry_run)
+                self.assertEqual(rc, hr.EXIT_OUTPUT_EXISTS)
+                self.assertEqual(tags(err), [f'ERROR Soft {hr.EXIT_OUTPUT_EXISTS}'])
+                rc, _, err = run_cli('reverse', all_soft, existing, '-f',
+                                     '--proceed-unsafe', *dry_run)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(tags(err), [
+                    soft.format(hr.EXIT_UNKNOWN_ENTRIES, '--proceed-unsafe'),
+                    soft.format(hr.EXIT_MODIFIED_SINCE_EDIT, '--proceed-unsafe'),
+                    soft.format(hr.EXIT_OUTPUT_EXISTS, '-f/--force')])
+                # a hard error stops it even with every option
+                rc, _, err = run_cli('rotate', '90', all_soft, existing, '-f',
+                                     *dry_run)
+                self.assertEqual(rc, hr.EXIT_NEWER_RELEASE)
+                self.assertEqual(tags(err), [f'ERROR Hard {hr.EXIT_NEWER_RELEASE}'])
+        # only the non-dry-run, both-options run wrote it: the original
+        with open(existing, 'rb') as f, open(self.input_path, 'rb') as g:
+            self.assertEqual(f.read(), g.read())
+        # usage errors and no arguments are tagged hard errors too
+        for args in (('rotate', '45', self.input_path), ()):
+            with self.subTest(usage=args):
+                rc, _, err = run_cli(*args)
+                self.assertEqual(rc, hr.EXIT_USAGE)
+                self.assertEqual(tags(err), [f'ERROR Hard {hr.EXIT_USAGE}'])
+
+    def test_unexpected_exception_is_a_tagged_internal_error(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(
+                hr_cli, 'gather_info', side_effect=IndexError('simulated bug')), \
+                unittest.mock.patch.object(
+                    sys, 'argv', ['heic-rotate', 'info', self.input_path]), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                hr_cli.main()
+        self.assertEqual(ctx.exception.code, hr.EXIT_INTERNAL)
+        self.assertIn(f'ERROR Hard {hr.EXIT_INTERNAL}: internal error: '
+                      f'unexpected IndexError: simulated bug', err.getvalue())
+        self.assertIn('Traceback', err.getvalue())
+
+    def test_failed_reversibility_self_check_has_its_own_exit_code(self):
+        """Whatever makes `rotate`'s post-rotate self-check fail - here a
+        record error and an internal error, simulated - it exits with
+        its own code and writes nothing."""
+        out_path = os.path.join(self.tmpdir, 'not_written.heic')
+        for cause in (hr.ProvenanceError('reconstruction mismatch'),
+                      hr.InternalError('internal error: simulated')):
+            with self.subTest(cause=type(cause).__name__):
+                err = io.StringIO()
+                with unittest.mock.patch.object(
+                        hr_cli, 'verify_reversible', side_effect=cause), \
+                        unittest.mock.patch.object(
+                            sys, 'argv', ['heic-rotate', '-q', 'rotate', '90',
+                                          self.input_path, out_path]), \
+                        contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as ctx:
+                        hr_cli.main()
+                self.assertEqual(ctx.exception.code, hr.EXIT_SELF_CHECK_FAILED)
+                self.assertIn('post-rotate reversibility self-check failed',
+                              err.getvalue())
+                self.assertFalse(os.path.exists(out_path))
+
+    def test_each_error_exits_with_its_own_code(self):
+        rotated = os.path.join(self.tmpdir, 'rotated.heic')
+        self.assertEqual(run_cli('rotate', '90', self.input_path, rotated, '-q')[0], 0)
+        with open(rotated, 'rb') as f:
+            rotated_bytes = f.read()
+
+        def write(name, data):
+            path = os.path.join(self.tmpdir, name)
+            with open(path, 'wb') as f:
+                f.write(data)
+            return path
+
+        # 20: modified since the last edit - in the inserted 'irot',
+        # which reverse discards, so --proceed-unsafe can recover it...
+        modified = bytearray(rotated_bytes)
+        loc = hr.locate_structures(rotated_bytes)
+        ipco = hr.find_unique_child(rotated_bytes, loc['iprp_hdr'][2],
+                                    loc['iprp_hdr'][3], b'ipco', "'iprp'")
+        irot = hr.parse_ipco_children(rotated_bytes, ipco[2], ipco[3])[-1]
+        self.assertEqual(irot[4], b'irot')
+        modified[irot[2]] ^= 0x1
+        modified = write('modified.heic', modified)
+        # ...and in 'ftyp', which the record can't restore: 55 even then
+        unrestorable = bytearray(rotated_bytes)
+        unrestorable[10] ^= 0xFF
+        unrestorable = write('unrestorable.heic', unrestorable)
+        # 21 (reverse/info) / 56 (rotate): unknown entry; 56: newer format
+        info = hr.locate_structures(rotated_bytes)
+        p_start, _, _, p_end, _ = info['provenance_hdr']
+        _, entries = hr.parse_provenance(rotated_bytes, info['provenance_hdr'])
+
+        def with_record(version, entries):
+            box = hr.build_provenance_box(version, entries)
+            delta = len(box) - (p_end - p_start)
+            out = bytearray(rotated_bytes)
+            iloc_content, changed = hr.patch_iloc_offsets_at_threshold(
+                rotated_bytes, info['iloc_hdr'], p_end, delta)
+            if changed:
+                out[info['iloc_hdr'][2]:info['iloc_hdr'][3]] = iloc_content
+            out[p_start:p_end] = box
+            return bytes(out)
+
+        unknown = write('unknown.heic', with_record(3, {**entries, b'XNEW': b''}))
+        newer = write('newer.heic', with_record(hr.FORMAT_VERSION + 1, entries))
+        # 55: corrupt record (REQT missing)
+        corrupt = write('corrupt.heic', _strip_provenance_tag(rotated_bytes, b'REQT'))
+        not_heif = write('not_heif.heic', b'\x00\x00\x00\x08free' * 4)
+
+        cases = (
+            (hr.EXIT_MODIFIED_SINCE_EDIT, ('reverse', modified, '--dry-run')),
+            (hr.EXIT_UNKNOWN_ENTRIES, ('reverse', unknown, '--dry-run')),
+            (hr.EXIT_UNKNOWN_ENTRIES, ('info', unknown)),
+            (hr.EXIT_NEWER_RELEASE, ('rotate', '90', unknown, '--dry-run')),
+            (hr.EXIT_NEWER_RELEASE, ('info', newer)),
+            (hr.EXIT_FILE_ERROR, ('info', os.path.join(self.tmpdir, 'missing.heic'))),
+            (hr.EXIT_FILE_ERROR, ('rotate', '90', self.input_path,
+                                  os.path.join(self.tmpdir, 'no_dir', 'out.heic'))),
+            (hr.EXIT_OUTPUT_EXISTS, ('rotate', '90', self.input_path, rotated)),
+            (hr.EXIT_USAGE, ('rotate', '45', self.input_path)),
+            (hr.EXIT_USAGE, ('info',)),
+            (hr.EXIT_UNSUPPORTED_FILE, ('info', not_heif)),
+            (hr.EXIT_NO_RECORD, ('reverse', self.input_path, '--dry-run')),
+            (hr.EXIT_BAD_RECORD, ('info', corrupt)),
+            (hr.EXIT_MODIFIED_SINCE_EDIT, ('reverse', unrestorable, '--dry-run')),
+            (hr.EXIT_BAD_RECORD, ('reverse', unrestorable, '--dry-run',
+                                  '--proceed-unsafe')),
+        )
+        for code, args in cases:
+            with self.subTest(expected=code, args=args):
+                rc, _, err = run_cli(*args)
+                self.assertEqual(rc, code, err)
+                self.assertNotIn('Traceback', err)
+        # overridable conditions really are overridden
+        for args in (('reverse', modified, '--dry-run'),
+                     ('reverse', unknown, '--dry-run'), ('info', unknown)):
+            with self.subTest(args=args, flag='--proceed-unsafe'):
+                rc, _, err = run_cli(*args, '--proceed-unsafe')
+                self.assertLess(rc, 20, err)
 
     def tearDown(self):
         import shutil

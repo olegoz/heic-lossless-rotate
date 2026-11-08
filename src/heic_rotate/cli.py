@@ -21,13 +21,31 @@ read-only: it reports the file's current rotation and any
 heic-lossless-rotate provenance record without doing the heavier
 reconstruction/verification `reverse` does.
 
-By default, rotate/reverse refuse to overwrite an existing output file;
-pass -f/--force to allow it. (This is a different flag from
---proceed-unsafe, on `reverse` and `info`, which proceeds past checks
-that would otherwise refuse: for `reverse`, a CRC mismatch suggesting the
-file was modified by something else since the last edit; for both,
-metadata entries this release doesn't know, as a newer release may
-write. Every check it overrides is reported on stderr, even with -q.)
+ERRORS
+------
+Every error exits with a code of 20 or above and is reported on stderr
+in a line starting with `ERROR Soft NN` or `ERROR Hard NN` (NN = the
+exit code), so `grep '^ERROR '` lists them all.
+
+SOFT errors (20-49) are overcome by an option; without it, the command
+stops at the first one:
+  20  `reverse`, `info`: metadata entries this release doesn't know
+                                       overcome by --proceed-unsafe
+  21  `reverse`: file modified by something else since the last edit
+                                       overcome by --proceed-unsafe
+  22  output file already exists       overcome by -f/--force
+With the option, the command goes on, reporting each one it overcame as
+`ERROR Soft NN (overridden by <option>): ...` - except with -q.
+
+HARD errors (50 and up) can't be overcome: the command stops at the
+first one, with its code:
+  50  invalid command line             54  made by a later release
+  51  file can't be read or written    55  corrupt or unusable record
+  52  not a valid/supported HEIF file  56  internal error (a bug)
+  53  no provenance record             57  rotate's self-check failed
+
+All of this applies with --dry-run too. If the command gets to the end,
+it exits 0 (or with `info`'s result code).
 
 Run with no arguments, or with -h, for full help.
 
@@ -206,25 +224,51 @@ No third-party dependencies - Python 3 standard library only.
 import sys
 import os
 import argparse
+import traceback
 
 from .core import (
-    BoxParseError,
-    NewerVersionError,
-    ProvenanceError,
+    HeicRotateError,
+    SelfCheckError,
     apply_rotation,
     reverse_rotation,
     verify_reversible,
     gather_info,
     format_info,
     verify_structure,
-    ERROR_EXIT_CODE,
-    NEWER_VERSION_EXIT_CODE,
+    EXIT_FILE_ERROR,
+    EXIT_INTERNAL,
+    EXIT_OUTPUT_EXISTS,
+    EXIT_USAGE,
+    error_tag,
+    report_overridden,
     _version_string,
 )
 
 
+class OutputExistsError(HeicRotateError):
+    """The output file already exists and -f/--force wasn't given - a
+    soft error, which -f/--force overcomes."""
+    exit_code = EXIT_OUTPUT_EXISTS
+
+
+def _report_error(code, message):
+    """The error a run stops at, tagged (see core.error_tag)."""
+    print(f"{error_tag(code)}: {message}", file=sys.stderr)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a bad command line - which is also `info`'s
+    "180 deg" result - so exit EXIT_USAGE instead. Subparsers inherit
+    this class (add_subparsers defaults to the parent's class)."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        _report_error(EXIT_USAGE, f"{self.prog}: {message}")
+        self.exit(EXIT_USAGE)
+
+
 def build_parser():
-    ap = argparse.ArgumentParser(
+    ap = _ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('-V', '--version', action='version',
@@ -237,8 +281,10 @@ def build_parser():
     # clobbers a value already set at this level - see build_parser()'s
     # docstring-free but load-bearing use of SUPPRESS throughout.
     ap.add_argument('-q', '--quiet', action='store_true', default=False,
-                     help="suppress informational stdout messages "
-                          "(errors still go to stderr)")
+                     help="suppress informational messages and warnings "
+                          "on stdout, and the stderr reports of soft "
+                          "errors an option overcame (the error a run "
+                          "stops at is still reported on stderr)")
     ap.add_argument('--dry-run', action='store_true', default=False,
                      help="for rotate/reverse: do everything except write "
                           "the output file (no effect on info, which "
@@ -293,8 +339,9 @@ def build_parser():
                       help="reverse even if the file appears to have been "
                            "modified by something else since the last "
                            "edit, or its metadata has entries this release "
-                           "doesn't know (ignoring them); each check "
-                           "overridden is reported on stderr. The "
+                           "doesn't know (ignoring them); each soft error "
+                           "overcome is reported on stderr, except with "
+                           "-q. The "
                            "reconstructed file is still verified against "
                            "the original's CRC32")
     rev.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS,
@@ -333,19 +380,20 @@ def build_parser():
                      "90/180/270 deg, or 4 if this tool's net "
                      "contribution is 0 deg (e.g. `rotate 0` was used "
                      "just to add tracking, or opposing rotations "
-                     "cancelled out). A genuine error "
-                     f"(e.g. unreadable file) exits {ERROR_EXIT_CODE}, "
-                     "kept outside 0-4 so it's never mistaken for a "
-                     "rotation-state result; refusing a file because a "
-                     "later heic-lossless-rotate release made something "
-                     "in it this one doesn't support exits "
-                     f"{NEWER_VERSION_EXIT_CODE}.")
+                     "cancelled out). Errors exit 20 or above, so "
+                     "they're never mistaken for a result: 20-49 are "
+                     "soft errors, which an option overcomes (here, 20: "
+                     "metadata entries this release doesn't know, "
+                     "overcome by --proceed-unsafe); 50 and above are "
+                     "hard errors, which nothing overcomes (e.g. 51: "
+                     "file can't be read, 54: made by a later release). "
+                     "See the README for the full list.")
     inf.add_argument('input', help='input .heic file')
     inf.add_argument('--proceed-unsafe', action='store_true',
                       help="report even if the file's metadata has entries "
                            "this release doesn't know, ignoring them (they "
                            "may change what this reports); reported on "
-                           "stderr")
+                           "stderr, except with -q")
     inf.add_argument('-q', '--quiet', action='store_true', default=argparse.SUPPRESS,
                       help="no text output; exit code alone reports state "
                            "(see command help above)")
@@ -386,24 +434,32 @@ def main():
     ap = build_parser()
     if len(sys.argv) == 1:
         ap.print_help()
-        sys.exit(2)
+        _report_error(EXIT_USAGE, "no command given (see the help above)")
+        sys.exit(EXIT_USAGE)
     args = ap.parse_args(_insert_implicit_rotate(sys.argv[1:]))
 
     try:
         with open(args.input, 'rb') as f:
             data = f.read()
         _run(args, data)
-    except NewerVersionError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(NEWER_VERSION_EXIT_CODE)
-    except (BoxParseError, ProvenanceError, OSError) as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(ERROR_EXIT_CODE)
+    except HeicRotateError as e:
+        _report_error(e.exit_code, e)
+        sys.exit(e.exit_code)
+    except OSError as e:
+        _report_error(EXIT_FILE_ERROR, e)
+        sys.exit(EXIT_FILE_ERROR)
+    except Exception as e:  # a bug: still a tagged error, plus the traceback
+        traceback.print_exc()
+        _report_error(EXIT_INTERNAL,
+                      f"internal error: unexpected {type(e).__name__}: {e} - "
+                      f"please report it, with the traceback above")
+        sys.exit(EXIT_INTERNAL)
 
 
 def _run(args, data):
     if args.cmd == 'info':
-        result = gather_info(data, proceed_unsafe=args.proceed_unsafe)
+        result = gather_info(data, proceed_unsafe=args.proceed_unsafe,
+                             verbose=not args.quiet)
         text, exit_code = format_info(result, quiet=args.quiet)
         if text is not None:
             print(text)
@@ -431,10 +487,13 @@ def _run(args, data):
         # since only the pass/fail matters - the reconstructed bytes
         # themselves are never used, so there's no reason to pay for a
         # second full-file copy just to discard it.)
+        # Reached only if everything up to here succeeded. Any failure is
+        # its own hard error (SelfCheckError), whatever the underlying
+        # reason given in the message.
         try:
             verify_reversible(out, proceed_unsafe=False, verbose=False)
-        except (BoxParseError, ProvenanceError) as e:
-            raise ProvenanceError(
+        except HeicRotateError as e:
+            raise SelfCheckError(
                 f"post-rotate reversibility self-check failed - refusing "
                 f"to write output: {e}") from e
         if not args.quiet:
@@ -459,9 +518,15 @@ def _run(args, data):
             print("[ok] output box structure is internally consistent")
         out_path = args.output or (args.input.rsplit('.', 1)[0] + '_restored.heic')
 
-    if os.path.exists(out_path) and not args.force:
-        raise OSError(f"refusing to overwrite existing file '{out_path}' "
-                       f"- use -f/--force to overwrite it")
+    if os.path.exists(out_path):
+        if not args.force:
+            raise OutputExistsError(
+                f"refusing to overwrite existing file '{out_path}' - use "
+                f"-f/--force to overwrite it")
+        report_overridden(OutputExistsError(
+            f"output file '{out_path}' already exists - "
+            f"{'would overwrite' if dry_run else 'overwriting'} it"),
+            '-f/--force', report=not args.quiet)
 
     if dry_run:
         if not args.quiet:

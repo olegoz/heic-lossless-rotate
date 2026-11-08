@@ -22,21 +22,104 @@ import uuid as uuid_mod
 from ._version import VERSION
 
 
-class BoxParseError(Exception):
-    pass
+# CLI exit codes. 0-4 are `info`'s results (see format_info); every
+# error is 20 or above.
+#   SOFT errors, 20-49: an option overcomes them - -f/--force for an
+#     existing output file, --proceed-unsafe for the rest - one code per
+#     condition. Without that option the command stops at the first one;
+#     with it, each is reported (see report_overridden; not with -q) and
+#     the command goes on.
+#   HARD errors, 50 and up: nothing overcomes them; the command always
+#     stops at the first one. One code per kind.
+# Within each range, codes follow the order a run can meet them in.
+# Each error class below carries its code as `exit_code`, and every
+# error message on stderr starts with error_tag(code), so they can be
+# grepped (see error_tag).
+EXIT_UNKNOWN_ENTRIES = 20      # record entries this release doesn't know
+                               # (`info`, `reverse`; --proceed-unsafe.
+                               # `rotate` can't overcome it, so there it's
+                               # the hard EXIT_NEWER_RELEASE)
+EXIT_MODIFIED_SINCE_EDIT = 21  # CCRC mismatch (`reverse`; --proceed-unsafe)
+EXIT_OUTPUT_EXISTS = 22        # output file exists (-f/--force overcomes)
+EXIT_USAGE = 50                # bad command line
+EXIT_FILE_ERROR = 51           # OS-level: can't read input / write output
+EXIT_UNSUPPORTED_FILE = 52     # not a valid, or not a supported, HEIF file
+EXIT_NO_RECORD = 53            # no provenance record (nothing to reverse)
+EXIT_NEWER_RELEASE = 54        # made by a later release: update the tool
+EXIT_BAD_RECORD = 55           # provenance record corrupt, or the original
+                               # can't be restored from it
+EXIT_INTERNAL = 56             # an internal consistency check failed, or
+                               # an unexpected exception: a bug in this tool
+EXIT_SELF_CHECK_FAILED = 57    # `rotate`'s output failed its reversibility
+                               # self-check, so it wasn't written
 
 
-class ProvenanceError(Exception):
-    pass
+def is_soft_error(code):
+    return 20 <= code < 50
+
+
+def error_tag(code):
+    """The tag every error message on stderr starts with: 'ERROR Soft
+    NN' or 'ERROR Hard NN', NN being its exit code - so `grep '^ERROR '`
+    lists every soft error a run reported (overcome or not) and the
+    error it stopped at, if any."""
+    return f"ERROR {'Soft' if is_soft_error(code) else 'Hard'} {code}"
+
+
+class HeicRotateError(Exception):
+    """Base of every error this tool reports."""
+    exit_code = EXIT_INTERNAL
+
+
+class BoxParseError(HeicRotateError):
+    """Not a valid HEIF file, or one structured in a way this tool
+    doesn't support."""
+    exit_code = EXIT_UNSUPPORTED_FILE
+
+
+class ProvenanceError(HeicRotateError):
+    """The provenance record is corrupt, or can't be used for this."""
+    exit_code = EXIT_BAD_RECORD
+
+
+class NoProvenanceError(ProvenanceError):
+    """The file has no provenance record at all."""
+    exit_code = EXIT_NO_RECORD
+
+
+class ModifiedSinceEditError(ProvenanceError):
+    """The file was modified by something else since this tool's last
+    edit (CCRC mismatch). `reverse --proceed-unsafe` overrides it."""
+    exit_code = EXIT_MODIFIED_SINCE_EDIT
 
 
 class NewerVersionError(ProvenanceError):
     """Refusing a file because a later release of heic-lossless-rotate
     produced something in it this release doesn't support: a newer
     provenance format, record entries it doesn't know, or a requested
-    change it can't handle (mirroring). The CLI exits with
-    NEWER_VERSION_EXIT_CODE for it, so scripts can tell "update the
+    change it can't handle (mirroring), so scripts can tell "update the
     tool" apart from other errors."""
+    exit_code = EXIT_NEWER_RELEASE
+
+
+class UnknownEntriesError(NewerVersionError):
+    """The record has entries this release doesn't know, for a command
+    (`info`, `reverse`) that --proceed-unsafe lets ignore them."""
+    exit_code = EXIT_UNKNOWN_ENTRIES
+
+
+class InternalError(HeicRotateError):
+    """An internal consistency check failed: this tool would have
+    produced (or did produce, in memory) something wrong - a bug, never
+    written."""
+    exit_code = EXIT_INTERNAL
+
+
+class SelfCheckError(HeicRotateError):
+    """`rotate`'s finished output, reversed in memory, didn't give back
+    the original file, so it wasn't written. Whatever the underlying
+    reason (in the message), this is always a hard error of its own."""
+    exit_code = EXIT_SELF_CHECK_FAILED
 
 
 # The provenance format version every record is WRITTEN in. Older
@@ -800,18 +883,18 @@ def iprp_diff_entries(pristine_iprp, new_iprp):
     p_ipco, p_ipma = _iprp_parts(pristine_iprp)
     n_ipco, n_ipma = _iprp_parts(new_iprp)
     if (p_ipco[0] < p_ipma[0]) != (n_ipco[0] < n_ipma[0]):
-        raise BoxParseError("internal error: 'ipco'/'ipma' order changed")
+        raise InternalError("internal error: 'ipco'/'ipma' order changed")
     p_children = parse_ipco_children(pristine_iprp, p_ipco[2], p_ipco[3])
     n_children = parse_ipco_children(new_iprp, n_ipco[2], n_ipco[3])
     if len(n_children) < len(p_children):
-        raise BoxParseError("internal error: 'ipco' lost children")
+        raise InternalError("internal error: 'ipco' lost children")
     oipc = bytearray(struct.pack('>I', len(p_children)))
     for i, (p, n) in enumerate(zip(p_children, n_children)):
         p_bytes = pristine_iprp[p[0]:p[3]]
         n_bytes = new_iprp[n[0]:n[3]]
         if p_bytes != n_bytes:
             if len(p_bytes) != len(n_bytes):
-                raise BoxParseError("internal error: 'ipco' child resized")
+                raise InternalError("internal error: 'ipco' child resized")
             oipc += struct.pack('>II', i, len(p_bytes)) + p_bytes
     pristine_ipma = bytes(pristine_iprp[p_ipma[0]:p_ipma[3]])
     oipd = _ipma_diff(pristine_ipma, bytes(new_iprp[n_ipma[0]:n_ipma[3]]))
@@ -987,7 +1070,7 @@ def _tver_string(entries):
     return '.'.join(str(b) for b in tver)
 
 
-def newer_version_error(problem, entries, advice=None):
+def newer_version_error(problem, entries, advice=None, cls=NewerVersionError):
     """A NewerVersionError saying `problem` (what this release can't
     handle), naming the release that last updated the file from the
     record's TVER if it has one, and ending with `advice` (default: to
@@ -997,7 +1080,7 @@ def newer_version_error(problem, entries, advice=None):
            else "a newer heic-lossless-rotate release")
     if advice is None:
         advice = "Update heic-lossless-rotate to rotate, reverse or inspect it"
-    return NewerVersionError(
+    return cls(
         f"this file was last updated by {who} (this is {VERSION}): "
         f"{problem}. {advice}")
 
@@ -1045,22 +1128,26 @@ RECORD_TAGS = {
 }
 
 
-def warn_unsafe(message):
-    """Report, on stderr - regardless of -q, so it can't go unnoticed - a
-    condition that would have been an error without --proceed-unsafe."""
-    print(f"warning (would be an error without --proceed-unsafe): {message}",
-          file=sys.stderr)
+def report_overridden(error, option='--proceed-unsafe', report=True):
+    """Report, on stderr, a soft error (a HeicRotateError) that `option`
+    overcame, so the command goes on - unless not `report` (the CLI's
+    -q)."""
+    if report:
+        print(f"{error_tag(error.exit_code)} (overridden by {option}): {error}",
+              file=sys.stderr)
 
 
-def check_known_entries(version, entries, command, proceed_unsafe=False):
+def check_known_entries(version, entries, command, proceed_unsafe=False,
+                        report=True):
     """Return `entries` (a format `version` record's) without any tag
     that format doesn't define (see RECORD_TAGS) - but raise if there is
     one, unless `proceed_unsafe`, in which
     case `command` ('info' or 'reverse') proceeds after reporting it via
-    warn_unsafe(). Callers must use the returned entries, so an ignored
+    report_overridden(). Callers must use the returned entries, so an ignored
     tag can't still affect how the record is read (e.g. a v3 tag in an
     older record). `rotate` can't be overridden: it would drop them.
-    Raises NewerVersionError, naming the release that wrote them."""
+    Raises UnknownEntriesError (NewerVersionError for `rotate`), naming
+    the release that wrote them."""
     known = RECORD_TAGS[version]
     unknown = sorted(set(entries) - known)
     if not unknown:
@@ -1068,8 +1155,10 @@ def check_known_entries(version, entries, command, proceed_unsafe=False):
     problem = (f"its metadata has entries this release doesn't know "
                f"({', '.join(t.decode('ascii', 'replace') for t in unknown)})")
     if proceed_unsafe and command != 'rotate':
-        warn_unsafe(str(newer_version_error(problem, entries,
-                                            "Ignoring them")))
+        report_overridden(newer_version_error(problem, entries,
+                                              "Ignoring them",
+                                              UnknownEntriesError),
+                          report=report)
         return {tag: value for tag, value in entries.items() if tag in known}
     if command == 'rotate':
         raise newer_version_error(problem, entries,
@@ -1077,7 +1166,7 @@ def check_known_entries(version, entries, command, proceed_unsafe=False):
     raise newer_version_error(
         problem, entries,
         f"Update heic-lossless-rotate, or re-run `{command}` with "
-        f"--proceed-unsafe to ignore them")
+        f"--proceed-unsafe to ignore them", UnknownEntriesError)
 
 
 def build_provenance_box(version, entries: dict):
@@ -1438,7 +1527,7 @@ def _check_display_change(before, after, request):
     """Raise unless the display transform `after` an edit is `request`
     applied on top of the one `before` it."""
     if after != compose_transforms(request, before):
-        raise BoxParseError(
+        raise InternalError(
             f"internal error: this edit would change the primary item's "
             f"display transform from {before} to {after}, not by the "
             f"requested {request} - nothing written")
@@ -1882,7 +1971,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     entries[b'CCRC'] = struct.pack('>I', ccrc)
     new_prov_box = build_provenance_box(FORMAT_VERSION, entries)
     if len(new_prov_box) != new_prov_size:
-        raise BoxParseError(
+        raise InternalError(
             "internal error: provenance box size changed between "
             "placeholder and real CCRC - CCRC should always be a "
             "fixed 4 bytes")
@@ -2113,7 +2202,7 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
     info = locate_structures(data)
     prov_hdr = info['provenance_hdr']
     if prov_hdr is None:
-        raise ProvenanceError(
+        raise NoProvenanceError(
             "no heic-lossless-rotate provenance record found in this file - "
             "either it was never edited by this tool, or the record was "
             "stripped by something else. Cannot reverse.")
@@ -2129,7 +2218,8 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
     # (pre-release v3 builds) still reverses - but one recording a change
     # this release doesn't support (mirroring) is refused, like
     # everywhere else.
-    entries = check_known_entries(version, entries, 'reverse', proceed_unsafe)
+    entries = check_known_entries(version, entries, 'reverse', proceed_unsafe,
+                                  report=verbose)
     if b'REQT' in entries:
         check_request_supported(entries)
 
@@ -2142,9 +2232,10 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
                f"{current_ccrc:#010x}, provenance expects {stored_ccrc:#010x}). "
                f"Reversing now could silently clobber those other changes.")
         if not proceed_unsafe:
-            raise ProvenanceError(
+            raise ModifiedSinceEditError(
                 msg + " Re-run `reverse` with --proceed-unsafe to override.")
-        warn_unsafe(msg + " Proceeding anyway.")
+        report_overridden(ModifiedSinceEditError(msg + " Proceeding anyway."),
+                          report=verbose)
 
     # 'mdat' - excluded from this span in both supported layouts, since
     # the provenance box is always inserted as 'meta''s immediate next
@@ -2176,7 +2267,7 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
                 # reverse_rotation's docstring) for any file this tool
                 # itself produced - fail loudly rather than silently
                 # risk reconstructing the wrong bytes.
-                raise ProvenanceError(
+                raise InternalError(
                     "internal error: embedded Exif Orientation field "
                     "unexpectedly falls inside the meta/provenance span "
                     "- refusing to guess at the reconstructed bytes")
@@ -2233,7 +2324,8 @@ def reverse_rotation(data: bytes, proceed_unsafe=False, verbose=True):
     that would otherwise refuse - the file was modified by something
     else since the last edit (CCRC mismatch), or the record holds
     entries this release doesn't know - reporting each one it overrides
-    via warn_unsafe(). The final PCRC check is never skipped.
+    via report_overridden() if `verbose`. The final PCRC check is never
+    skipped.
 
     Structural fact this relies on, and that verify_reversible() below
     also depends on: every edit made here falls either inside the
@@ -2327,13 +2419,14 @@ def verify_reversible(data, proceed_unsafe=False, verbose=False):
 # Info: cheap, read-only summary - no reconstruction, no heavy verification.
 # ---------------------------------------------------------------------------
 
-def gather_info(data, proceed_unsafe=False):
+def gather_info(data, proceed_unsafe=False, verbose=True):
     """Read-only summary of heic-lossless-rotate provenance state and the file's
     live rotation. Does none of the "heavy" work reverse/rotate do (no
     byte-level reconstruction, no final CRC-of-reconstructed-file check) -
     just parses what's already sitting in the file. `proceed_unsafe`
     ignores record entries this release doesn't know instead of
-    refusing, reporting it via warn_unsafe() (see check_known_entries).
+    refusing, reporting it via report_overridden() unless not `verbose`
+    (see check_known_entries).
 
     Returns a dict:
       current_quarter_turns  : 0-3, the live 'irot' value on the primary
@@ -2396,7 +2489,8 @@ def gather_info(data, proceed_unsafe=False):
     # Raises for a format newer than this release (see parse_provenance)
     # or a corrupt record - `info` doesn't guess at either.
     version, entries = parse_provenance(data, prov_hdr)
-    entries = check_known_entries(version, entries, 'info', proceed_unsafe)
+    entries = check_known_entries(version, entries, 'info', proceed_unsafe,
+                                  report=verbose)
     result['has_provenance'] = True
     result['version'] = version
     result['has_iloc_snapshot'] = b'OILC' in entries
@@ -2552,12 +2646,6 @@ def verify_structure(data):
                         if gc[4] == b'ipco':
                             check_container(gc[0], gc[2], gc[3], "ipco")
     return True
-
-
-NEWER_VERSION_EXIT_CODE = 11  # refused: made by a later release (see
-                              # NewerVersionError)
-ERROR_EXIT_CODE = 10  # kept out of 0-3 so it never collides with `info`'s
-                       # rotation-degrees exit codes
 
 
 def _version_string():

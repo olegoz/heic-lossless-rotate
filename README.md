@@ -38,7 +38,7 @@ No third-party dependencies. Python 3 standard library only.
 - [How rotation values map to the container format](#how-rotation-values-map-to-the-container-format)
 - [Options](#options)
   - [`--proceed-unsafe`](#--proceed-unsafe)
-- [Exit codes](#exit-codes)
+- [Errors and exit codes](#errors-and-exit-codes)
 - [Known limitations](#known-limitations)
 - [Development install](#development-install)
 - [Testing](#testing)
@@ -471,7 +471,7 @@ Every edit writes its provenance record in the latest metadata format.
 Records in older formats, written by earlier releases, can still be
 reversed, and `rotate` replaces them as described above. A record in a
 format newer than the running release knows is refused outright, by
-`rotate`, `reverse` and `info` alike, with exit code `11`: beyond its
+`rotate`, `reverse` and `info` alike, with hard error `54`: beyond its
 format number, only the version of the release that last updated the
 file is read from it, so the error can name that release. The same
 applies to a record in a known format that a newer release extended
@@ -485,63 +485,99 @@ shows the formats a release supports).
 |---|---|---|
 | `-h`, `--help` | any | Show help and exit |
 | `-V`, `--version` | top-level | Show script version, current metadata format version, and metadata format versions supported by `reverse`, then exit |
-| `-q`, `--quiet` | all | Suppress informational stdout messages (errors still go to stderr) |
+| `-q`, `--quiet` | all | Suppress informational messages and warnings on stdout, and the stderr reports of soft errors an option overcame. The error a run stops at is still reported on stderr |
 | `--dry-run` | `rotate`, `reverse` | Do everything except write the output file |
-| `-f`, `--force` | `rotate`, `reverse` | Overwrite the output file if it already exists (refused by default) |
+| `-f`, `--force` | `rotate`, `reverse` | Overwrite the output file if it already exists (otherwise soft error `22`) |
 | `--no-exif-sync` | `rotate` | Don't sync the legacy embedded Exif `Orientation` tag |
-| `--proceed-unsafe` | `reverse`, `info` | Proceed past some checks on the input file that would otherwise refuse, reporting each one it overrides on stderr, even with `-q` (see [`--proceed-unsafe`](#--proceed-unsafe) below) |
+| `--proceed-unsafe` | `reverse`, `info` | Overcome the soft errors about the input file, reporting each one on stderr unless `-q` is given (see [`--proceed-unsafe`](#--proceed-unsafe) below) |
 
 All top-level flags (`-q`, `--dry-run`, `-f`) may be given either before or
 after the subcommand name.
 
-`-f`/`--force` and `--proceed-unsafe` control two different things.
-`-f`/`--force` is purely about not clobbering an existing *output* file.
-`--proceed-unsafe` is about the *input* file.
+`-f`/`--force` and `--proceed-unsafe` each overcome different
+[soft errors](#errors-and-exit-codes): `-f`/`--force` only an existing
+*output* file, `--proceed-unsafe` only conditions of the *input* file.
 
 ### `--proceed-unsafe`
 
-Without this option, each of these conditions is an error. With it, the
-command goes ahead:
+It overcomes these soft errors:
 
-- **The file was modified by something else since this tool's last edit**
-  (its checksum doesn't match the one recorded then). Affects `reverse`
-  only (`info` doesn't check this). `reverse` restores the original
-  anyway, which can discard those other changes. Exit code `10` without
-  the option.
-- **The file's metadata has entries this release doesn't know**, as a
-  newer release may add. Affects `reverse` and `info`. The entries are
-  ignored, though they may change what `info` should report or what
-  `reverse` should restore. Exit code `11` without the option.
+- **`20`: the file's metadata has entries this release doesn't know**,
+  as a newer release may add. Affects `reverse` and `info`. The entries
+  are ignored, though they may change what `info` should report or what
+  `reverse` should restore.
+- **`21`: the file was modified by something else since this tool's
+  last edit** (its checksum doesn't match the one recorded then).
+  Affects `reverse` only (`info` doesn't check this). `reverse` restores
+  the original anyway, which can discard those other changes.
 
-Each condition it overrides is reported as a line on stderr, even with
-`-q`:
-
-```
-warning (would be an error without --proceed-unsafe): ...
-```
-
-It never overrides:
+It never overcomes a hard error, for example:
 
 - `reverse`'s final check that the restored file matches the original
-  file's checksum, so it still never writes a wrong file.
-- A newer metadata format, or a file mirrored by a newer release (exit
-  code `11`): update heic-lossless-rotate instead.
+  file's checksum (`55`), so it still never writes a wrong file.
+- A newer metadata format, or a file mirrored by a newer release (`54`):
+  update heic-lossless-rotate instead.
 - Anything in `rotate`, which has no such option: it would have to drop
-  the unknown entries.
+  the unknown entries, so for `rotate` they are hard error `54`.
 
-## Exit codes
+## Errors and exit codes
 
-`rotate` and `reverse` exit `0` on success. `info` uses its own scheme so a
-script can branch on the result without parsing text output. Exit codes
-`10` and `11` apply to all commands:
+On success, `rotate` and `reverse` exit `0`, and `info` exits with its
+result, so a script can branch on it without parsing text output:
 
-| Exit code | Meaning |
+| Exit code | `info` result |
 |---|---|
 | `0` | No provenance record found — this tool has never touched the file |
 | `1` / `2` / `3` | This tool's cumulative contribution is `90°` / `180°` / `270°` |
 | `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. `rotate 0` was used just to add tracking, or opposing rotations cancelled out) |
-| `10` | A genuine error occurred (e.g. unreadable file, refused overwrite) — deliberately outside `0`–`4` so it's never mistaken for a rotation-state result |
-| `11` | Refused because a later release of this tool produced something in the file that this release doesn't support: a newer metadata format, metadata entries it doesn't know, or mirroring. The error names the release that last updated the file. Update heic-lossless-rotate (for unknown entries, `info`/`reverse` can also proceed with `--proceed-unsafe`) |
+
+Every error exits with `20` or above, for every command, so it's never
+mistaken for a result. There are two kinds:
+
+- **Soft errors (`20`–`49`)** are overcome by an option. Without it, the
+  command stops at the first error of any kind. With it, the command
+  goes on past that soft error.
+- **Hard errors (`50` and above)** can't be overcome. The command always
+  stops at the first one.
+
+So a command stops at its first error, unless every soft error it
+meets is overcome by an option given, in which case it stops at the
+first hard error. If it gets to the end, it exits with a code that isn't
+an error. All of this applies to `--dry-run` runs as well: they stop,
+or get to the end, exactly where the real run would.
+
+Every error is reported on stderr in one line starting with a tag:
+`ERROR Soft NN` or `ERROR Hard NN`, where `NN` is its exit code. A soft
+error that an option overcame is reported too, as
+`ERROR Soft NN (overridden by <option>): ...`, unless `-q` is given;
+the error a run stops at is always reported, even with `-q`. So this
+lists every soft error a run met, and the hard error it stopped at, if
+any:
+
+```bash
+heic-rotate reverse photo.heic --proceed-unsafe 2>&1 >/dev/null | grep '^ERROR '
+```
+
+**Soft errors:**
+
+| Exit code | Meaning | Overcome by |
+|---|---|---|
+| `20` | `reverse`, `info`: the file's metadata has entries this release doesn't know, as a newer release may add | `--proceed-unsafe` |
+| `21` | `reverse`: the file was modified by something else since this tool's last edit | `--proceed-unsafe` |
+| `22` | `rotate`, `reverse`: the output file already exists | `-f`/`--force` |
+
+**Hard errors:**
+
+| Exit code | Meaning |
+|---|---|
+| `50` | Invalid command line (also when run with no arguments) |
+| `51` | The input file can't be read, or the output file can't be written (an operating-system error, e.g. file not found or permission denied) |
+| `52` | Not a valid HEIF file, or one structured in a way this tool doesn't support (see [Known limitations](#known-limitations)) |
+| `53` | `reverse`: the file has no provenance record, so there's nothing to reverse |
+| `54` | A later release of this tool produced something in the file that this release doesn't support: a newer metadata format, mirroring, or (for `rotate`) metadata entries it doesn't know. The error names the release that last updated the file. Update heic-lossless-rotate |
+| `55` | The provenance record is corrupt, or the original file can't be restored from it (e.g. the file was changed outside what the record restores) |
+| `56` | Internal error: one of the tool's internal consistency checks failed, or something unexpected went wrong (the message is followed by a traceback). Nothing was written. Please report it |
+| `57` | `rotate`: the rotated file, reversed in memory, didn't give back the original, so it wasn't written. The message says why |
 
 ## Known limitations
 

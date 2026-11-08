@@ -147,11 +147,11 @@ same as heic-lossless-rotate itself. Requires Python 3.
    `compose_irot`/`compose_imir`, that it accumulates every requested
    rotation, that a record whose `REQT` includes mirroring (as a later
    release will write) is refused by `rotate`, `reverse` and `info`
-   (API and CLI, exit 11, naming the release from `TVER`), that a record holding a tag its format
+   (API and CLI, exit 54, naming the release from `TVER`), that a record holding a tag its format
    doesn't define (v3, or a v3 tag in a v1 record) is refused by
    `rotate`, `reverse` and `info`, and that `--proceed-unsafe` makes
    `info`/`reverse` ignore it - really dropping it before the record is
-   read - with a warning on stderr, that a v3
+   read - reported on stderr as an overridden soft error, that a v3
    record without `REQT` (pre-release builds only) is refused by
    `rotate`/`info` but still reversible, that a malformed one is
    refused, that an edit which wouldn't display as requested is
@@ -184,8 +184,19 @@ same as heic-lossless-rotate itself. Requires Python 3.
    `--dry-run` never
    writing a file, `info`'s exit codes (0/1/2/3/4) and its recorded-
    tool-version line, `rotate`'s "reversibility self-check passed"
-   message (and that `-q` suppresses it), and the error exit code (10)
-   staying isolated from those.
+   message (and that `-q` suppresses it), the error exit codes - each
+   kind of error exiting with its own code (`test_each_error_exits_with_
+   its_own_code`: soft errors 20-22 and that their options overcome
+   them; hard errors 50-55; 57 for a failed post-rotate self-check,
+   whatever caused it; 56 for an unexpected exception), that a run stops
+   at its first error unless options overcome each soft error, then at
+   the first hard one, with every error line tagged `ERROR Soft NN` /
+   `ERROR Hard NN` - overcome soft errors not reported with `-q`, the
+   error a run stops at always - with and without `--dry-run`
+   (`test_runs_until_first_error_soft_errors_overcome_by_options`),
+   the ranges themselves
+   (`test_exit_code_ranges`), all 20 or above so they stay clear of
+   `info`'s.
 
 4. **Real-file tests** (`TestRealFiles`) - round-trips every `.heic` file
    found in `testdata/`, skipped cleanly if that directory is empty. Also
