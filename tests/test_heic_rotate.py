@@ -1234,26 +1234,38 @@ class TestProvenanceFormats(unittest.TestCase):
 
     def test_rotate_refuses_old_record_whose_original_cannot_be_restored(self):
         """If `reverse` fails on an old-format record, `rotate` must not
-        guess: it refuses, and tells the user the two steps to do by
-        hand - reverse with the release that wrote the record, then
-        rotate with this one by the recorded plus the requested angle,
-        wrapped (here 270 + 180 = 90)."""
+        guess: it refuses with the same advice as `reverse` - recover the
+        original with the release that wrote the record - then says to
+        rotate it with the latest release by the recorded plus the
+        requested angle, wrapped (here 270 + 180 = 90). No advice if
+        something else modified the file since: that release can't
+        recover it either."""
         original = build_synthetic_heic(layout='mdat_first')
-        old_style = bytearray(_make_v2_style_record(
-            original, hr.apply_rotation(original, 3, verbose=False)))
-        info = hr.locate_structures(bytes(old_style))
-        _, entries = hr.parse_provenance(bytes(old_style), info['provenance_hdr'])
+        old_style = _make_v2_style_record(
+            original, hr.apply_rotation(original, 3, verbose=False))
+        info = hr.locate_structures(old_style)
+        _, entries = hr.parse_provenance(old_style, info['provenance_hdr'])
         entries[b'TVER'] = bytes([1, 7, 1])
-        old_style = bytearray(_replace_record(bytes(old_style), 2, entries))
-        old_style[len(old_style) // 2] ^= 0xFF  # inside mdat: original is gone
+        # a record this release can't restore the original from
+        entries[b'PCRC'] = struct.pack(
+            '>I', struct.unpack('>I', entries[b'PCRC'])[0] ^ 1)
+        unrestorable = _replace_record(old_style, 2, entries)
+        advice = hr.recovery_advice(unrestorable)
+        self.assertEqual(advice, "This file was last updated by "
+                         "heic-lossless-rotate 1.7.1. Use that release to "
+                         "recover the original.")
         with self.assertRaises(hr.ProvenanceError) as ctx:
-            hr.apply_rotation(bytes(old_style), 2, verbose=False)
-        message = str(ctx.exception)
-        self.assertIn("1. Run `reverse` on this file with "
-                      "heic-lossless-rotate 1.7.1", message)
-        self.assertIn("2. Run `rotate 90` on the restored file with this "
-                      "release: the 270 deg the earlier release added, plus "
-                      "the 180 deg requested now", message)
+            hr.apply_rotation(unrestorable, 2, verbose=False)
+        self.assertIn(advice[:-1] + ", then run `rotate 90` on it with the "
+                      "latest release (270 deg that release added + 180 deg "
+                      "requested now).", str(ctx.exception))
+        modified = bytearray(_replace_record(old_style, 2, {
+            **entries, b'PCRC': hr.parse_provenance(
+                old_style, info['provenance_hdr'])[1][b'PCRC']}))
+        modified[len(modified) // 2] ^= 0xFF  # inside mdat
+        with self.assertRaises(hr.ProvenanceError) as ctx:
+            hr.apply_rotation(bytes(modified), 2, verbose=False)
+        self.assertNotIn("Use that release", str(ctx.exception))
 
 
 def _reqt(data):
@@ -2077,7 +2089,7 @@ class TestCLI(unittest.TestCase):
                 f.write(data)
             return path
 
-        # 20: modified since the last edit - in the inserted 'irot',
+        # 21: modified since the last edit - in the inserted 'irot',
         # which reverse discards, so --proceed-unsafe can recover it...
         modified = bytearray(rotated_bytes)
         loc = hr.locate_structures(rotated_bytes)
@@ -2091,7 +2103,7 @@ class TestCLI(unittest.TestCase):
         unrestorable = bytearray(rotated_bytes)
         unrestorable[10] ^= 0xFF
         unrestorable = write('unrestorable.heic', unrestorable)
-        # 21 (reverse/info) / 56 (rotate): unknown entry; 56: newer format
+        # 20 (reverse/info) / 54 (rotate): unknown entry; 54: newer format
         info = hr.locate_structures(rotated_bytes)
         p_start, _, _, p_end, _ = info['provenance_hdr']
         _, entries = hr.parse_provenance(rotated_bytes, info['provenance_hdr'])
@@ -2112,6 +2124,13 @@ class TestCLI(unittest.TestCase):
         # 55: corrupt record (REQT missing)
         corrupt = write('corrupt.heic', _strip_provenance_tag(rotated_bytes, b'REQT'))
         not_heif = write('not_heif.heic', b'\x00\x00\x00\x08free' * 4)
+        # 55: a record this release can't restore the original from (wrong
+        # PCRC), last updated by another release / by this one
+        bad_pcrc = {**entries, b'PCRC': struct.pack(
+            '>I', struct.unpack('>I', entries[b'PCRC'])[0] ^ 1)}
+        by_other = write('by_other.heic', with_record(
+            3, {**bad_pcrc, b'TVER': bytes([1, 7, 9])}))
+        by_this = write('by_this.heic', with_record(3, bad_pcrc))
 
         cases = (
             (hr.EXIT_MODIFIED_SINCE_EDIT, ('reverse', modified, '--dry-run')),
@@ -2131,12 +2150,27 @@ class TestCLI(unittest.TestCase):
             (hr.EXIT_MODIFIED_SINCE_EDIT, ('reverse', unrestorable, '--dry-run')),
             (hr.EXIT_BAD_RECORD, ('reverse', unrestorable, '--dry-run',
                                   '--proceed-unsafe')),
+            (hr.EXIT_BAD_RECORD, ('reverse', by_other, '--dry-run')),
+            (hr.EXIT_BAD_RECORD, ('reverse', by_this, '--dry-run')),
         )
         for code, args in cases:
             with self.subTest(expected=code, args=args):
                 rc, _, err = run_cli(*args)
                 self.assertEqual(rc, code, err)
                 self.assertNotIn('Traceback', err)
+        # reverse's failure names the release to reverse it with - only
+        # when that's another release, and the file is unmodified since
+        hint = "Use that release to recover the original."
+        for path, named in ((by_other, 'heic-lossless-rotate 1.7.9.'),
+                            (by_this, None), (unrestorable, None)):
+            with self.subTest(hint_for=os.path.basename(path)):
+                _, _, err = run_cli('reverse', path, '--dry-run',
+                                    '--proceed-unsafe')
+                if named:
+                    self.assertIn(named, err)
+                    self.assertIn(hint, err)
+                else:
+                    self.assertNotIn(hint, err)
         # overridable conditions really are overridden
         for args in (('reverse', modified, '--dry-run'),
                      ('reverse', unknown, '--dry-run'), ('info', unknown)):

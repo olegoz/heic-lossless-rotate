@@ -376,33 +376,25 @@ state captured on the very first edit is never overwritten, so `reverse`
 can always undo every edit made since, no matter how many times you've
 rotated the file.
 
+Before writing anything, `rotate` checks that its output can be
+reversed: it reverses the output in memory and compares the result
+with the original file's recorded checksum. If they don't match, it
+writes nothing (hard error `57`). So the same release's `reverse` can
+always restore a file `rotate` wrote, even if a later release can't
+(see [`reverse`](#reverse) below), and a problem is found while you
+still have the input file, not later when you try to `reverse`.
+
 If the file's record was written in an older metadata format, `rotate N`
 instead first restores the original file (checked against the recorded
-checksum). It then rotates the original
-with the current version's code by the angle the older release was asked
-to add, plus N. For example, 270° plus `rotate 180` gives 90°, since a
-total of 360° or more wraps around. So `rotate 0` brings a file rotated
-by an older release up to date, including any fixes made since, and
-keeps the rotation you asked for. If the original can't be restored,
-`rotate` writes nothing, and tells you the two steps to do by hand:
-`reverse` the file with the release that wrote the record, then rotate
-the restored file with the current version by the combined angle.
-
-**Recovering from a bug in an earlier release.** The recommended way is
-to run `reverse` with the latest release (it can also reverse records
-written by earlier releases), check the restored file yourself, then
-rotate it with the latest release. `rotate` on the already-rotated file does the same in one step,
-but the angle you give it is added to what you asked the earlier release
-for, not to what you see on screen. Those differ when a bug made the
-earlier release show the photo wrongly, as with mirrored photos below.
-
-Before writing anything, `rotate` also reverses its own freshly-produced
-output in memory and confirms that reconstructs the original exactly —
-refusing to write the output file at all if it doesn't. This is a
-stronger guarantee than checking the *original* file's CRC after the
-fact: it verifies each edit's own reversibility, using the true original
-bytes, at the moment they're still available, rather than waiting to
-find out later that something couldn't be reversed.
+checksum). It then rotates the original with the current version's code
+by the angle the older release was asked to add, plus N. For example,
+270° plus `rotate 180` gives 90°, since a total of 360° or more wraps
+around. So `rotate 0` brings a file rotated by an older release up to
+date, including any fixes made since, and keeps the rotation you asked
+for. If the original can't be restored, `rotate` writes nothing. Its
+error names the release to recover the original with (see
+[`reverse`](#reverse) below), and the combined angle to rotate it by
+with the latest release.
 
 ### `reverse`
 
@@ -416,6 +408,18 @@ affects whether `reverse` proceeds past the *earlier* checks (whether
 something else modified the file since this tool's last edit, and
 whether its metadata has entries this release doesn't know), not this
 final one.
+
+A later release can usually restore files that earlier ones modified
+(the current one can restore files from every earlier release), but
+that isn't guaranteed: it may drop an old metadata format, or have a
+bug. What is guaranteed is that the release that last updated a file
+can restore the original, since that release checked this before
+writing the file (every release from 1.6.0 on does this). That release is recorded in the
+file's provenance record, and `info` shows it. When a release can't
+restore a file, the error message also names the release to use. Run
+`reverse` on the file with that release, from the
+[releases page](https://github.com/olegoz/heic-lossless-rotate/releases).
+This holds as long as nothing else has modified the file since.
 
 ### `info`
 
@@ -454,9 +458,12 @@ few kinds of file get extra handling:
   in the opposite direction, because the mirror reverses the visible
   rotation. `info` labels such files as mirrored, since their raw `irot`
   value then moves the opposite way to what the tool reports it added.
-  Releases before 1.8.0 turned these photos the wrong way. If you rotated
-  one with such a release, see "Recovering from a bug in an earlier
-  release" above.
+  Releases before 1.8.0 turned these photos the wrong way. To fix a
+  photo rotated by such a release, run `rotate 0` on it with this
+  release. That re-applies the rotation you asked the earlier release
+  for, which for 90° and 270° isn't what it showed you. If you'd rather pick
+  the angle by what you see, `reverse` the file, check the restored
+  file, then rotate it.
 - **HDR photos with a gain map** (recent iPhones and Samsung Galaxy
   phones): these contain a second, tone-mapped (`tmap`) image that
   HDR-capable viewers show instead of the main one. Its stored size is
@@ -464,8 +471,8 @@ few kinds of file get extra handling:
   from the main image's. Without this, viewers show the rotated photo
   inside a frame of the old shape, cropped and with blank bars. The gain
   map itself turns together with the main image. Releases before 1.8.0
-  didn't handle these photos. If you rotated one with such a release,
-  see "Recovering from a bug in an earlier release" above.
+  didn't handle these photos. To fix a photo rotated by such a release,
+  run `rotate 0` on it with this release.
 
 Every edit writes its provenance record in the latest metadata format.
 Records in older formats, written by earlier releases, can still be

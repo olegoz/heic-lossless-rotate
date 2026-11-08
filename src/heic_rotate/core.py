@@ -1085,6 +1085,38 @@ def newer_version_error(problem, entries, advice=None, cls=NewerVersionError):
         f"{problem}. {advice}")
 
 
+def recovery_advice(data, then=''):
+    """When this release can't restore a file's original: if another
+    release last updated the file, and nothing else has modified it
+    since (its CCRC matches), the advice to recover the original with
+    that release - which checked, before writing the file, that it
+    could (see README). `then` is appended to say what to do with the
+    original afterwards (", then ..."). None otherwise (no usable
+    record, a modified file, or this release wrote it).
+
+    The one wording for every command that needs the original and
+    can't restore it: `reverse` (cli.py), `rotate` on an older record
+    (_replay_from_original), and any later one."""
+    try:
+        hdr = find_provenance_box(data)
+        if hdr is None:
+            return None
+        _, entries = parse_provenance(data, hdr)
+        ccrc = entries.get(b'CCRC')
+        if (ccrc is None or len(ccrc) != 4 or struct.unpack('>I', ccrc)[0]
+                != crc32_excluding_range(data, hdr[0], hdr[3])):
+            return None
+    except HeicRotateError:
+        return None
+    writer = _tver_string(entries)
+    if writer == VERSION:
+        return None
+    who = (f"heic-lossless-rotate {writer}" if writer is not None
+           else "a heic-lossless-rotate release before 1.6.0")
+    return (f"This file was last updated by {who}. Use that release to "
+            f"recover the original{then}.")
+
+
 def parse_provenance(data, hdr):
     """Parse our provenance box content into (version, entries dict).
 
@@ -1574,8 +1606,9 @@ def _replay_from_original(data, record_version, entries, delta_turns,
 
     `reverse` only reads each older format's normal final record; it
     makes no attempt to recover from bugs in the releases that wrote
-    them. If it fails, nothing is written and the user is told the two
-    steps to do by hand instead."""
+    them. If it fails, nothing is written, and the user is told to
+    recover the original with the release that wrote the record, then
+    rotate it with the latest release (see recovery_advice)."""
     delta_turns %= 4
     try:
         original = reverse_rotation(data, verbose=False)
@@ -1586,29 +1619,21 @@ def _replay_from_original(data, record_version, entries, delta_turns,
             added = _recorded_rotation(data, record_version, entries)
         except (ProvenanceError, BoxParseError):
             added = None
-        tver = entries.get(b'TVER')
-        writer = (f"heic-lossless-rotate {'.'.join(map(str, tver))}"
-                  if tver is not None and len(tver) == 3
-                  else "a heic-lossless-rotate release before 1.6.0")
         if added is not None:
             total = (added + delta_turns) % 4
-            step2 = (f"Run `rotate {total * 90}` on the restored file with "
-                     f"this release: the {added * 90} deg the earlier release "
-                     f"added, plus the {delta_turns * 90} deg requested now")
+            then = (f", then run `rotate {total * 90}` on it with the "
+                    f"latest release ({added * 90} deg that release added "
+                    f"+ {delta_turns * 90} deg requested now)")
         else:
-            step2 = (f"Run `rotate` on the restored file with this release, "
-                     f"by the angle the earlier release was asked to add "
-                     f"plus the {delta_turns * 90} deg requested now (minus "
-                     f"360 deg if the sum is 360 or more)")
-        raise ProvenanceError(
-            f"cannot upgrade this file's metadata (format v{record_version}, "
-            f"written by {writer}): restoring the original file failed: "
-            f"{str(e).rstrip('.')}.\n"
-            f"To fix:\n"
-            f"  1. Run `reverse` on this file with {writer}, the release "
-            f"that wrote this metadata (it verified at the time that the "
-            f"original could be restored from it).\n"
-            f"  2. {step2}.") from None
+            then = (f", then rotate it with the latest release by the "
+                    f"angle that release added + {delta_turns * 90} deg "
+                    f"requested now")
+        message = (f"cannot upgrade this file's metadata (format "
+                   f"v{record_version}): restoring the original file "
+                   f"failed: {str(e).rstrip('.')}.")
+        advice = recovery_advice(data, then)
+        raise ProvenanceError(f"{message} {advice}" if advice else message
+                              ) from None
     added = _recorded_rotation(data, record_version, entries, original)
     total = (added + delta_turns) % 4
     if verbose:

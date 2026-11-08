@@ -155,9 +155,9 @@ file, byte for byte:
     (e.g. 270 recorded + `rotate 180` = 90). `reverse` itself only reads
     each older format's normal final record; it never tries to recover
     from bugs in the releases that wrote them. If the original can't be
-    restored, `rotate` writes nothing and gives the two steps to do by
-    hand: `reverse` with the release that wrote the record, then
-    `rotate` the restored file with this release by the combined angle.
+    restored, `rotate` writes nothing and says to recover the original
+    with the release that wrote the record, then rotate it with the
+    latest release by the combined angle.
   - the heic-lossless-rotate version (major.minor.patch) that most recently
     UPDATED the file - shown by `info` as "Rotated with heic-lossless-rotate
     vX.Y.Z". Written by `rotate` only, as part of the same edit whose
@@ -227,8 +227,14 @@ import argparse
 import traceback
 
 from .core import (
+    BoxParseError,
     HeicRotateError,
+    ModifiedSinceEditError,
+    NewerVersionError,
+    NoProvenanceError,
+    ProvenanceError,
     SelfCheckError,
+    recovery_advice,
     apply_rotation,
     reverse_rotation,
     verify_reversible,
@@ -511,8 +517,18 @@ def _run(args, data):
             else:
                 out_path = in_stem + '_rotated.heic'
     else:
-        out = reverse_rotation(data, proceed_unsafe=args.proceed_unsafe,
-                                verbose=not args.quiet)
+        try:
+            out = reverse_rotation(data, proceed_unsafe=args.proceed_unsafe,
+                                    verbose=not args.quiet)
+        except (NoProvenanceError, ModifiedSinceEditError, NewerVersionError):
+            raise
+        except (ProvenanceError, BoxParseError) as e:
+            # This release can't restore it: point to the release that
+            # wrote the record, if that one is guaranteed to.
+            advice = recovery_advice(data)
+            if advice is None:
+                raise
+            raise type(e)(f"{str(e).rstrip('.')}. {advice}") from e
         verify_structure(out)
         if not args.quiet:
             print("[ok] output box structure is internally consistent")
