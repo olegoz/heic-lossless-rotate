@@ -1168,7 +1168,7 @@ class TestProvenanceFormats(unittest.TestCase):
                             v3 = hr.apply_rotation(v3, step, verbose=False)
                         with unittest.mock.patch.object(hr, 'FORMAT_VERSION', 4), \
                                 unittest.mock.patch.object(
-                                    hr, 'SUPPORTED_REVERSE_FORMAT_VERSIONS',
+                                    hr, 'COMPATIBLE_FORMAT_VERSIONS',
                                     (1, 2, 3, 4)):
                             replayed = hr.apply_rotation(v3, delta, verbose=False)
                             expected = hr.apply_rotation(
@@ -1718,7 +1718,7 @@ class TestCLI(unittest.TestCase):
                 self.assertEqual(rc, 0, err)
                 self.assertIn(hr.VERSION, out)
                 self.assertIn(str(hr.FORMAT_VERSION), out)
-                for v in hr.SUPPORTED_REVERSE_FORMAT_VERSIONS:
+                for v in hr.COMPATIBLE_FORMAT_VERSIONS:
                     self.assertIn(str(v), out)
 
     def test_rotate_refuses_to_overwrite_existing_output_without_force(self):

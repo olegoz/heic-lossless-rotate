@@ -484,14 +484,14 @@ file is read from it, so the error can name that release. The same
 applies to a record in a known format that a newer release extended
 (with entries this release doesn't know, or with mirroring). So once a
 newer release has edited a file, use that release or a later one (`-V`
-shows the formats a release supports).
+lists the metadata formats a release is compatible with).
 
 ## Options
 
 | Flag | Applies to | Meaning |
 |---|---|---|
 | `-h`, `--help` | any | Show help and exit |
-| `-V`, `--version` | top-level | Show script version, current metadata format version, and metadata format versions supported by `reverse`, then exit |
+| `-V`, `--version` | top-level | Show script version, current metadata format version, and compatible metadata formats (the ones `rotate`, `reverse` and `info` accept), then exit |
 | `-q`, `--quiet` | all | Suppress informational messages and warnings on stdout, and the stderr reports of soft errors an option overcame. The error a run stops at is still reported on stderr |
 | `--dry-run` | `rotate`, `reverse` | Do everything except write the output file |
 | `-f`, `--force` | `rotate`, `reverse` | Overwrite the output file if it already exists (otherwise soft error `22`) |
@@ -582,7 +582,7 @@ heic-rotate reverse photo.heic --proceed-unsafe 2>&1 >/dev/null | grep '^ERROR '
 | `52` | Not a valid HEIF file, or one structured in a way this tool doesn't support (see [Known limitations](#known-limitations)) |
 | `53` | `reverse`: the file has no provenance record, so there's nothing to reverse |
 | `54` | A later release of this tool produced something in the file that this release doesn't support: a newer metadata format, mirroring, or (for `rotate`) metadata entries it doesn't know. The error names the release that last updated the file. Update heic-lossless-rotate |
-| `55` | The provenance record is corrupt, or the original file can't be restored from it (e.g. the file was changed outside what the record restores) |
+| `55` | The provenance record is corrupt, or the original file can't be restored from it (e.g. the file was changed outside what the record restores). If another release last updated the file, the message names the release to recover the original with (see [`reverse`](#reverse)) |
 | `56` | Internal error: one of the tool's internal consistency checks failed, or something unexpected went wrong (the message is followed by a traceback). Nothing was written. Please report it |
 | `57` | `rotate`: the rotated file, reversed in memory, didn't give back the original, so it wasn't written. The message says why |
 

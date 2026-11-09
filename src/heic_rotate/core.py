@@ -128,7 +128,10 @@ class SelfCheckError(HeicRotateError):
 # _replay_from_original).
 FORMAT_VERSION = 3
 
-# Which provenance/metadata format versions `reverse` knows how to restore.
+# The provenance/metadata format versions this release is compatible
+# with (-V's "compatible metadata formats"): `reverse` restores the
+# original from them, so `rotate` can replay an older one from the
+# original, and `info` reads them.
 # v1: the pristine 'iprp' box (ipco+ipma) was saved in full (OPRP). v2:
 # only the 'irot' property itself is saved (OIRT, +OIPF for the slow-path
 # case). v3: only the 'ipma' associations (OIPD) and 'ipco' children
@@ -140,7 +143,7 @@ FORMAT_VERSION = 3
 # each is reconstructed. Kept as its own constant (rather than inlining
 # a literal at each call site) so --version and reverse_rotation()'s
 # check can never drift out of sync with each other.
-SUPPORTED_REVERSE_FORMAT_VERSIONS = (1, 2, 3)
+COMPATIBLE_FORMAT_VERSIONS = (1, 2, 3)
 
 
 def _version_tuple():
@@ -2233,8 +2236,8 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
             "stripped by something else. Cannot reverse.")
 
     version, entries = parse_provenance(data, prov_hdr)
-    if version not in SUPPORTED_REVERSE_FORMAT_VERSIONS:
-        supported = ', '.join(str(v) for v in SUPPORTED_REVERSE_FORMAT_VERSIONS)
+    if version not in COMPATIBLE_FORMAT_VERSIONS:
+        supported = ', '.join(str(v) for v in COMPATIBLE_FORMAT_VERSIONS)
         raise ProvenanceError(
             f"provenance record is format version {version}; this script "
             f"only knows how to reverse version(s) {supported}. Use a "
@@ -2674,7 +2677,7 @@ def verify_structure(data):
 
 
 def _version_string():
-    supported = ', '.join(str(v) for v in SUPPORTED_REVERSE_FORMAT_VERSIONS)
+    supported = ', '.join(str(v) for v in COMPATIBLE_FORMAT_VERSIONS)
     return (f"heic-lossless-rotate {VERSION}\n"
             f"metadata (provenance) format version: {FORMAT_VERSION}\n"
-            f"metadata format versions supported by reverse: {supported}")
+            f"compatible metadata formats: {supported}")
