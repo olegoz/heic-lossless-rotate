@@ -66,12 +66,22 @@ the tag — `release.yml` will redo it in a clean environment regardless.
       — kept out by `MANIFEST.in`)
 - [ ] Build the standalone zipapp and smoke-test it runs with no install
       step at all:
-      ```
-      python -m zipapp src -o dist/heic-lossless-rotate.pyz \
-          -p "/usr/bin/env python3" -m "heic_rotate.cli:main"
-      chmod +x dist/heic-lossless-rotate.pyz
-      ./dist/heic-lossless-rotate.pyz -V
-      ```
+
+  ```bash
+  rm -rf build/pyz && mkdir -p build/pyz
+  git archive HEAD src/heic_rotate | tar -x -C build/pyz
+  python -m zipapp build/pyz/src -o dist/heic-lossless-rotate.pyz \
+      -p "/usr/bin/env python3" -m "heic_rotate.cli:main"
+  chmod +x dist/heic-lossless-rotate.pyz
+  ./dist/heic-lossless-rotate.pyz -V
+  unzip -l dist/heic-lossless-rotate.pyz
+  ```
+
+  Building from a `git archive` of `HEAD` puts only committed package
+  files in the `.pyz`. Local leftovers in `src/` (`*.egg-info/`,
+  `__pycache__/`, untracked files) and uncommitted edits stay out, so
+  the `.pyz` matches the commit you'll tag. The `unzip -l` listing should
+  show just `__main__.py` plus the `heic_rotate/*.py` files.
 
 ## 3. Verify the built package actually works
 
