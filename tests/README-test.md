@@ -115,7 +115,7 @@ same as heic-lossless-rotate itself. Requires Python 3.
    tag`, builds a self-consistent "legacy-style" record (missing a given
    tag, with `iloc` correctly patched to match) to simulate a record
    lacking a newer tag, rather than just deleting bytes and hoping.
-   (Since 1.8.0, real records from older releases are in an older
+   (Since 2.0.0, real records from older releases are in an older
    format and are replayed from the original instead - see
    `TestProvenanceFormats`.) Includes a `rotate 0` case,
    confirming that command can be used purely to bring an old file's
@@ -293,7 +293,7 @@ same as heic-lossless-rotate itself. Requires Python 3.
 
 7. **Mirrored and HDR gain-map photos** (`TestMirroringAndGainMaps`).
    Regression tests for two real-world bugs found on iPhone and Samsung
-   files (fixed in 1.8.0):
+   files (fixed in 2.0.0):
    - **Mirrored photos.** A mirror (`imir`) listed after the rotation
      (`irot`) reverses the visible direction of the rotation. The tests
      check that the displayed image turns the requested way for every
@@ -307,12 +307,14 @@ same as heic-lossless-rotate itself. Requires Python 3.
      property layouts, across single edits, chains of edits and the
      slow path. A shared `ispe`/`irot` must be copied, never changed in
      place for the main image.
-   - **Repair of files rotated by releases before 1.8.0.** Those
+   - **Repair of files rotated by releases before 2.0.0.** Those
      releases are reproduced by hiding the `tmap` item and the mirror
      direction from `apply_rotation` (mocking `find_tmap_items` and
      `_rotation_sign`), with the v2 record they wrote. The test checks
-     that `rotate 0` then produces exactly the bytes of a 1.8.0
+     that `rotate 0` then produces exactly the bytes of a 2.0.0
      rotation of the original.
+   - **`info` labels.** `info` labels mirrored photos and photos with a
+     gain map, alone and combined, and labels neither on a plain photo.
 
    `synth_heic.py` gained three parameters for this group:
    - `imir_axis` (None, or 0/1 to add a mirror property),

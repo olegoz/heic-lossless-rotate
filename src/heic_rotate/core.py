@@ -2477,7 +2477,7 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
                                 record it is what viewers show; for an
                                 older record of a photo that release
                                 displayed wrongly (mirrored photos before
-                                1.8.0) it can differ from the screen, and
+                                2.0.0) it can differ from the screen, and
                                 is what `rotate 0` re-applies
       version                : provenance format version (if has_provenance)
       tool_version            : (major, minor, patch) tuple - the
@@ -2502,6 +2502,10 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
                                  item's 'imir' is applied after its
                                  'irot', so the displayed image turns
                                  opposite to the raw 'irot' value
+      has_gain_map            : bool (if has_provenance) - the file has
+                                 a 'tmap' (HDR gain-map) image derived
+                                 from the primary item (see
+                                 find_tmap_items)
     """
     current_quarter_turns = get_current_rotation(data)
     result = {
@@ -2526,6 +2530,9 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
 
     mirrored = _mirrored_after_rotation(data)
     result['mirrored_after_rotation'] = mirrored
+    result['has_gain_map'] = bool(find_tmap_items(
+        data, info['meta_body_start'], info['meta_hdr'][3],
+        info['primary_item_id']))
 
     original_quarter_turns = None
     if b'OIPC' in entries:
@@ -2612,6 +2619,8 @@ def format_info(result, quiet=False):
         lines.append(f"  currently at: {current_degrees} deg (original "
                       f"rotation snapshot unavailable - can't compute what "
                       f"this tool added specifically)")
+    if result.get('has_gain_map'):
+        lines.append("  HDR photo with a gain map ('tmap' image)")
     if result['version'] < FORMAT_VERSION:
         lines.append(f"  metadata format is older than this release's "
                       f"(v{FORMAT_VERSION}): `rotate 0` brings the file up "

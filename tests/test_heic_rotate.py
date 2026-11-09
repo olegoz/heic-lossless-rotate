@@ -1194,9 +1194,9 @@ class TestProvenanceFormats(unittest.TestCase):
                             + b'\xff\x00garbage, not entries')
         framed = with_body(
             hr.build_provenance_box(hr.FORMAT_VERSION + 1, {
-                b'TVER': bytes([1, 9, 0]), b'ZNEW': b'anything'})[8:])
+                b'TVER': bytes([2, 1, 0]), b'ZNEW': b'anything'})[8:])
         for data, writer in ((garbage, 'a newer heic-lossless-rotate release'),
-                             (framed, 'heic-lossless-rotate 1.9.0')):
+                             (framed, 'heic-lossless-rotate 2.1.0')):
             for name, call in (
                     ('rotate', lambda: hr.apply_rotation(data, 1, verbose=False)),
                     ('reverse', lambda: hr.reverse_rotation(data, verbose=False)),
@@ -1216,7 +1216,7 @@ class TestProvenanceFormats(unittest.TestCase):
                 f.write(framed)
             code, _, err = run_cli('info', path)
             self.assertEqual(code, hr.EXIT_NEWER_RELEASE)
-            self.assertIn('last updated by heic-lossless-rotate 1.9.0', err)
+            self.assertIn('last updated by heic-lossless-rotate 2.1.0', err)
             self.assertIn('newer than this release supports', err)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1343,7 +1343,7 @@ class TestRequestedTransform(unittest.TestCase):
         rotated = hr.apply_rotation(original, 1, verbose=False)
         _, entries = hr.parse_provenance(
             rotated, hr.locate_structures(rotated)['provenance_hdr'])
-        entries[b'TVER'] = bytes([1, 9, 0])
+        entries[b'TVER'] = bytes([2, 1, 0])
         for request in ((True, 0), (True, 1), (True, 2)):
             with self.subTest(request=request):
                 entries[b'REQT'] = hr.encode_requested_transform(request)
@@ -1359,7 +1359,7 @@ class TestRequestedTransform(unittest.TestCase):
                             call()
                         self.assertIn(
                             f"this file was last updated by heic-lossless-"
-                            f"rotate 1.9.0 (this is {hr.VERSION}): it was "
+                            f"rotate 2.1.0 (this is {hr.VERSION}): it was "
                             f"mirrored, which this release doesn't support "
                             f"yet", str(ctx.exception))
         tmpdir = tempfile.mkdtemp()
@@ -1463,7 +1463,7 @@ class TestRequestedTransform(unittest.TestCase):
                     self.assertIn("doesn't understand", str(ctx.exception))
 
     def test_edit_that_does_not_display_as_requested_is_refused(self):
-        """Ignoring the mirror (as releases before 1.8.0 did) turns a
+        """Ignoring the mirror (as releases before 2.0.0 did) turns a
         photo mirrored after rotation the wrong way: the check against
         the requested change catches it and nothing is written."""
         original = build_synthetic_heic(include_irot=True, irot_value=1,
@@ -1639,15 +1639,15 @@ class TestMirroringAndGainMaps(unittest.TestCase):
             self.assertIn(b'OIPD', entries)
             self.assertEqual(hr.reverse_rotation(data, verbose=False), original)
 
-    def test_rotate_0_repairs_files_rotated_by_releases_before_1_8_0(self):
-        """Releases before 1.8.0 changed 'irot' by the raw requested angle
+    def test_rotate_0_repairs_files_rotated_by_releases_before_2_0_0(self):
+        """Releases before 2.0.0 changed 'irot' by the raw requested angle
         (wrong direction for mirrored photos) and didn't know about 'tmap'
         items (gain map left unrotated, shared 'irot' changed in place,
         tmap 'ispe' left at the old shape). Hiding the mirror and tmap
         from apply_rotation (and skipping its check that the display
         turned as requested, which those releases lacked) reproduces
         exactly that, and those releases wrote v1/v2 records. `rotate 0` must then produce the very bytes
-        a 1.8.0 rotation of the original does."""
+        a 2.0.0 rotation of the original does."""
         for kwargs in (dict(include_irot=False, tmap='own'),
                        dict(include_irot=True, irot_value=0, tmap='shared'),
                        dict(include_irot=True, irot_value=1, tmap='own'),
@@ -1677,6 +1677,27 @@ class TestMirroringAndGainMaps(unittest.TestCase):
                         hr.gather_info(repaired))[0])
                     self.assertEqual(
                         repaired, hr.apply_rotation(original, delta, verbose=False))
+
+    def test_info_labels_mirrored_and_gain_map_photos(self):
+        """`info` labels the two kinds of photo releases before 2.0.0
+        rotated wrongly - mirrored ones and HDR ones with a gain map -
+        so users can tell whether a file needs repairing."""
+        for kwargs, mirrored, gain_map in (
+                (dict(include_irot=True, irot_value=0), False, False),
+                (dict(include_irot=True, irot_value=0, imir_axis=1), True, False),
+                (dict(include_irot=False, tmap='own'), False, True),
+                (dict(include_irot=True, irot_value=0, tmap='shared'), False, True),
+                (dict(include_irot=True, irot_value=0, imir_axis=1,
+                      tmap='shared'), True, True)):
+            with self.subTest(**kwargs):
+                rotated = hr.apply_rotation(build_synthetic_heic(**kwargs), 1,
+                                            verbose=False)
+                info = hr.gather_info(rotated)
+                self.assertEqual(info['mirrored_after_rotation'], mirrored)
+                self.assertEqual(info['has_gain_map'], gain_map)
+                text = hr.format_info(info)[0]
+                self.assertEqual('mirrored after rotating' in text, mirrored)
+                self.assertEqual('HDR photo with a gain map' in text, gain_map)
 
     def test_shared_ispe_is_copied_not_changed_for_the_primary(self):
         original = build_synthetic_heic(include_irot=True, irot_value=0,

@@ -421,6 +421,27 @@ restore a file, the error message also names the release to use. Run
 [releases page](https://github.com/olegoz/heic-lossless-rotate/releases).
 This holds as long as nothing else has modified the file since.
 
+Several releases can coexist, so you don't have to touch the copy you
+normally use. Each release's `.pyz` is one standalone file. You can
+download the one you need just for this, run it, and delete it
+afterward. Your regular `.pyz` or pip install stays as it was. Every
+release's file has the same name, `heic-lossless-rotate.pyz`, so save it
+under a different name, or your current copy will be overwritten. For
+example, for 1.7.1:
+
+```bash
+curl -L -o heic-lossless-rotate-1.7.1.pyz https://github.com/olegoz/heic-lossless-rotate/releases/download/v1.7.1/heic-lossless-rotate.pyz
+python3 heic-lossless-rotate-1.7.1.pyz reverse IMG_0001_rotated.heic IMG_0001_original.heic
+```
+
+On Windows (PowerShell), download it with `Invoke-WebRequest -Uri <same
+URL> -OutFile heic-lossless-rotate-1.7.1.pyz` and run it with `python`
+as shown in [Installation](#installation). For another release, replace
+`1.7.1` in both the URL and the file name. Release 1.6.0 has no `.pyz`. It was a
+single script, so download
+`https://raw.githubusercontent.com/olegoz/heic-lossless-rotate/v1.6.0/heic_rotate.py`
+and run it as `python3 heic_rotate.py reverse ...`.
+
 ### `info`
 
 `info` is cheap and read-only: it reports the cumulative rotation *this
@@ -435,10 +456,14 @@ The rotation it reports is the one you asked for. For a file rotated by
 the latest release, that is exactly what viewers show, mirrored or not:
 `rotate 90` on the original shows the photo turned 90° counter-clockwise,
 and `info` reports 90. A file rotated by an older release that displayed
-it wrongly (mirrored photos, before 1.8.0) can look different from what
+it wrongly (mirrored photos, before 2.0.0) can look different from what
 `info` reports. `info` then says the metadata is in an older format, and
 `rotate 0` brings the file up to date by re-applying the reported
 rotation with the latest release's code.
+
+`info` also labels the two kinds of photo releases before 2.0.0 rotated
+wrongly: mirrored photos (on the `irot` line) and HDR photos with a gain
+map (`HDR photo with a gain map ('tmap' image)`).
 
 ## How rotation values map to the container format
 
@@ -458,19 +483,18 @@ few kinds of file get extra handling:
   in the opposite direction, because the mirror reverses the visible
   rotation. `info` labels such files as mirrored, since their raw `irot`
   value then moves the opposite way to what the tool reports it added.
-  Releases before 1.8.0 turned these photos the wrong way. To fix a
+  Releases before 2.0.0 turned these photos the wrong way. To fix a
   photo rotated by such a release, run `rotate 0` on it with this
   release. That re-applies the rotation you asked the earlier release
-  for, which for 90° and 270° isn't what it showed you. If you'd rather pick
-  the angle by what you see, `reverse` the file, check the restored
-  file, then rotate it.
+  for, which for 90° and 270° isn't what it showed you. If the result
+  isn't the way you want it, rotate it again by the difference.
 - **HDR photos with a gain map** (recent iPhones and Samsung Galaxy
   phones): these contain a second, tone-mapped (`tmap`) image that
   HDR-capable viewers show instead of the main one. Its stored size is
   updated to the new orientation, and its own rotation is kept separate
   from the main image's. Without this, viewers show the rotated photo
   inside a frame of the old shape, cropped and with blank bars. The gain
-  map itself turns together with the main image. Releases before 1.8.0
+  map itself turns together with the main image. Releases before 2.0.0
   didn't handle these photos. To fix a photo rotated by such a release,
   run `rotate 0` on it with this release.
 
