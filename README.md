@@ -58,8 +58,18 @@ No third-party dependencies. Python 3 standard library only.
 
 ## Requirements
 
-- Python 3 (standard library only — no third-party dependencies, whichever
-  way you install it below)
+- Python 3.10 or newer (standard library only — no third-party
+  dependencies, whichever way you install it below)
+
+**New to Python?** Most macOS and Linux systems already have it — run
+`python3 --version` in a terminal to check. If you don't have it, or it's
+older than 3.10, get it from
+[python.org/downloads](https://www.python.org/downloads/); the official
+[Using Python](https://docs.python.org/3/using/index.html) guide walks
+through installing and running it on
+[Windows](https://docs.python.org/3/using/windows.html),
+[macOS](https://docs.python.org/3/using/mac.html) and
+[Linux](https://docs.python.org/3/using/unix.html).
 
 ## Installation
 
