@@ -2114,6 +2114,186 @@ class TestFlip(unittest.TestCase):
 # 3. CLI-level tests
 # ---------------------------------------------------------------------------
 
+OLDER_VERSION = (2, 0, 0)
+
+
+def _rotated_like_before_3_0_0(data, turns, then_flip=None):
+    """`data` rotated by `turns` (and then flipped, if `then_flip`) the
+    way releases before 3.0.0 did it: an inserted 'irot' goes to the
+    primary item and gain-map inputs only, not to the thumbnail - and a
+    flip of the result leaves the thumbnail alone too. Recorded as
+    written by OLDER_VERSION, in the same (latest) metadata format."""
+    with unittest.mock.patch.object(hr, 'find_related_items',
+                                    return_value=[]), \
+            unittest.mock.patch.object(hr, '_version_tuple',
+                                       return_value=OLDER_VERSION):
+        out = bytes(hr.apply_rotation(data, turns, verbose=False))
+        if then_flip is not None:
+            out = bytes(hr.apply_transform(out, then_flip, verbose=False))
+    return out
+
+
+class TestRelatedImagesFollowRotation(unittest.TestCase):
+    """The images that go with the primary item (thumbnail, auxiliary
+    images, gain map) turn with it when `rotate` has to INSERT an 'irot'
+    as well - and one that an earlier release left behind is brought
+    back in line by the next edit, `rotate 0` included."""
+
+    LEFT_BEHIND_FIXTURES = (dict(thumbnail='plain'),
+                            dict(thumbnail='plain', tmap='own'),
+                            dict(thumbnail='plain', tmap='shared'),
+                            dict(thumbnail='shared', imir_axis=1),
+                            dict(thumbnail='shared', imir_axis=0, tmap='own'))
+
+    def _assert_in_line(self, data, expected):
+        self.assertEqual(_display_state(data)[0], expected)
+        related = _related_transforms(data)
+        self.assertTrue(related, "fixture sanity check: related items expected")
+        for item_id, item_transform in related.items():
+            self.assertEqual(item_transform, expected,
+                             f"item {item_id} must be oriented like the primary")
+
+    def test_inserted_irot_goes_to_the_related_images_too(self):
+        for layout in ('mdat_first', 'meta_first'):
+            for kwargs in self.LEFT_BEHIND_FIXTURES:
+                original = build_synthetic_heic(layout=layout, include_irot=False,
+                                                include_exif=True, **kwargs)
+                t0 = _display_state(original)[0]
+                for turns in range(4):
+                    with self.subTest(layout=layout, turns=turns, **kwargs):
+                        rotated = hr.apply_rotation(original, turns, verbose=False)
+                        hr.verify_structure(rotated)
+                        expected = hr.compose_irot(t0, turns)
+                        self._assert_in_line(rotated, expected)
+                        self.assertEqual(hr.gather_info(rotated)
+                                         ['left_behind_items'], [])
+                        # ... and stay in line through later edits
+                        again = hr.apply_rotation(rotated, 1, verbose=False)
+                        self._assert_in_line(again, hr.compose_irot(expected, 1))
+                        flipped = _apply(again, hr.FLIP_HORIZONTAL)
+                        self._assert_in_line(flipped, hr.compose_transforms(
+                            hr.FLIP_HORIZONTAL, hr.compose_irot(expected, 1)))
+                        for edited in (rotated, again, flipped):
+                            self.assertEqual(hr.reverse_rotation(
+                                edited, verbose=False), original)
+
+    def test_next_edit_repairs_a_left_behind_thumbnail(self):
+        """Any edit - a rotation by 0 like any other - of a file whose
+        thumbnail an earlier release didn't turn with the primary item
+        gives the same bytes as making all the edits with this release
+        from the original."""
+        for layout in ('mdat_first', 'meta_first'):
+            for kwargs in self.LEFT_BEHIND_FIXTURES:
+                original = build_synthetic_heic(layout=layout, include_irot=False,
+                                                include_exif=True, **kwargs)
+                for then_flip in (None, hr.FLIP_HORIZONTAL):
+                    old = _rotated_like_before_3_0_0(original, 1, then_flip)
+                    t_old = _display_state(old)[0]
+                    stale = [t for t in _related_transforms(old).values()
+                             if t != t_old]
+                    self.assertTrue(stale, "fixture sanity check: a related "
+                                    "item must have been left behind")
+                    info = hr.gather_info(old)
+                    # (the simulated old flip leaves a gain map behind
+                    # as well, which the real one didn't)
+                    self.assertIn(5, info['left_behind_items'])
+                    self.assertEqual(info['tool_version'], OLDER_VERSION)
+                    self.assertIn('`rotate 0`', hr.format_info(info)[0])
+                    fresh = hr.apply_rotation(original, 1, verbose=False)
+                    if then_flip is not None:
+                        fresh = _apply(fresh, then_flip)
+                    for request in ALL_REQUESTS:
+                        with self.subTest(layout=layout, then_flip=then_flip,
+                                          request=request, **kwargs):
+                            repaired = _apply(old, request)
+                            hr.verify_structure(repaired)
+                            self._assert_in_line(repaired, hr.compose_transforms(
+                                request, t_old))
+                            self.assertEqual(bytes(repaired),
+                                             bytes(_apply(fresh, request)))
+                            after = hr.gather_info(repaired)
+                            self.assertEqual(after['left_behind_items'], [])
+                            self.assertEqual(after['tool_version'],
+                                             hr._version_tuple())
+                            self.assertNotIn('`rotate 0`',
+                                             hr.format_info(after)[0])
+                            hr.verify_reversible(repaired, verbose=False)
+                            self.assertEqual(hr.reverse_rotation(
+                                repaired, verbose=False), original)
+
+    def test_rotate_0_is_an_ordinary_rotation(self):
+        """`rotate 0` takes the same steps as any other rotation: on a
+        file last written by an older release in the same metadata
+        format, it records the running release as the one that last
+        updated the file and leaves it reversible - the display
+        unchanged."""
+        for layout in ('mdat_first', 'meta_first'):
+            for kwargs in (dict(include_irot=False),
+                           dict(include_irot=True, irot_value=3),
+                           dict(include_irot=True, irot_value=1, imir_axis=1,
+                                thumbnail='shared', tmap='own')):
+                with self.subTest(layout=layout, **kwargs):
+                    original = build_synthetic_heic(layout=layout,
+                                                    include_exif=True, **kwargs)
+                    with unittest.mock.patch.object(
+                            hr, '_version_tuple', return_value=OLDER_VERSION):
+                        old = bytes(hr.apply_rotation(original, 1, verbose=False))
+                    self.assertEqual(hr.gather_info(old)['tool_version'],
+                                     OLDER_VERSION)
+                    updated = hr.apply_rotation(old, 0, verbose=False)
+                    hr.verify_structure(updated)
+                    info = hr.gather_info(updated)
+                    self.assertEqual(info['tool_version'], hr._version_tuple())
+                    self.assertEqual(info['delta_quarter_turns'], 1)
+                    self.assertEqual(_display_state(updated),
+                                     _display_state(old))
+                    self.assertEqual(len(updated), len(old))
+                    hr.verify_reversible(updated, verbose=False)
+                    self.assertEqual(hr.reverse_rotation(updated, verbose=False),
+                                     original)
+
+    def test_cli_rotate_0_repairs_and_self_checks(self):
+        original = build_synthetic_heic(include_irot=False, thumbnail='plain',
+                                        include_exif=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path = os.path.join(tmpdir, 'old.heic')
+            out_path = os.path.join(tmpdir, 'new.heic')
+            with open(in_path, 'wb') as f:
+                f.write(_rotated_like_before_3_0_0(original, 1))
+            rc, out, err = run_cli('info', in_path)
+            self.assertEqual(rc, 1, err)
+            self.assertIn('`rotate 0`', out)
+            rc, out, err = run_cli('rotate', '0', in_path, out_path)
+            self.assertEqual(rc, 0, err)
+            self.assertIn('were not turned with it by an earlier edit', out)
+            self.assertIn('reversibility self-check passed', out)
+            with open(out_path, 'rb') as f:
+                repaired = f.read()
+            self._assert_in_line(repaired, (False, 1))
+            rc, out, err = run_cli('info', out_path)
+            self.assertEqual(rc, 1, err)
+            self.assertNotIn('`rotate 0`', out)
+            self.assertIn(f'v{hr.VERSION}', out)
+
+    def test_thumbnail_that_differed_originally_is_left_with_a_warning(self):
+        """A thumbnail that didn't have the primary's rotation/mirror
+        properties in the ORIGINAL file wasn't left behind by this tool:
+        it is not touched, and `rotate` says so, like `flip`."""
+        original = build_synthetic_heic(include_irot=True, irot_value=1,
+                                        thumbnail='plain')
+        data = original
+        for turns in (1, 0):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                data = hr.apply_rotation(data, turns)
+            self.assertIn("[warning] item 5, which goes with the primary item",
+                          out.getvalue())
+            self.assertEqual(_related_transforms(data), {5: (False, 0)})
+            self.assertEqual(hr.gather_info(data)['left_behind_items'], [])
+        self.assertEqual(_display_state(data)[0], (False, 2))
+        self.assertEqual(hr.reverse_rotation(data, verbose=False), original)
+
+
 class TestCLI(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -2783,6 +2963,39 @@ class TestRealFiles(unittest.TestCase):
                 self.assertEqual(zlib.crc32(restored) & 0xffffffff,
                                   zlib.crc32(original) & 0xffffffff)
 
+    def test_rotations_of_every_file_in_testdata(self):
+        """Every rotation (0 included), on every real file: the
+        primary's display turns by exactly the angle, the thumbnail,
+        auxiliary images and gain map stay oriented like it - also where
+        the rotation property has to be inserted - a 'tmap' item keeps
+        its own transform and the displayed size, a second rotation on
+        top composes, and `reverse` restores the exact original."""
+        files = _discover_real_test_files()
+        if not files:
+            self.skipTest("no .heic files in testdata/ - see README-test.md")
+        for fname in files:
+            with open(os.path.join(TESTDATA, fname), 'rb') as f:
+                original = f.read()
+            t0, _, tmaps0, _, _ = _display_state(original)
+            related0 = _related_transforms(original)
+            for turns in range(4):
+                with self.subTest(file=fname, turns=turns):
+                    rotated = hr.apply_rotation(original, turns, verbose=False)
+                    hr.verify_structure(rotated)
+                    # (not the Exif tag: a rotation turns whatever it
+                    # said, which in one test file isn't what the HEIF
+                    # properties say)
+                    self._check(rotated, hr.compose_irot(t0, turns),
+                                t0, related0, tmaps0, check_exif=False)
+                    self.assertEqual(
+                        hr.gather_info(rotated)['left_behind_items'], [])
+                    again = hr.apply_rotation(rotated, 1, verbose=False)
+                    self._check(again, hr.compose_irot(t0, turns + 1),
+                                t0, related0, tmaps0, check_exif=False)
+                    for data in (rotated, again):
+                        self.assertEqual(
+                            hr.reverse_rotation(data, verbose=False), original)
+
     def test_flips_of_every_file_in_testdata(self):
         """Every request with a flip, on every real file: the primary's
         display changes by exactly the request, the thumbnail, auxiliary
@@ -2811,10 +3024,10 @@ class TestRealFiles(unittest.TestCase):
                         self.assertEqual(
                             hr.reverse_rotation(data, verbose=False), original)
 
-    def _check(self, data, expected, t0, related0, tmaps0):
+    def _check(self, data, expected, t0, related0, tmaps0, check_exif=True):
         t, displayed, tmaps, _, exif = _display_state(data)
         self.assertEqual(t, expected)
-        if exif is not None:
+        if check_exif and exif is not None:
             self.assertEqual(exif, hr.transform_to_exif_orientation(t))
         for item_id, transform in _related_transforms(data).items():
             # every real test file's related items start out oriented

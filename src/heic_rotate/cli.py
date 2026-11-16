@@ -67,10 +67,9 @@ how to rotate it: "rotate 90" always means "turn it one more quarter
 turn from however it currently displays", the same way you'd physically
 turn a printed photo in your hands. A concrete consequence: `rotate 90`
 twice in a row lands at 180 deg, not back at 90 deg. `rotate 0` is a
-true no-op for the visual orientation (adding 0 changes nothing) and is
-useful purely to add heic-lossless-rotate's tracking metadata to a file, or to
-make an implicit 0 deg orientation explicit, without altering how the
-image displays either way.
+rotation like any other, by nothing. Its use is to bring a file edited
+by an older release up to date without changing how it displays (see
+"Re-running `rotate` or `flip`" below).
 
 FLIPPING
 --------
@@ -117,6 +116,12 @@ This script implements both paths:
     are affected by the size change (only relevant if 'meta' precedes
     'mdat' in the file; harmless no-op patch otherwise).
 
+The images that go with the primary item - its thumbnail, auxiliary
+images such as depth maps, and an HDR gain map - normally carry the very
+same rotation/mirror properties as it (the same boxes, or none). Those
+that do turn with it: a changed 'irot' value is theirs too, and an
+inserted 'irot' is associated with each of them as well.
+
 A flip changes whether the primary item has an 'imir' (mirror) property:
 one is associated with it, as its last property, if it has none - reusing
 an identical box already in 'ipco', else adding one - and if it has one,
@@ -124,9 +129,8 @@ that association is removed (the box itself stays). The 'irot' value then
 supplies whatever rotation is left, and an 'irot' is inserted before the
 'imir' if the item has none, so the result is 'irot' followed by 'imir',
 the order iPhones write for mirrored photos. The images that go with the
-primary item - its thumbnail, auxiliary images such as depth maps, and
-an HDR gain map - normally carry the very same properties; those that do
-get the same changes, so they stay oriented like it.
+primary item and carry its properties (above) get the same changes, so
+they stay oriented like it.
 
 It also keeps a separate, independent legacy embedded Exif 'Orientation'
 tag (if the file has one, as an 'Exif' item referenced via 'iref') in
@@ -217,6 +221,21 @@ never overwrites the saved pristine snapshot, so `reverse` always
 undoes ALL edits back to the true original, however many times you've
 rotated it since.
 
+It also repairs what an earlier edit left behind: a thumbnail or
+auxiliary image that had the primary item's rotation/mirror properties
+in the original file and doesn't have them now is given them, before
+the requested change is applied. (Releases before 3.0.0 gave an 'irot'
+they had to insert to the primary item and the gain map only.)
+
+`rotate 0` is not a special case in any of this: it takes every step
+any other rotation does, and adds nothing to the angle. That makes it
+the way to bring a file edited by an older release up to date without
+changing how it displays - a record in an older format is replayed with
+this release's code (above), a left-behind thumbnail is repaired, the
+tool-version marker becomes this release's, and the result passes the
+self-check below before anything is written. `info` says when a file
+needs it.
+
 Every `rotate` and `flip` also runs a post-edit self-check before writing
 anything: it reverses its own freshly-produced output (not yet a file -
 see heic_rotate.core's "Byte sources") and confirms the result's CRC32
@@ -267,12 +286,12 @@ and refused with a clear error rather than silently mis-editing the file:
     the primary item, isn't rotated - `rotate` prints a warning instead
     (HDR viewers may show it misaligned). None of the real photos tested
     has this.
-  - `flip` changes the primary item and those of its thumbnail, auxiliary
-    images and gain map that have the same rotation/mirror properties as
-    it. One that doesn't is left as it is, with a warning (viewers that
-    show it may show the old orientation). This includes the thumbnail
-    of a photo that had no 'irot' until `rotate` inserted one: `rotate`
-    gives the new 'irot' to the primary item and the gain map only.
+  - `rotate` and `flip` change the primary item and those of its
+    thumbnail, auxiliary images and gain map that have the same
+    rotation/mirror properties as it. One that doesn't - and didn't in
+    the original file either - is left as it is, with a warning (viewers
+    that show it may show the old orientation). None of the real photos
+    tested has one.
   - The legacy embedded Exif Orientation sync only handles the Exif item
     being stored via an absolute file offset (iloc construction_method
     0) in the file itself (data_reference_index 0). If it's stored via
@@ -417,10 +436,9 @@ def build_parser():
                            "the file's existing rotation (0 if none) - "
                            "NOT an absolute target angle. `rotate 90` "
                            "twice lands at 180 deg, not back at 90. "
-                           "0 is a true no-op for the displayed image; "
-                           "it only adds heic-lossless-rotate's tracking "
-                           "metadata (and makes an implicit 0 deg "
-                           "orientation explicit if no 'irot' exists yet).")
+                           "0 leaves the image displayed as it is: use "
+                           "it to bring a file edited by an older "
+                           "release up to date.")
     rot.add_argument('--then-flip', type=_flip_direction, default=None,
                       metavar='{horizontal,vertical}',
                       help="after rotating, also flip the image: "
@@ -499,8 +517,7 @@ def build_parser():
                      "exit code is always non-zero: 1/2/3 for a "
                      "cumulative rotation ADDED BY THIS TOOL of "
                      "90/180/270 deg, or 4 if this tool's net "
-                     "contribution is 0 deg (e.g. `rotate 0` was used "
-                     "just to add tracking, or opposing rotations "
+                     "contribution is 0 deg (e.g. opposing rotations "
                      "cancelled out). If the image was also flipped, "
                      "the code is 4 higher: 5/6/7 for 90/180/270 deg "
                      "followed by a horizontal flip (6 is the same as a "

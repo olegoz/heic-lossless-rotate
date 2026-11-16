@@ -1655,7 +1655,67 @@ def get_rotation_from_iprp_snapshot(iprp_box_bytes, primary_item_id):
 # Main rotation logic (forward)
 # ---------------------------------------------------------------------------
 
-def _flip_primary(model, primary, related_items, request, notes, warnings):
+def _is_transform(model, assoc):
+    return model.child_type(assoc[0]) in (b'irot', b'imir')
+
+
+def _left_behind_items(model, pristine_model, primary, related_items):
+    """Those of `related_items` (see find_related_items) that had the
+    primary item's transformative properties in the ORIGINAL file
+    (`pristine_model`: the same boxes in the same order, or none on
+    either) and don't have them in `model`, the file as it is now.
+
+    Encoders orient these images like the primary, and every edit by
+    this tool is meant to keep it so. One that no longer is was left
+    behind by an earlier edit: `rotate` before 3.0.0 gave a rotation
+    property it had to INSERT (primary without an 'irot') to the primary
+    and gain-map inputs only, not to a thumbnail or other auxiliary
+    image, and a later `flip` left such an image alone as well."""
+    now = model.transform_indices(primary)
+    then = pristine_model.transform_indices(primary)
+    return [item_id for item_id in related_items
+            if model.assocs(item_id) is not None
+            and model.transform_indices(item_id) != now
+            and pristine_model.assocs(item_id) is not None
+            and pristine_model.transform_indices(item_id) == then]
+
+
+def _repair_left_behind_items(model, primary, item_ids):
+    """Give each of `item_ids` (see _left_behind_items) the primary
+    item's transformative property associations in place of its own, at
+    the position of its first one (at the end if it has none). Its other
+    properties keep their order."""
+    wanted = [a for a in model.assocs(primary) if _is_transform(model, a)]
+    for item_id in item_ids:
+        assocs = model.assocs(item_id)
+        pos = next((p for p, a in enumerate(assocs)
+                    if _is_transform(model, a)), len(assocs))
+        kept = [a for a in assocs if not _is_transform(model, a)]
+        assocs[:] = kept[:pos] + wanted + kept[pos:]
+
+
+def _related_group(model, primary, related_items, warnings, quiet_items=()):
+    """[primary] + those of `related_items` whose transformative
+    properties are the primary's own - the same boxes in the same order
+    (or none on either): the items an edit of the primary's orientation
+    applies to as one. Any other related item is left alone, with a
+    warning - unless it is in `quiet_items` (reported elsewhere)."""
+    primary_transforms = model.transform_indices(primary)
+    group = [primary]
+    for item_id in related_items:
+        if (model.assocs(item_id) is not None
+                and model.transform_indices(item_id) == primary_transforms):
+            group.append(item_id)
+        elif item_id not in quiet_items:
+            warnings.append(
+                f"item {item_id}, which goes with the primary item (a "
+                f"thumbnail, auxiliary image or gain map), doesn't have the "
+                f"same rotation/mirror properties as it - left unchanged; "
+                f"viewers that show it may show the old orientation")
+    return group
+
+
+def _flip_primary(model, primary, group, request, notes):
     """The part of _plan_iprp_edit() for a `request` that includes a
     flip: change the primary item's transformative properties in `model`
     so that its displayed image changes by exactly `request`.
@@ -1678,25 +1738,12 @@ def _flip_primary(model, primary, related_items, request, notes, warnings):
     the 'irot' value alone is preferred (always possible for a flip
     without rotation), else it is left-right.
 
-    `related_items` (see find_related_items) whose transformative
-    properties are the primary's own - the same boxes in the same order
-    - get the same changes, so they stay oriented like it; any other is
-    left alone, with a warning.
+    `group` is the primary item followed by the images that go with it
+    and have its transformative properties (see _related_group): they
+    get the same changes, so they stay oriented like it.
 
     Returns (irot_index, inserted, current_turns, new_turns)."""
     target = compose_transforms(request, model.transform(primary))
-    primary_transforms = model.transform_indices(primary)
-    group = [primary]
-    for item_id in related_items:
-        if (model.assocs(item_id) is not None
-                and model.transform_indices(item_id) == primary_transforms):
-            group.append(item_id)
-        else:
-            warnings.append(
-                f"item {item_id}, which goes with the primary item (a "
-                f"thumbnail, auxiliary image or gain map), doesn't have the "
-                f"same rotation/mirror properties as it - left unchanged; "
-                f"viewers that show it may show the old orientation")
 
     def is_imir(assoc):
         return model.child_type(assoc[0]) == b'imir'
@@ -1778,9 +1825,20 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, request, tmap_items,
     see make_request) to an IprpModel of the file's 'iprp'. A rotation
     alone changes the primary's 'irot' (in place, or appended if absent,
     exactly like the FAST/SLOW PATHs); a request with a flip is applied
-    by _flip_primary(), also to `related_items`. PLUS whatever each
-    'tmap' item derived from the primary needs to stay consistent with
-    it:
+    by _flip_primary().
+
+    Either way the change is made to the primary item AND to those of
+    `related_items` (its thumbnail, auxiliary images, gain map - see
+    find_related_items) that have its transformative properties, so
+    that they stay oriented like it (see _related_group). They normally
+    share the primary's 'irot' box and so follow a changed value
+    automatically; an 'irot' that has to be inserted is associated with
+    each of them. Before that, a related item an EARLIER edit left
+    behind is brought back in line with the primary (see
+    _left_behind_items) - on every edit, including a rotation by 0.
+
+    PLUS whatever each 'tmap' item derived from the primary needs to
+    stay consistent with it:
 
       - its other inputs (the gain map) must turn together with the
         primary. They normally share the primary's 'irot' property and
@@ -1798,8 +1856,10 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, request, tmap_items,
         'ispe' must not change).
 
     Never mutates `data`. Returns a dict: model, current_turns,
-    new_turns, tmap_changed (False if nothing beyond the primary's own
-    'irot' needed changing), notes (verbose messages), warnings."""
+    new_turns, tmap_changed and related_changed (both False if nothing
+    beyond the primary's own 'irot' needed changing: the FAST/SLOW PATHs
+    then do), repaired (ids of the left-behind items brought back in
+    line), notes (verbose messages), warnings."""
     flip, delta_turns = bool(request[0]), request[1] & 0x3
     iprp_start, _, iprp_c_start, iprp_c_end, _ = struct_info['iprp_hdr']
     primary = struct_info['primary_item_id']
@@ -1819,11 +1879,33 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, request, tmap_items,
                     data, struct_info, existing_provenance))
         return pristine_model
 
+    # -- related items an earlier edit left behind: back in line first --
+    repaired = []
+    if existing_provenance is not None and related_items:
+        primary_transforms = model.transform_indices(primary)
+        if any(model.transform_indices(item_id) != primary_transforms
+               for item_id in related_items):
+            repaired = _left_behind_items(model, get_pristine_model(),
+                                          primary, related_items)
+    if repaired:
+        _repair_left_behind_items(model, primary, repaired)
+        notes.append(f"item(s) {', '.join(map(str, repaired))}, which go "
+                     f"with the primary item (thumbnail, auxiliary images), "
+                     f"were not turned with it by an earlier edit - given "
+                     f"the primary item's rotation/mirror properties")
+    related_changed = bool(repaired)
+
+    # A rotation reports a gain-map input it can't turn in the 'tmap'
+    # loop below, in its own words.
+    group = _related_group(
+        model, primary, related_items, warnings,
+        () if flip else {i for _, inputs in tmap_items for i in inputs})
+
     sign = _rotation_sign(model.prop_types(primary))
     found = model.first_assoc(primary, b'irot')
     if flip:
         irot_index, inserted, current_turns, new_turns = _flip_primary(
-            model, primary, related_items, request, notes, warnings)
+            model, primary, group, request, notes)
     elif found is not None:
         irot_index = found[1]
         current_turns = model.payload_byte(irot_index) & 0x3
@@ -1835,10 +1917,17 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, request, tmap_items,
         current_turns = 0
         new_turns = delta_turns
         irot_index = model.append(struct.pack('>I4sB', 9, b'irot', new_turns))
-        model.assocs(primary).append((irot_index, True))
+        for item_id in group:
+            model.assocs(item_id).append((irot_index, True))
         inserted = True
         notes.append(f"inserted new 'irot' property (index {irot_index}) "
                      f"for the primary item")
+        if len(group) > 1:
+            related_changed = True
+            notes.append(f"associated it with item(s) "
+                         f"{', '.join(map(str, group[1:]))} too, which go "
+                         f"with the primary item (thumbnail, auxiliary "
+                         f"images, gain map)")
 
     for tmap_id, other_inputs in tmap_items:
         if model.assocs(tmap_id) is None:
@@ -1902,6 +1991,7 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, request, tmap_items,
 
     return {'model': model, 'current_turns': current_turns,
             'new_turns': new_turns, 'tmap_changed': tmap_changed,
+            'related_changed': related_changed, 'repaired': repaired,
             'notes': notes, 'warnings': warnings}
 
 
@@ -2184,9 +2274,11 @@ def transform_source(source, request, sync_exif=True, verbose=True):
     check the file's existing orientation first: "rotate 90" always means
     "turn it another quarter turn from however it looks now", exactly
     like rotating a physical photo in your hands - and "flip horizontal"
-    means "mirror it as it looks now". A rotation by 0 is a
-    genuine no-op for the visual orientation (see angle-0 handling below)
-    and can be used purely to add tracking metadata.
+    means "mirror it as it looks now". A rotation by 0 is not a
+    special case anywhere below: it takes every step any other rotation
+    does - the provenance record, the images that go with the primary
+    item, the replay of an older-format record - and adds nothing to
+    the orientation.
 
     `source` is the file, as a ByteSource; the edited file is returned
     as another (a PatchedSource over it), nothing written or copied.
@@ -2287,26 +2379,28 @@ def transform_source(source, request, sync_exif=True, verbose=True):
               "opposite direction so the displayed image turns the "
               "requested way")
 
-    # ---- GAIN-MAP (tmap) and FLIP PATHS: restructure 'iprp' as a whole ----
-    # Needed when the file has a 'tmap' derived image item that would be
-    # left inconsistent by changing the primary's 'irot' alone (see
-    # find_tmap_items / _plan_iprp_edit), and for every request with a
-    # flip, which adds or removes 'imir' associations - of the primary
-    # and of the images that go with it (see find_related_items). A
-    # rotation of anything else uses the minimal FAST/SLOW PATH edits
-    # below.
+    # ---- GAIN-MAP (tmap), RELATED-IMAGE and FLIP PATHS: restructure
+    # ---- 'iprp' as a whole ----
+    # Needed when changing the primary's 'irot' alone would leave another
+    # image inconsistent with it: a 'tmap' derived image item (see
+    # find_tmap_items), or an image that goes with the primary - its
+    # thumbnail, auxiliary images, gain map (see find_related_items) -
+    # which needs an inserted 'irot' too, or was left behind by an
+    # earlier edit and is brought back in line (see _plan_iprp_edit).
+    # And for every request with a flip, which adds or removes 'imir'
+    # associations. A rotation of anything else uses the minimal
+    # FAST/SLOW PATH edits below.
     tmap_items = find_tmap_items(data, meta_body_start, meta_c_end, primary_item_id)
+    related_items = find_related_items(data, meta_body_start, meta_c_end,
+                                       primary_item_id, tmap_items)
     plan = None
-    if tmap_items or flip:
-        related_items = find_related_items(
-            data, meta_body_start, meta_c_end, primary_item_id,
-            tmap_items) if flip else ()
+    if tmap_items or related_items or flip:
         plan = _plan_iprp_edit(data, struct_info, existing_provenance,
                                 request, tmap_items, related_items)
         if verbose:
             for msg in plan['warnings']:
                 print(f"[warning] {msg}")
-        if not flip and not plan['tmap_changed']:
+        if not (flip or plan['tmap_changed'] or plan['related_changed']):
             plan = None
 
     # ---- FAST PATH: existing irot already associated with primary item ----
@@ -2322,7 +2416,8 @@ def transform_source(source, request, sync_exif=True, verbose=True):
         current_turns = plan['current_turns']
         new_turns = plan['new_turns']
         new_iprp_box = plan['model'].build()
-        label = '[flip path]' if flip else '[tmap path]'
+        label = ('[flip path]' if flip else '[tmap path]' if tmap_items
+                 else '[related path]')
         if verbose:
             print(f"{label} 'irot' {current_turns * 90} deg -> "
                   f"{new_turns * 90} deg")
@@ -2358,16 +2453,10 @@ def transform_source(source, request, sync_exif=True, verbose=True):
         current_turns = 0  # absence of 'irot' implies 0 deg per spec
         new_turns = (current_turns + delta_turns) % 4
         if verbose:
-            if delta_turns == 0:
-                print("[angle 0] no 'irot' property exists yet - inserting "
-                      "an explicit irot=0 (this matches the orientation "
-                      "already implied by its absence, so the actual "
-                      "displayed orientation does not change)")
-            else:
-                print(f"[slow path] no 'irot' property associated with the "
-                      f"primary item (implied 0 deg) - inserting one with "
-                      f"{new_turns * 90} deg after applying the "
-                      f"{delta_turns * 90} deg delta")
+            print(f"[slow path] no 'irot' property associated with the "
+                  f"primary item (implied 0 deg) - inserting one with "
+                  f"{new_turns * 90} deg after applying the "
+                  f"{delta_turns * 90} deg delta")
 
         new_irot_box = struct.pack('>I4sB', 9, b'irot', new_turns)
         new_ipco_content = data[ipco_c_start:ipco_c_end] + new_irot_box
@@ -3032,6 +3121,13 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
                                  a 'tmap' (HDR gain-map) image derived
                                  from the primary item (see
                                  find_tmap_items)
+      left_behind_items       : (latest-format record whose original
+                                 'iprp' can be rebuilt) ids of the
+                                 thumbnail/auxiliary image items an
+                                 earlier edit didn't turn with the
+                                 primary item, which the next edit -
+                                 e.g. `rotate 0` - brings back in line
+                                 (see _left_behind_items)
     """
     _, data = load_span(as_source(data))
     current_quarter_turns = get_current_rotation(data)
@@ -3076,8 +3172,16 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
             pristine_iprp = _pristine_iprp_bytes(data, info, entries)
             original_quarter_turns = get_rotation_from_iprp_snapshot(
                 pristine_iprp, info['primary_item_id'])
-            result['original_mirror'] = mirror_axes(
-                IprpModel.from_box(pristine_iprp))
+            pristine_model = IprpModel.from_box(pristine_iprp)
+            result['original_mirror'] = mirror_axes(pristine_model)
+            result['left_behind_items'] = _left_behind_items(
+                IprpModel(data, iprp_hdr[0], iprp_hdr[2], iprp_hdr[3]),
+                pristine_model, info['primary_item_id'],
+                find_related_items(
+                    data, info['meta_body_start'], info['meta_hdr'][3],
+                    info['primary_item_id'], find_tmap_items(
+                        data, info['meta_body_start'], info['meta_hdr'][3],
+                        info['primary_item_id'])))
         except (BoxParseError, ProvenanceError, KeyError):
             pass
     elif b'OPRP' in entries:
@@ -3177,6 +3281,10 @@ def format_info(result, quiet=False):
                       f"this tool added specifically)")
     if result.get('has_gain_map'):
         lines.append("  HDR photo with a gain map ('tmap' image)")
+    if result.get('left_behind_items'):
+        lines.append("  a thumbnail or auxiliary image was not turned with "
+                     "the main image by an earlier release: `rotate 0` (or "
+                     "any other rotation or flip) repairs it")
     if result['version'] < FORMAT_VERSION:
         lines.append(f"  metadata format is older than this release's "
                       f"(v{FORMAT_VERSION}): `rotate 0` brings the file up "
@@ -3198,9 +3306,8 @@ def format_info(result, quiet=False):
     # record exists, the file has been through this tool and we always
     # report a distinct, non-zero code based on what THIS TOOL added:
     # 1/2/3 for a cumulative delta of 90/180/270 deg, or 4 if the tool's
-    # net contribution is 0 deg (e.g. `rotate 0` was used just to add
-    # tracking/container without changing orientation, a `rotate 90` was
-    # later cancelled out by `rotate 270`, or OPRP was unavailable above).
+    # net contribution is 0 deg (e.g. a `rotate 90` was later cancelled
+    # out by `rotate 270`, or OPRP was unavailable above).
     # The same plus 4 if that rotation is followed by a horizontal flip:
     # 5/6/7 for 90/180/270 deg then a flip (6 is a vertical flip), 8 for
     # a horizontal flip alone. So code % 4 is always the quarter turns,
