@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be the input file itself.
 
 ### Fixed
+- `rotate` on a photo with no rotation property left its thumbnail and
+  auxiliary images (such as depth maps) in the old orientation. They now
+  turn with the main image. A file rotated by an earlier release is
+  repaired by its next edit: `rotate 0` does it without changing the
+  photo, and `info` says which files need it.
 - A file with a top-level box that may refer to data an edit moves
   (such as `moov`) is refused (`52`), instead of being written with
   that box pointing at the wrong place. A file with Exif data inside

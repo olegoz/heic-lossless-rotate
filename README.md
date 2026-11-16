@@ -38,7 +38,6 @@ No third-party dependencies. Python 3 standard library only.
   - [`info`](#info)
 - [How rotation values map to the container format](#how-rotation-values-map-to-the-container-format)
 - [Options](#options)
-  - [`--proceed-unsafe`](#--proceed-unsafe)
 - [Errors and exit codes](#errors-and-exit-codes)
 - [Known limitations](#known-limitations)
 - [Development install](#development-install)
@@ -419,6 +418,14 @@ state captured on the very first edit is never overwritten, so `reverse`
 can always undo every edit made since, no matter how many times you've
 rotated the file.
 
+A photo's thumbnail, its auxiliary images (such as depth maps) and its
+HDR gain map normally carry the very same rotation and mirror properties
+as the main image, or none where it has none. Those that do turn with
+it. Releases before 3.0.0 left the thumbnail and auxiliary images behind
+when they had to add a rotation property to a photo that had none. The
+next edit of such a file, of any kind, first brings them back in line
+with the main image.
+
 Before writing anything, `rotate` (and `flip`) checks that its output
 can be reversed: it reverses the output and compares the result
 with the original file's recorded checksum. If they don't match, it
@@ -437,12 +444,18 @@ instead first restores the original file (checked against the recorded
 checksum). It then rotates the original with the current version's code
 by the angle the older release was asked to add, plus N. For example,
 270° plus `rotate 180` gives 90°, since a total of 360° or more wraps
-around. So `rotate 0` brings a file rotated by an older release up to
-date, including any fixes made since, and keeps the rotation you asked
-for. If the original can't be restored, `rotate` writes nothing. Its
+around. If the original can't be restored, `rotate` writes nothing. Its
 error names the release to recover the original with (see
 [`reverse`](#reverse) below), and the combined angle to rotate it by
 with the latest release.
+
+`rotate 0` is a rotation like any other, by nothing: it does everything
+described above and leaves the photo displayed as it is. That makes it
+the way to bring a file edited by an older release up to date, keeping
+the rotation you asked for. A record in an older format is rebuilt from
+the original, a thumbnail left behind is repaired, the recorded tool
+version becomes the current one, and the result is checked to be
+reversible. `info` says when a file needs it.
 
 ### `flip`
 
@@ -470,11 +483,10 @@ The result is always a rotation followed by a mirror, which is the order
 iPhones write for mirrored photos. A flip on its own doesn't change the
 `irot` value of an unmirrored image.
 
-A photo's thumbnail, its auxiliary images (such as depth maps) and its
-HDR gain map normally carry the very same rotation and mirror properties
-as the main image. Those that do get the same changes, so they stay
-oriented like it. See [Known limitations](#known-limitations) for those
-that don't.
+As with a rotation, a photo's thumbnail, auxiliary images and HDR gain
+map get the same changes as the main image when they carry the very
+same rotation and mirror properties, so they stay oriented like it. See
+[Known limitations](#known-limitations) for those that don't.
 
 The legacy Exif `Orientation` tag is kept in sync here too, using its
 mirrored values (2, 4, 5 and 7) when the result is mirrored.
@@ -542,7 +554,9 @@ and `info` reports 90. A file rotated by an older release that displayed
 it wrongly (mirrored photos, before 2.0.0) can look different from what
 `info` reports. `info` then says the metadata is in an older format, and
 `rotate 0` brings the file up to date by re-applying the reported
-rotation with the latest release's code.
+rotation with the latest release's code. `info` also says when a
+thumbnail or auxiliary image was not turned with the main image by a
+release before 3.0.0, which `rotate 0`, like any other edit, repairs.
 
 If you have flipped the file, `info` reports the total as a rotation
 followed by a flip, the same form `rotate --then-flip` takes, so you can
@@ -655,7 +669,7 @@ with its result, so a script can branch on it without parsing text output:
 |---|---|
 | `0` | No provenance record found — this tool has never touched the file |
 | `1` / `2` / `3` | This tool's cumulative contribution is `90°` / `180°` / `270°` |
-| `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. `rotate 0` was used just to add tracking, or opposing rotations or flips cancelled out) |
+| `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. opposing rotations or flips cancelled out) |
 | `5` / `6` / `7` | As `1` / `2` / `3`, followed by a horizontal flip: `90°` / `180°` / `270°`, then flipped. `6` is the same as a vertical flip alone |
 | `8` | This tool's cumulative contribution is a horizontal flip alone |
 
@@ -740,13 +754,12 @@ refused with a clear error rather than silently mis-editing the file:
   isn't shared with the main image, the gain map isn't rotated: `rotate`
   prints a warning, and HDR viewers may show it misaligned. No phone
   photo tested is built like this.
-- `flip` changes the main image, and those of its thumbnail, auxiliary
-  images and gain map that have the same rotation and mirror properties
-  as it. One that doesn't is left as it is: `flip` prints a warning, and
-  a viewer that shows that image may show the old orientation. This
-  includes the thumbnail of a photo that had no rotation property until
-  `rotate` added one, since `rotate` gives the new property to the main
-  image and the gain map only.
+- `rotate` and `flip` change the main image, and those of its
+  thumbnail, auxiliary images and gain map that have the same rotation
+  and mirror properties as it. One that doesn't, and didn't in the
+  original file either, is left as it is: the command prints a warning,
+  and a viewer that shows that image may show the old orientation. No
+  phone photo tested is built like this.
 - The legacy embedded Exif `Orientation` sync only handles the Exif item
   being stored via an absolute file offset in the file itself. If it's
   stored via `idat`, another item's data or a data reference (`dref`,

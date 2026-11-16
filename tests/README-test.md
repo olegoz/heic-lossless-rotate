@@ -118,7 +118,7 @@ same as heic-lossless-rotate itself. Requires Python 3.
    (Since 2.0.0, real records from older releases are in an older
    format and are replayed from the original instead - see
    `TestProvenanceFormats`.) Includes a `rotate 0` case,
-   confirming that command can be used purely to bring an old file's
+   confirming that a rotation by 0 brings an old file's
    metadata up to date without touching its displayed rotation, and a
    mocked-failure case confirming `rotate` writes nothing at all if the
    self-check ever fails.
@@ -205,7 +205,8 @@ same as heic-lossless-rotate itself. Requires Python 3.
 
 4. **Real-file tests** (`TestRealFiles`) - round-trips every `.heic` file
    found in `testdata/`, skipped cleanly if that directory is empty. Every
-   request with a flip is applied to each file too, checking that the
+   rotation and every request with a flip is applied to each file too,
+   checking that the
    display changes by exactly the request, that the thumbnail, auxiliary
    images and gain map stay oriented like the main image, that a `tmap`
    item keeps its own transform and the displayed size, that a second
@@ -403,6 +404,26 @@ same as heic-lossless-rotate itself. Requires Python 3.
    reference to the main image. `'shared'` gives it the main image's
    `irot`/`imir` properties, as real encoders do; `'plain'` gives it
    none.
+
+9. **Thumbnails and rotation** (`TestRelatedImagesFollowRotation`).
+   - **Inserted rotation property.** Rotating a photo with no `irot`
+     gives the new one to the thumbnail and gain map too, with and
+     without a mirror property and a `tmap` item. They stay in line
+     through later rotations and flips, and `reverse` restores the
+     original.
+   - **Repair.** Releases before 3.0.0 are reproduced by hiding the
+     related images from the edit (mocking `find_related_items`) and
+     recording version 2.0.0. Every request on such a file, a rotation
+     by 0 included, must give exactly the bytes of the same edits made
+     with this release from the original. `info` must point at
+     `rotate 0` before the repair and not after.
+   - **`rotate 0` is an ordinary rotation.** On a file last written by
+     an older release in the same format it records the running
+     release, leaves the display and file size alone, and stays
+     reversible. A CLI run checks the repair message and the
+     self-check.
+   - **Not repaired.** A thumbnail that differed from the main image in
+     the original is left alone, with a warning from `rotate`.
 
 ## Adding your own files to `testdata/`
 
