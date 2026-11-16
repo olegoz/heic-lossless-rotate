@@ -103,7 +103,7 @@ class NewerVersionError(ProvenanceError):
     """Refusing a file because a later release of heic-lossless-rotate
     produced something in it this release doesn't support: a newer
     provenance format, record entries it doesn't know, or a requested
-    change it can't handle (mirroring), so scripts can tell "update the
+    change it doesn't understand, so scripts can tell "update the
     tool" apart from other errors."""
     exit_code = EXIT_NEWER_RELEASE
 
@@ -301,7 +301,7 @@ FORMAT_VERSION = 3
 # case). v3: only the 'ipma' associations (OIPD) and 'ipco' children
 # (OIPC) that changed - see iprp_diff_entries - plus the requested change
 # to the displayed image, rotation and mirroring (REQT - see
-# requested_transform); see apply_rotation()'s
+# requested_transform); see transform_source()'s
 # "Update / create the provenance box" section and
 # _pristine_iprp_bytes() for what each format actually stores and how
 # each is reconstructed. Kept as its own constant (rather than inlining
@@ -831,6 +831,69 @@ def transform_to_exif_orientation(transform):
     return IROT_TO_EXIF_ORIENTATION[turns & 0x3]
 
 
+# ---------------------------------------------------------------------------
+# Requests: what `rotate` and `flip` are asked to do to the displayed image
+# ---------------------------------------------------------------------------
+#
+# A request is a (flip, turns) transform like any other (see above). Users
+# give and read it the other way round, as "rotate, then flip": a rotation
+# of 0/90/180/270 deg counter-clockwise, optionally FOLLOWED by a flip -
+# `rotate <angle> --then-flip <direction>` on the command line, and the
+# same form in `info` and in messages, so that what is reported can be
+# typed back in. The order matters: rotating by 90 deg and then flipping
+# differs by a half turn from flipping first.
+#
+# "Horizontal" swaps left and right (a mirror image; Exif "mirror
+# horizontal"); "vertical" swaps top and bottom.
+
+FLIP_HORIZONTAL = (True, 0)
+FLIP_VERTICAL = (True, 2)   # == a horizontal flip followed by a half turn
+FLIP_REQUESTS = {'horizontal': FLIP_HORIZONTAL, 'vertical': FLIP_VERTICAL}
+
+
+def make_request(turns, then_flip=None):
+    """The request "rotate by `turns` quarter-turns counter-clockwise,
+    then flip `then_flip`" ('horizontal', 'vertical' or None)."""
+    request = (False, turns & 0x3)
+    if then_flip is not None:
+        request = compose_transforms(FLIP_REQUESTS[then_flip], request)
+    return request
+
+
+def rotate_then_flip(transform):
+    """`transform` as (turns, flipped): rotate by `turns` quarter-turns
+    counter-clockwise, THEN - if `flipped` - flip horizontally. The
+    inverse of make_request(turns, 'horizontal' if flipped else None)."""
+    flip, turns = transform
+    return ((-turns) & 0x3 if flip else turns & 0x3), bool(flip)
+
+
+def describe_transform(transform):
+    """`transform` in words, in "rotate, then flip" form: '90 deg',
+    'horizontal flip', 'vertical flip' (180 deg, then a horizontal flip)
+    or '90 deg, then horizontal flip'."""
+    turns, flipped = rotate_then_flip(transform)
+    if not flipped:
+        return f"{turns * 90} deg"
+    if turns == 0:
+        return "horizontal flip"
+    if turns == 2:
+        return "vertical flip"
+    return f"{turns * 90} deg, then horizontal flip"
+
+
+def transform_command(transform):
+    """The command (without file names) that requests `transform`."""
+    turns, flipped = rotate_then_flip(transform)
+    if not flipped:
+        return f"rotate {turns * 90}"
+    if turns == 0:
+        return "flip horizontal"
+    if turns == 2:
+        return "flip vertical"
+    return f"rotate {turns * 90} --then-flip horizontal"
+
+
 def _rotation_sign(prop_types):
     """+1 or -1: the direction in which the DISPLAYED image turns when the
     value of the first 'irot' in `prop_types` (an item's associated
@@ -892,6 +955,28 @@ def find_tmap_items(data, meta_body_start, meta_c_end, primary_item_id):
         if reftype == b'dimg' and from_id in tmap_ids and primary_item_id in to_ids:
             result.append((from_id, [i for i in to_ids if i != primary_item_id]))
     return result
+
+
+def find_related_items(data, meta_body_start, meta_c_end, primary_item_id,
+                       tmap_items=()):
+    """Item ids of the images that go with the primary item and are
+    shown in its place or together with it: its thumbnails ('thmb'
+    references to it), its auxiliary images ('auxl': depth maps, mattes,
+    the HDR gain map) and the other inputs of the 'tmap' items derived
+    from it (`tmap_items`, see find_tmap_items) - never those 'tmap'
+    items themselves, whose own transform stays as it is.
+
+    Encoders give these the primary's own transformative properties
+    (the very same 'irot'/'imir' boxes), so that they are oriented like
+    it. A flip keeps it that way (see _plan_iprp_edit)."""
+    tmap_ids = {tmap_id for tmap_id, _ in tmap_items}
+    related = {i for _, inputs in tmap_items for i in inputs}
+    iref_hdr = find_child(data, meta_body_start, meta_c_end, b'iref')
+    if iref_hdr is not None:
+        for reftype, from_id, to_ids in parse_iref(data, iref_hdr[2], iref_hdr[3]):
+            if reftype in (b'thmb', b'auxl') and primary_item_id in to_ids:
+                related.add(from_id)
+    return sorted(related - tmap_ids - {primary_item_id})
 
 
 class IprpModel:
@@ -968,6 +1053,20 @@ class IprpModel:
     def repoint(self, item_id, pos, new_index):
         assocs = self.assocs(item_id)
         assocs[pos] = (new_index, assocs[pos][1])
+
+    def transform_indices(self, item_id):
+        """The item's transformative properties ('irot', 'imir'), as
+        property indices in the order they are applied."""
+        return [i for i, _ in (self.assocs(item_id) or [])
+                if self.child_type(i) in (b'irot', b'imir')]
+
+    def find_child(self, box_bytes):
+        """Index of the first property that is exactly `box_bytes`, or
+        None."""
+        for index, child in enumerate(self.children, 1):
+            if child == box_bytes:
+                return index
+        return None
 
     def transform(self, item_id):
         t = (False, 0)
@@ -1403,24 +1502,25 @@ def check_known_entries(version, entries, command, proceed_unsafe=False,
     case `command` ('info' or 'reverse') proceeds after reporting it via
     report_overridden(). Callers must use the returned entries, so an ignored
     tag can't still affect how the record is read (e.g. a v3 tag in an
-    older record). `rotate` can't be overridden: it would drop them.
-    Raises UnknownEntriesError (NewerVersionError for `rotate`), naming
-    the release that wrote them."""
+    older record). `rotate` and `flip` can't be overridden: they would
+    drop them. Raises UnknownEntriesError (NewerVersionError for
+    `rotate`/`flip`), naming the release that wrote them."""
     known = RECORD_TAGS[version]
     unknown = sorted(set(entries) - known)
     if not unknown:
         return entries
     problem = (f"its metadata has entries this release doesn't know "
                f"({', '.join(t.decode('ascii', 'replace') for t in unknown)})")
-    if proceed_unsafe and command != 'rotate':
+    editing = command in ('rotate', 'flip')
+    if proceed_unsafe and not editing:
         report_overridden(newer_version_error(problem, entries,
                                               "Ignoring them",
                                               UnknownEntriesError),
                           report=report)
         return {tag: value for tag, value in entries.items() if tag in known}
-    if command == 'rotate':
-        raise newer_version_error(problem, entries,
-                                  "Update heic-lossless-rotate to rotate it")
+    if editing:
+        raise newer_version_error(
+            problem, entries, f"Update heic-lossless-rotate to {command} it")
     raise newer_version_error(
         problem, entries,
         f"Update heic-lossless-rotate, or re-run `{command}` with "
@@ -1555,11 +1655,132 @@ def get_rotation_from_iprp_snapshot(iprp_box_bytes, primary_item_id):
 # Main rotation logic (forward)
 # ---------------------------------------------------------------------------
 
-def _plan_iprp_edit(data, struct_info, existing_provenance, delta_turns, tmap_items):
-    """Apply the rotation to an IprpModel of the file's 'iprp' - the
-    primary's 'irot' (changed in place, or appended if absent, exactly
-    like the FAST/SLOW PATHs) PLUS whatever each 'tmap' item derived from
-    the primary needs to stay consistent with it:
+def _flip_primary(model, primary, related_items, request, notes, warnings):
+    """The part of _plan_iprp_edit() for a `request` that includes a
+    flip: change the primary item's transformative properties in `model`
+    so that its displayed image changes by exactly `request`.
+
+    Whether an item is mirrored can't be changed by editing a property
+    in place (an 'imir' has no "not mirrored" value), so the 'imir'
+    ASSOCIATION is added or removed:
+      - not mirrored yet: an 'imir' is associated as the item's LAST
+        property, so that it applies after everything else - a flip of
+        the image as displayed. An identical 'imir' box already in
+        'ipco' is reused, otherwise one is appended.
+      - mirrored: its (last) 'imir' association is removed. The box
+        itself stays in 'ipco': other items may use it, and 'ipco'
+        children are never removed (see IprpModel).
+    The value of the item's (first) 'irot' then supplies whatever
+    rotation the request still needs. If the item has no 'irot', one is
+    inserted first, BEFORE any 'imir' - so an item that had at most one
+    of each ends up with 'irot' followed by 'imir', the order iPhones
+    write for mirrored photos. For a new 'imir', the axis that leaves
+    the 'irot' value alone is preferred (always possible for a flip
+    without rotation), else it is left-right.
+
+    `related_items` (see find_related_items) whose transformative
+    properties are the primary's own - the same boxes in the same order
+    - get the same changes, so they stay oriented like it; any other is
+    left alone, with a warning.
+
+    Returns (irot_index, inserted, current_turns, new_turns)."""
+    target = compose_transforms(request, model.transform(primary))
+    primary_transforms = model.transform_indices(primary)
+    group = [primary]
+    for item_id in related_items:
+        if (model.assocs(item_id) is not None
+                and model.transform_indices(item_id) == primary_transforms):
+            group.append(item_id)
+        else:
+            warnings.append(
+                f"item {item_id}, which goes with the primary item (a "
+                f"thumbnail, auxiliary image or gain map), doesn't have the "
+                f"same rotation/mirror properties as it - left unchanged; "
+                f"viewers that show it may show the old orientation")
+
+    def is_imir(assoc):
+        return model.child_type(assoc[0]) == b'imir'
+
+    found = model.first_assoc(primary, b'irot')
+    inserted = found is None
+    if inserted:
+        current_turns = 0
+        irot_index = model.append(struct.pack('>I4sB', 9, b'irot', 0))
+        for item_id in group:
+            assocs = model.assocs(item_id)
+            pos = next((p for p, a in enumerate(assocs) if is_imir(a)),
+                       len(assocs))
+            assocs.insert(pos, (irot_index, True))
+        notes.append(f"inserted new 'irot' property (index {irot_index}) "
+                     f"for the primary item")
+    else:
+        irot_index = found[1]
+        current_turns = model.payload_byte(irot_index) & 0x3
+
+    def transform_with(turns, new_axis=None):
+        """The primary's transform if 'irot' `irot_index` held `turns`
+        and an 'imir' of `new_axis` were appended."""
+        t = (False, 0)
+        for index, _ in model.assocs(primary):
+            ptype = model.child_type(index)
+            if ptype == b'irot':
+                t = compose_irot(t, turns if index == irot_index
+                                 else model.payload_byte(index) & 0x3)
+            elif ptype == b'imir':
+                t = compose_imir(t, model.payload_byte(index) & 0x1)
+        if new_axis is not None:
+            t = compose_imir(t, new_axis)
+        return t
+
+    other_turns = [k for k in range(4) if k != current_turns]
+    mirrors = [a[0] for a in model.assocs(primary) if is_imir(a)]
+    if mirrors:
+        removed = mirrors[-1]
+        for item_id in group:
+            assocs = model.assocs(item_id)
+            del assocs[max(p for p, a in enumerate(assocs) if a[0] == removed)]
+        candidates = [(k, None) for k in [current_turns] + other_turns]
+        notes.append(f"removed the 'imir' association (property {removed}, "
+                     f"which stays in 'ipco')")
+    else:
+        candidates = ([(current_turns, 1), (current_turns, 0)]
+                      + [(k, 1) for k in other_turns])
+    choice = next((c for c in candidates if transform_with(*c) == target), None)
+    if choice is None:
+        raise BoxParseError(
+            "the primary item's rotation/mirror properties are arranged in "
+            "a way this tool can't flip - not supported")
+    new_turns, axis = choice
+    if axis is not None:
+        imir_box = struct.pack('>I4sB', 9, b'imir', axis)
+        imir_index = model.find_child(imir_box)
+        how = "existing"
+        if imir_index is None:
+            imir_index = model.append(imir_box)
+            how = "new"
+        for item_id in group:
+            model.assocs(item_id).append((imir_index, True))
+        notes.append(f"associated {how} 'imir' property (index {imir_index}, "
+                     f"{'left-right' if axis else 'top-bottom'}) with the "
+                     f"primary item")
+    if new_turns != current_turns:
+        model.set_payload_byte(irot_index, new_turns)
+    if len(group) > 1:
+        notes.append(f"same changes for item(s) "
+                     f"{', '.join(map(str, group[1:]))}, which go with the "
+                     f"primary item (thumbnail, auxiliary images, gain map)")
+    return irot_index, inserted, current_turns, new_turns
+
+
+def _plan_iprp_edit(data, struct_info, existing_provenance, request, tmap_items,
+                    related_items=()):
+    """Apply `request` (a (flip, turns) change to the displayed image,
+    see make_request) to an IprpModel of the file's 'iprp'. A rotation
+    alone changes the primary's 'irot' (in place, or appended if absent,
+    exactly like the FAST/SLOW PATHs); a request with a flip is applied
+    by _flip_primary(), also to `related_items`. PLUS whatever each
+    'tmap' item derived from the primary needs to stay consistent with
+    it:
 
       - its other inputs (the gain map) must turn together with the
         primary. They normally share the primary's 'irot' property and
@@ -1579,6 +1800,7 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, delta_turns, tmap_it
     Never mutates `data`. Returns a dict: model, current_turns,
     new_turns, tmap_changed (False if nothing beyond the primary's own
     'irot' needed changing), notes (verbose messages), warnings."""
+    flip, delta_turns = bool(request[0]), request[1] & 0x3
     iprp_start, _, iprp_c_start, iprp_c_end, _ = struct_info['iprp_hdr']
     primary = struct_info['primary_item_id']
     model = IprpModel(data, iprp_start, iprp_c_start, iprp_c_end)
@@ -1599,7 +1821,10 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, delta_turns, tmap_it
 
     sign = _rotation_sign(model.prop_types(primary))
     found = model.first_assoc(primary, b'irot')
-    if found is not None:
+    if flip:
+        irot_index, inserted, current_turns, new_turns = _flip_primary(
+            model, primary, related_items, request, notes, warnings)
+    elif found is not None:
         irot_index = found[1]
         current_turns = model.payload_byte(irot_index) & 0x3
         new_turns = (current_turns + sign * delta_turns) % 4
@@ -1622,7 +1847,8 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, delta_turns, tmap_it
             continue
 
         # -- its other inputs (gain map) turn together with the primary --
-        for input_id in other_inputs:
+        # (a flip has dealt with them already: they are related items)
+        for input_id in ([] if flip else other_inputs):
             in_irot = model.first_assoc(input_id, b'irot')
             if in_irot is not None and in_irot[1] == irot_index:
                 continue  # shares the primary's 'irot' - already follows it
@@ -1739,9 +1965,9 @@ def encode_requested_transform(transform):
 
     One mirror bit covers every orientation: a top-bottom flip is a
     left-right flip followed by a half turn, (True, 2), so the 8 values
-    are exactly the 8 orientations Exif Orientation can describe. This
-    release only ever writes flip == False; mirroring is reserved for a
-    later one."""
+    are exactly the 8 orientations Exif Orientation can describe.
+    Releases before 3.0.0 only ever wrote flip == False, and refuse a
+    record with the mirror bit set."""
     flip, turns = transform
     return bytes([(0x4 if flip else 0) | (turns & 0x3)])
 
@@ -1749,21 +1975,17 @@ def encode_requested_transform(transform):
 def check_request_supported(entries):
     """Raise NewerVersionError unless the REQT entry in a record's
     `entries` is one this release can handle: a single byte with the
-    mirror bit and reserved bits clear. Called by every command
-    (`rotate`, `reverse`, `info`), so a file a later release has
-    mirrored - or recorded something newer in REQT for - is refused with
-    a clear message rather than misreported, rotated around its
-    mirroring or reversed by a release that doesn't know what the record
-    means."""
+    reserved bits clear. Called by every command (`rotate`, `flip`,
+    `reverse`, `info`), so a file a later release has recorded
+    something newer in REQT for is refused with a clear message rather
+    than misreported, edited or reversed by a release that doesn't know
+    what the record means. (Releases before 3.0.0 refused the mirror
+    bit here too: they couldn't flip.)"""
     value = entries[b'REQT']
     if len(value) != 1 or value[0] & ~0x7:
         raise newer_version_error(
             "its metadata records a change this release doesn't understand "
             "(unexpected REQT entry - or the metadata is corrupt)", entries)
-    if value[0] & 0x4:
-        raise newer_version_error(
-            "it was mirrored, which this release doesn't support yet",
-            entries)
 
 
 def decode_requested_transform(entries):
@@ -1798,9 +2020,8 @@ def requested_transform(record_version, entries, original_turns, current_turns):
         delta), or None if either 'irot' value is unknown.
       v3: stored explicitly in REQT, so that it's known independently of
         how 'irot'/'imir' were edited to achieve it - a future release
-        that fixes a bug in that, or adds mirroring, replays it as is.
-        Raises if it includes mirroring, which this release doesn't
-        support (see check_request_supported).
+        that fixes a bug in that replays it as is. May include a flip
+        (releases from 3.0.0 on).
     Raises ProvenanceError for a format it doesn't know - add a case
     here whenever FORMAT_VERSION is bumped, before records of the
     previous format get replayed (see _replay_from_original)."""
@@ -1834,8 +2055,8 @@ def _mirrored_after_rotation(data):
     return _rotation_sign(model.prop_types(info['primary_item_id'])) < 0
 
 
-def _recorded_rotation(data, record_version, entries, original=None):
-    """The rotation (0-3 quarter turns) requested_transform() says was
+def _recorded_request(data, record_version, entries, original=None):
+    """The change, as (flip, turns), requested_transform() says was
     requested for `data` (see load_span), a file with a format
     `record_version` provenance record holding `entries`. The original
     'irot' value (only needed for formats that don't store the request)
@@ -1851,43 +2072,48 @@ def _recorded_rotation(data, record_version, entries, original=None):
         original_turns = get_rotation_from_iprp_snapshot(
             _pristine_iprp_bytes(data, info, entries), info['primary_item_id'])
     return requested_transform(record_version, entries, original_turns,
-                               get_current_rotation(data))[1]
+                               get_current_rotation(data))
 
 
-def _replay_from_original(source, data, record_version, entries, delta_turns,
+def _replay_from_original(source, data, record_version, entries, request,
                           sync_exif, verbose):
-    """rotate_source() for a file (`source`; `data` is its load_span())
-    whose provenance record is in an OLDER
+    """transform_source() for a file (`source`; `data` is its
+    load_span()) whose provenance record is in an OLDER
     format than FORMAT_VERSION: rather than carrying forward (and having
     to repair) state written by an older release, restore the original
     file with `reverse` - which verifies it against the recorded
-    original-file CRC - and rotate it with this release's code by the
-    rotation the older release added plus `delta_turns`, mod 4: the same
-    as a single first edit of the original by that total angle.
+    original-file CRC - and edit it with this release's code by the
+    change the older release was asked for followed by `request` (for
+    two rotations, the angles add up mod 4): the same as a single first
+    edit of the original by that total.
 
     `reverse` only reads each older format's normal final record; it
     makes no attempt to recover from bugs in the releases that wrote
     them. If it fails, nothing is written, and the user is told to
     recover the original with the release that wrote the record, then
     rotate it with the latest release (see recovery_advice)."""
-    delta_turns %= 4
     try:
         original = reverse_source(source, verbose=False)
     except NewerVersionError:
         raise
     except (ProvenanceError, BoxParseError) as e:
         try:
-            added = _recorded_rotation(data, record_version, entries)
+            added = _recorded_request(data, record_version, entries)
         except (ProvenanceError, BoxParseError):
             added = None
         if added is not None:
-            total = (added + delta_turns) % 4
-            then = (f", then run `rotate {total * 90}` on it with the "
-                    f"latest release ({added * 90} deg that release added "
-                    f"+ {delta_turns * 90} deg requested now)")
+            total = compose_transforms(request, added)
+            then = (f", then run `{transform_command(total)}` on it with the "
+                    f"latest release ({describe_transform(added)} that "
+                    f"release added + {describe_transform(request)} "
+                    f"requested now)")
+        elif request[0]:
+            then = (f", then apply to it, with the latest release, the "
+                    f"rotation that release added + "
+                    f"{describe_transform(request)} requested now")
         else:
             then = (f", then rotate it with the latest release by the "
-                    f"angle that release added + {delta_turns * 90} deg "
+                    f"angle that release added + {describe_transform(request)} "
                     f"requested now")
         message = (f"cannot upgrade this file's metadata (format "
                    f"v{record_version}): restoring the original file "
@@ -1895,15 +2121,17 @@ def _replay_from_original(source, data, record_version, entries, delta_turns,
         advice = recovery_advice(source, then)
         raise ProvenanceError(f"{message} {advice}" if advice else message
                               ) from None
-    added = _recorded_rotation(data, record_version, entries, original)
-    total = (added + delta_turns) % 4
+    added = _recorded_request(data, record_version, entries, original)
+    total = compose_transforms(request, added)
     if verbose:
         print(f"[provenance] metadata format v{record_version} predates "
               f"v{FORMAT_VERSION}: restored the original (CRC verified); "
-              f"rotating it by {total * 90} deg - the {added * 90} deg the "
-              f"earlier release added, plus the {delta_turns * 90} deg "
+              f"{'applying to it' if total[0] else 'rotating it by'} "
+              f"{describe_transform(total)} - the "
+              f"{describe_transform(added)} the "
+              f"earlier release added, plus the {describe_transform(request)} "
               f"requested now")
-    return rotate_source(original, total, sync_exif, verbose)
+    return transform_source(original, total, sync_exif, verbose)
 
 
 def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
@@ -1911,6 +2139,20 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     returns the whole rotated file as a bytearray."""
     return materialize(rotate_source(BytesSource(data), delta_turns,
                                      sync_exif, verbose))
+
+
+def apply_transform(data: bytes, request, sync_exif=True, verbose=True):
+    """transform_source() for a whole file held in memory: takes its
+    bytes, returns the whole edited file as a bytearray."""
+    return materialize(transform_source(BytesSource(data), request,
+                                        sync_exif, verbose))
+
+
+def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
+    """transform_source() for a rotation alone, by `delta_turns`
+    quarter-turns counter-clockwise."""
+    return transform_source(source, (False, delta_turns & 0x3), sync_exif,
+                            verbose)
 
 
 def _check_nothing_unsupported_moves(source, base, span_end, delta):
@@ -1931,17 +2173,22 @@ def _check_nothing_unsupported_moves(source, base, span_end, delta):
             f"the data after the 'meta' box - not supported")
 
 
-def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
-    """Rotate the image by `delta_turns` quarter-turns ON TOP OF whatever
-    rotation is already recorded (0 if none) - NOT to an absolute angle.
+def transform_source(source, request, sync_exif=True, verbose=True):
+    """Apply `request` to the image: a (flip, turns) change to how it is
+    DISPLAYED (see make_request) - a rotation by 0-3 quarter-turns
+    counter-clockwise, a flip, or both.
+
+    The change is made ON TOP OF whatever rotation and mirroring is
+    already recorded (none if absent) - NOT to an absolute orientation.
     This means the person applying a rotation never needs to know or
     check the file's existing orientation first: "rotate 90" always means
     "turn it another quarter turn from however it looks now", exactly
-    like rotating a physical photo in your hands. delta_turns=0 is a
+    like rotating a physical photo in your hands - and "flip horizontal"
+    means "mirror it as it looks now". A rotation by 0 is a
     genuine no-op for the visual orientation (see angle-0 handling below)
     and can be used purely to add tracking metadata.
 
-    `source` is the file, as a ByteSource; the rotated file is returned
+    `source` is the file, as a ByteSource; the edited file is returned
     as another (a PatchedSource over it), nothing written or copied.
     Only the 'meta' box and the provenance box are edited, in memory
     (`data`/`out` below - see load_span - whose offsets are relative to
@@ -1949,7 +2196,8 @@ def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
     recorded in the provenance box, in chunks. The one edit outside
     that span is the 2-byte embedded Exif Orientation value, which
     normally sits in 'mdat': it is a patch of its own."""
-    delta_turns &= 0x3
+    flip, delta_turns = bool(request[0]), request[1] & 0x3
+    request = (flip, delta_turns)
 
     base, data = load_span(source)
     span_end = base + len(data)
@@ -1994,10 +2242,11 @@ def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
     if struct_info['provenance_hdr'] is not None:
         record_version, existing_provenance = parse_provenance(
             data, struct_info['provenance_hdr'])
-        check_known_entries(record_version, existing_provenance, 'rotate')
+        check_known_entries(record_version, existing_provenance,
+                            'flip' if flip else 'rotate')
         if record_version < FORMAT_VERSION:
             return _replay_from_original(source, data, record_version,
-                                         existing_provenance, delta_turns,
+                                         existing_provenance, request,
                                          sync_exif, verbose)
         prior_request = decode_requested_transform(existing_provenance)
         if verbose:
@@ -2032,26 +2281,32 @@ def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
     rotation_sign = _rotation_sign(
         [ipco_children[i - 1][4] if 1 <= i <= len(ipco_children) else None
          for i, _ in primary_entry[1]])
-    if verbose and rotation_sign < 0:
+    if verbose and rotation_sign < 0 and not flip:
         print("[info] primary item is mirrored AFTER its rotation ('imir' "
               "follows 'irot') - the 'irot' value is changed in the "
               "opposite direction so the displayed image turns the "
               "requested way")
 
-    # ---- GAIN-MAP (tmap) PATH: restructure 'iprp' as a whole ----
+    # ---- GAIN-MAP (tmap) and FLIP PATHS: restructure 'iprp' as a whole ----
     # Needed when the file has a 'tmap' derived image item that would be
     # left inconsistent by changing the primary's 'irot' alone (see
-    # find_tmap_items / _plan_iprp_edit). Everything else uses the
-    # minimal FAST/SLOW PATH edits below.
+    # find_tmap_items / _plan_iprp_edit), and for every request with a
+    # flip, which adds or removes 'imir' associations - of the primary
+    # and of the images that go with it (see find_related_items). A
+    # rotation of anything else uses the minimal FAST/SLOW PATH edits
+    # below.
     tmap_items = find_tmap_items(data, meta_body_start, meta_c_end, primary_item_id)
     plan = None
-    if tmap_items:
+    if tmap_items or flip:
+        related_items = find_related_items(
+            data, meta_body_start, meta_c_end, primary_item_id,
+            tmap_items) if flip else ()
         plan = _plan_iprp_edit(data, struct_info, existing_provenance,
-                                delta_turns, tmap_items)
+                                request, tmap_items, related_items)
         if verbose:
             for msg in plan['warnings']:
                 print(f"[warning] {msg}")
-        if not plan['tmap_changed']:
+        if not flip and not plan['tmap_changed']:
             plan = None
 
     # ---- FAST PATH: existing irot already associated with primary item ----
@@ -2067,13 +2322,14 @@ def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
         current_turns = plan['current_turns']
         new_turns = plan['new_turns']
         new_iprp_box = plan['model'].build()
+        label = '[flip path]' if flip else '[tmap path]'
         if verbose:
-            print(f"[tmap path] 'irot' {current_turns * 90} deg -> "
+            print(f"{label} 'irot' {current_turns * 90} deg -> "
                   f"{new_turns * 90} deg")
             for msg in plan['notes']:
-                print(f"[tmap path] {msg}")
+                print(f"{label} {msg}")
         out, _ = _splice_iprp(data, struct_info, new_iprp_box, verbose,
-                              '[tmap path]', base)
+                              label, base)
     for prop_index, essential in ([] if plan is not None else primary_entry[1]):
         if 1 <= prop_index <= len(ipco_children):
             child = ipco_children[prop_index - 1]
@@ -2147,15 +2403,29 @@ def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
     # nothing that represents displayed orientation should be touched.
     # The tag isn't in `out`: it is patched where it sits in `source`
     # (exif_offset), as part of the result returned below.
+    #
+    # A flip always changes the orientation. Its Exif value is that of
+    # the new HEIF transform too - except, as for a rotation, where the
+    # tag said "mirrored" and the HEIF properties didn't: then the
+    # request is applied to what the tag said, so readers of either see
+    # the same change.
     exif_patches = []
-    if sync_exif and new_turns != current_turns:
+    if sync_exif and (flip or new_turns != current_turns):
         if exif_field is not None:
             iprp_now = locate_structures(out)['iprp_hdr']
             model_now = IprpModel(out, iprp_now[0], iprp_now[2], iprp_now[3])
-            if b'imir' in model_now.prop_types(primary_item_id):
-                # A mirrored HEIF transform: 'irot' alone no longer
-                # describes it, so derive the Exif value from the full
-                # (irot + imir, in 'ipma' order) transform instead.
+            if (flip and cur_value in EXIF_MIRRORED_ORIENTATION_TO_TURNS
+                    and b'imir' not in IprpModel(
+                        data, iprp_start, iprp_c_start,
+                        iprp_c_end).prop_types(primary_item_id)):
+                new_exif_orientation = transform_to_exif_orientation(
+                    compose_transforms(request, (
+                        True, EXIF_MIRRORED_ORIENTATION_TO_TURNS[cur_value])))
+            elif flip or b'imir' in model_now.prop_types(primary_item_id):
+                # A mirrored HEIF transform (or one that just stopped
+                # being mirrored): 'irot' alone doesn't describe it, so
+                # derive the Exif value from the full (irot + imir, in
+                # 'ipma' order) transform instead.
                 new_exif_orientation = transform_to_exif_orientation(
                     model_now.transform(primary_item_id))
             else:
@@ -2215,7 +2485,7 @@ def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
     # by exactly what was requested (checked against the file's state
     # just before it, not the original's, so a rotation applied by
     # another tool since doesn't count against it).
-    this_request = (False, delta_turns)
+    this_request = request
     _check_display_change(
         IprpModel(data, iprp_start, iprp_c_start, iprp_c_end).transform(
             primary_item_id),
@@ -2548,8 +2818,7 @@ def _prepare_reversal(source, proceed_unsafe, verbose):
             f"matching version of heic-lossless-rotate.")
     # REQT isn't needed to restore the original, so a record lacking it
     # (pre-release v3 builds) still reverses - but one recording a change
-    # this release doesn't support (mirroring) is refused, like
-    # everywhere else.
+    # this release doesn't understand is refused, like everywhere else.
     entries = check_known_entries(version, entries, 'reverse', proceed_unsafe,
                                   report=verbose)
     if b'REQT' in entries:
@@ -2710,10 +2979,14 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
       original_quarter_turns : 0-3, what the rotation was at the time
                                 heic-lossless-rotate FIRST touched the file
                                 (if has_provenance)
-      delta_quarter_turns    : 0-3, the rotation REQUESTED from
+      delta_quarter_turns,
+      flipped                : the change REQUESTED from
                                 heic-lossless-rotate on top of that
                                 original, cumulatively across every edit
-                                since (if has_provenance; see
+                                since, in "rotate, then flip" form (see
+                                rotate_then_flip): a rotation by 0-3
+                                quarter turns, then - if `flipped` - a
+                                horizontal flip (if has_provenance; see
                                 requested_transform) - THIS is the number
                                 that answers "what did this tool do to
                                 it", as opposed to current_quarter_turns
@@ -2747,6 +3020,14 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
                                  item's 'imir' is applied after its
                                  'irot', so the displayed image turns
                                  opposite to the raw 'irot' value
+      current_mirror,
+      original_mirror         : (if has_provenance) the axes of the
+                                 primary item's 'imir' properties now
+                                 and originally, as a tuple in the order
+                                 they apply (0 = top-bottom, 1 =
+                                 left-right; empty if not mirrored).
+                                 original_mirror is absent if the
+                                 original 'iprp' can't be rebuilt
       has_gain_map            : bool (if has_provenance) - the file has
                                  a 'tmap' (HDR gain-map) image derived
                                  from the primary item (see
@@ -2780,11 +3061,23 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
         data, info['meta_body_start'], info['meta_hdr'][3],
         info['primary_item_id']))
 
+    def mirror_axes(model):
+        return tuple(model.payload_byte(i) & 0x1
+                     for i in model.transform_indices(info['primary_item_id'])
+                     if model.child_type(i) == b'imir')
+
+    iprp_hdr = info['iprp_hdr']
+    result['current_mirror'] = mirror_axes(
+        IprpModel(data, iprp_hdr[0], iprp_hdr[2], iprp_hdr[3]))
+
     original_quarter_turns = None
     if b'OIPC' in entries:
         try:
+            pristine_iprp = _pristine_iprp_bytes(data, info, entries)
             original_quarter_turns = get_rotation_from_iprp_snapshot(
-                _pristine_iprp_bytes(data, info, entries), info['primary_item_id'])
+                pristine_iprp, info['primary_item_id'])
+            result['original_mirror'] = mirror_axes(
+                IprpModel.from_box(pristine_iprp))
         except (BoxParseError, ProvenanceError, KeyError):
             pass
     elif b'OPRP' in entries:
@@ -2806,7 +3099,8 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
     requested = requested_transform(version, entries, original_quarter_turns,
                                     current_quarter_turns)
     if requested is not None:
-        result['delta_quarter_turns'] = requested[1]
+        result['delta_quarter_turns'], result['flipped'] = \
+            rotate_then_flip(requested)
 
     if b'PCRC' in entries:
         result['pcrc'] = struct.unpack('>I', entries[b'PCRC'])[0]
@@ -2840,7 +3134,7 @@ def format_info(result, quiet=False):
     # already at 270 deg natively, then `rotate 90`, sits at 0 deg
     # absolute - but this tool only ever ADDED 90 deg to it).
     delta_qt = result.get('delta_quarter_turns')
-    delta_degrees = delta_qt * 90 if delta_qt is not None else None
+    flipped = result.get('flipped', False)
     original_qt = result.get('original_quarter_turns')
     original_degrees = original_qt * 90 if original_qt is not None else None
 
@@ -2849,9 +3143,25 @@ def format_info(result, quiet=False):
                          if tool_version is not None else "")
     lines = [f"Rotated with heic-lossless-rotate{tool_version_str}, "
              f"provenance format v{result['version']}."]
-    if delta_degrees is not None:
-        lines.append(f"  heic-lossless-rotate has added: {delta_degrees} deg")
-        if result.get('mirrored_after_rotation'):
+    if delta_qt is not None:
+        added = describe_transform(make_request(
+            delta_qt, 'horizontal' if flipped else None))
+        if flipped and delta_qt & 1:
+            # e.g. asked for as `rotate 90 --then-flip vertical`
+            added += (f" (the same as {((delta_qt + 2) & 0x3) * 90} deg, "
+                      f"then vertical flip)")
+        lines.append(f"  heic-lossless-rotate has added: {added}")
+        mirror_now = result.get('current_mirror', ())
+        mirror_then = result.get('original_mirror', mirror_now)
+        if mirror_now != mirror_then:
+            def axes(mirror):
+                return ' + '.join('left-right' if a else 'top-bottom'
+                                  for a in mirror) or 'none'
+            lines.append(f"  file's 'irot' value: {original_degrees} deg "
+                          f"originally -> {current_degrees} deg now")
+            lines.append(f"  file's mirroring ('imir'): {axes(mirror_then)} "
+                          f"originally -> {axes(mirror_now)} now")
+        elif result.get('mirrored_after_rotation'):
             lines.append(f"  file's 'irot' value: {original_degrees} deg "
                           f"originally -> {current_degrees} deg now (mirrored "
                           f"after rotating, so the displayed image turns the "
@@ -2891,7 +3201,11 @@ def format_info(result, quiet=False):
     # net contribution is 0 deg (e.g. `rotate 0` was used just to add
     # tracking/container without changing orientation, a `rotate 90` was
     # later cancelled out by `rotate 270`, or OPRP was unavailable above).
-    exit_code = delta_qt if delta_qt else 4
+    # The same plus 4 if that rotation is followed by a horizontal flip:
+    # 5/6/7 for 90/180/270 deg then a flip (6 is a vertical flip), 8 for
+    # a horizontal flip alone. So code % 4 is always the quarter turns,
+    # and code > 4 means flipped.
+    exit_code = (delta_qt if delta_qt else 4) + (4 if flipped else 0)
     return (None if quiet else text), exit_code
 
 

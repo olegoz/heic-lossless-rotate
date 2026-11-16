@@ -145,9 +145,8 @@ same as heic-lossless-rotate itself. Requires Python 3.
    covers `REQT` itself: its frozen 1-byte encoding (bit 2 = mirror,
    bits 0-1 = turns), `compose_transforms()` against
    `compose_irot`/`compose_imir`, that it accumulates every requested
-   rotation, that a record whose `REQT` includes mirroring (as a later
-   release will write) is refused by `rotate`, `reverse` and `info`
-   (API and CLI, exit 54, naming the release from `TVER`), that a record holding a tag its format
+   rotation, that the mirror bit decodes as an ordinary request (2.0.0
+   refused it; flipping is group 8), that a record holding a tag its format
    doesn't define (v3, or a v3 tag in a v1 record) is refused by
    `rotate`, `reverse` and `info`, and that `--proceed-unsafe` makes
    `info`/`reverse` ignore it - really dropping it before the record is
@@ -182,8 +181,14 @@ same as heic-lossless-rotate itself. Requires Python 3.
    was overridden; with `-q`, still naming on stderr every check it
    overrode - tamper and unknown entry - for both `reverse` and `info`),
    `--dry-run` never
-   writing a file, `info`'s exit codes (0/1/2/3/4) and its recorded-
-   tool-version line, `rotate`'s "reversibility self-check passed"
+   writing a file, `info`'s exit codes (0/1/2/3/4, and 5-8 for flipped
+   files) and its recorded-tool-version line, the `flip` command (`h`/`v`
+   and the full words in any case give the bytes the core gives for that
+   request; default output name, overwrite rules and `--dry-run` as for
+   `rotate`; usage errors), `rotate --then-flip` (wherever the option is
+   put; the same display and recorded request as the two commands run
+   one after the other; `rotate 180 --then-flip horizontal` being
+   byte-identical to `flip vertical`), `rotate`'s "reversibility self-check passed"
    message (and that `-q` suppresses it), the error exit codes - each
    kind of error exiting with its own code (`test_each_error_exits_with_
    its_own_code`: soft errors 20-22 and that their options overcome
@@ -199,8 +204,14 @@ same as heic-lossless-rotate itself. Requires Python 3.
    `info`'s.
 
 4. **Real-file tests** (`TestRealFiles`) - round-trips every `.heic` file
-   found in `testdata/`, skipped cleanly if that directory is empty. Also
-   writes 0/90/180/270 deg rotated copies of each real file found there to
+   found in `testdata/`, skipped cleanly if that directory is empty. Every
+   request with a flip is applied to each file too, checking that the
+   display changes by exactly the request, that the thumbnail, auxiliary
+   images and gain map stay oriented like the main image, that a `tmap`
+   item keeps its own transform and the displayed size, that a second
+   edit on top composes, and that `reverse` restores the original. Also
+   writes 0/90/180/270 deg rotated copies of each real file found there,
+   and three flipped ones (`_flipH`, `_flipV`, `_rot90_flipH`), to
    a `rotated/` directory (contents cleared in place and repopulated each
    run, left as-is afterward) for manual visual inspection in an image
    viewer - structural round-trip checks alone can't confirm the pixels
@@ -353,6 +364,45 @@ same as heic-lossless-rotate itself. Requires Python 3.
      main image's, as iPhones do for an unrotated photo. `'shared'`
      requires an `irot` of 0, because that's the only value an encoder
      would share.
+
+8. **Flipping** (`TestFlip`). A request is a (flip, turns) change to the
+   displayed image, given and reported as "rotate, then flip".
+   - **Requests.** `make_request`/`rotate_then_flip` are inverses and
+     cover all 8 orientations; a vertical flip is a horizontal flip plus
+     a half turn; rotating then flipping differs by a half turn from
+     flipping then rotating; the wording `info` and messages use.
+   - **Every request, on every starting layout** (no `irot`, each `irot`
+     value, a mirror on either axis and in either order, both box
+     layouts): the display changes by exactly the request, the Exif
+     Orientation matches, `REQT` and `info` (text and exit code) report
+     it, and `reverse` gets back the original. Rotation-only requests
+     give exactly the bytes `apply_rotation` gives.
+   - **Composition.** For every pair of requests, two edits give the
+     display and recorded request of the one combined edit. The same
+     request phrased two ways gives the same file.
+   - **Layout of the result.** The image ends up with an `irot`,
+     followed by an `imir` if mirrored. A flip alone leaves the `irot`
+     value. Un-mirroring an iPhone-style photo removes the association
+     and keeps the box; flipping back reuses it and gives the original
+     `iprp` byte for byte.
+   - **Related images.** A thumbnail and gain map with the main image's
+     properties follow it, also through later rotations; the `tmap`
+     item keeps an identity transform and the displayed size. One with
+     other properties is left alone, with a warning.
+   - **Exif.** All 8 Orientation values x every flip; a tag that says
+     "mirrored" where the HEIF properties don't; `sync_exif=False`.
+   - **Older records.** A v1/v2 record followed by a flip is replayed
+     as one edit of the original; if the original can't be restored the
+     error names the single command to run. Flipped v3 records replay
+     correctly after a (simulated) format bump.
+   - **Refusal.** A property arrangement that can't supply the needed
+     rotation (the same `irot` box associated twice) is refused.
+
+   `synth_heic.py` gained one parameter for this group: `thumbnail`
+   (None, `'shared'` or `'plain'`). Adds a thumbnail item with a `thmb`
+   reference to the main image. `'shared'` gives it the main image's
+   `irot`/`imir` properties, as real encoders do; `'plain'` gives it
+   none.
 
 ## Adding your own files to `testdata/`
 

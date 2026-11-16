@@ -1,12 +1,14 @@
 """
-heic-lossless-rotate - Losslessly rotate a HEIC/HEIF image by editing
-container metadata only (the 'irot' item property + a synced legacy Exif
-Orientation tag), never touching the encoded HEVC image data. Fully
-reversible.
+heic-lossless-rotate - Losslessly rotate or flip a HEIC/HEIF image by
+editing container metadata only (the 'irot' and 'imir' item properties +
+a synced legacy Exif Orientation tag), never touching the encoded HEVC
+image data. Fully reversible.
 
 USAGE
 -----
     %(prog)s rotate <0|90|180|270> <input.heic> [output.heic] [-f]
+                    [--then-flip <horizontal|vertical>]
+    %(prog)s flip <horizontal|vertical> <input.heic> [output.heic] [-f]
     %(prog)s reverse <input.heic> [output.heic] [-f] [--proceed-unsafe]
     %(prog)s info <input.heic> [--proceed-unsafe]
     %(prog)s -V | --version
@@ -15,8 +17,8 @@ The 'rotate' subcommand name may be omitted: if the first non-option
 argument is exactly '0', '90', '180', or '270', 'rotate' is assumed.
     %(prog)s 90 <input.heic> [output.heic]   # same as above
 
--q/--quiet, --dry-run, and -f/--force (rotate/reverse only) may be given
-either before or after the subcommand name. `info` is cheap and
+-q/--quiet, --dry-run, and -f/--force (rotate/flip/reverse only) may be
+given either before or after the subcommand name. `info` is cheap and
 read-only: it reports the file's current rotation and any
 heic-lossless-rotate provenance record without doing the heavier
 reconstruction/verification `reverse` does.
@@ -42,7 +44,7 @@ first one, with its code:
   50  invalid command line             54  made by a later release
   51  file can't be read or written    55  corrupt or unusable record
   52  not a valid/supported HEIF file  56  internal error (a bug)
-  53  no provenance record             57  rotate's self-check failed
+  53  no provenance record             57  rotate/flip self-check failed
 
 All of this applies with --dry-run too. If the command gets to the end,
 it exits 0 (or with `info`'s result code).
@@ -69,6 +71,24 @@ true no-op for the visual orientation (adding 0 changes nothing) and is
 useful purely to add heic-lossless-rotate's tracking metadata to a file, or to
 make an implicit 0 deg orientation explicit, without altering how the
 image displays either way.
+
+FLIPPING
+--------
+`flip horizontal` swaps left and right (a mirror image); `flip vertical`
+swaps top and bottom. `h` and `v` are accepted as short forms. Like a
+rotation, a flip is relative: it applies to the image as it is displayed
+now, on top of whatever rotation and mirroring the file already has, so
+flipping the same way twice gives back what you started with.
+
+To rotate and flip in one run, use `rotate <angle> --then-flip
+<direction>`: the rotation first, then the flip of the result. The order
+matters - rotating by 90 deg and then flipping horizontally is not the
+same as flipping first (the two differ by a half turn) - which is why
+the option says which comes first. Every orientation can be reached this
+way. `info` reports what this tool has added in the same form (e.g. "90
+deg, then horizontal flip"), so it can be typed back in.
+
+Both commands write to <input>_rotated.heic by default.
 
 -------------------------------------------------------------------------
 Everything below is internals - why this tool exists, how reversibility
@@ -97,10 +117,22 @@ This script implements both paths:
     are affected by the size change (only relevant if 'meta' precedes
     'mdat' in the file; harmless no-op patch otherwise).
 
+A flip changes whether the primary item has an 'imir' (mirror) property:
+one is associated with it, as its last property, if it has none - reusing
+an identical box already in 'ipco', else adding one - and if it has one,
+that association is removed (the box itself stays). The 'irot' value then
+supplies whatever rotation is left, and an 'irot' is inserted before the
+'imir' if the item has none, so the result is 'irot' followed by 'imir',
+the order iPhones write for mirrored photos. The images that go with the
+primary item - its thumbnail, auxiliary images such as depth maps, and
+an HDR gain map - normally carry the very same properties; those that do
+get the same changes, so they stay oriented like it.
+
 It also keeps a separate, independent legacy embedded Exif 'Orientation'
 tag (if the file has one, as an 'Exif' item referenced via 'iref') in
-sync with the new 'irot' value, since some non-HEIF-spec-strict software
-reads that instead of 'irot'.
+sync with the new orientation (the mirrored values 2/4/5/7 where the
+result is mirrored), since some non-HEIF-spec-strict software reads that
+instead of 'irot' and 'imir'.
 
 Only container/box bytes are ever touched. The 'mdat' payload (the
 actual compressed image data) is never interpreted or changed, so every
@@ -121,7 +153,8 @@ file, byte for byte:
   - the original association lists of only those items in 'ipma'
     (item -> property associations) whose list the edit changed -
     usually none, or just the primary item when an 'irot' had to be
-    inserted, or the gain-map item when it had to be given its own
+    inserted, the items a flip added an 'imir' to or removed one from,
+    or the gain-map item when it had to be given its own
     copies of boxes it shared (just an 8-byte header when nothing
     changed; the whole pristine 'ipma' box only as a fallback, if
     that can't reproduce it byte for byte), plus the original bytes
@@ -132,8 +165,8 @@ file, byte for byte:
     (an embedded ICC colour profile, say) heic-lossless-rotate never
     reads or modifies and so has no need to carry a copy of. New
     properties are only ever APPENDED to 'ipco' (a new 'irot' when the
-    file had none; the gain-map item's own copies of boxes it used to
-    share with the primary item), so `reverse` truncates 'ipco' back
+    file had none; a new 'imir' for a flip; the gain-map item's own
+    copies of boxes it used to share with the primary item), so `reverse` truncates 'ipco' back
     to its original property count, puts the saved bytes back, and
     puts the saved association lists back into 'ipma'.
   - the pristine bytes of the 'iloc' box content
@@ -164,9 +197,13 @@ file, byte for byte:
     restored, `rotate` writes nothing and says to recover the original
     with the release that wrote the record, then rotate it with the
     latest release by the combined angle.
+  - the change requested from heic-lossless-rotate so far, in total: a
+    rotation and whether the image was flipped (1 byte). This is what
+    `info` reports, and what is applied again when a record in an older
+    format is replayed (below).
   - the heic-lossless-rotate version (major.minor.patch) that most recently
     UPDATED the file - shown by `info` as "Rotated with heic-lossless-rotate
-    vX.Y.Z". Written by `rotate` only, as part of the same edit whose
+    vX.Y.Z". Written by `rotate` and `flip` only, as part of the same edit whose
     reversibility it just self-checked (see below). `reverse` verifies
     reversibility too, but never writes this marker, since reversing
     isn't an update of its own - it just undoes previous ones. This is
@@ -174,17 +211,17 @@ file, byte for byte:
     version that has ever touched it - each `rotate` overwrites it with
     the version currently running.
 
-Re-running `rotate` on an already-edited file updates only the
+Re-running `rotate` or `flip` on an already-edited file updates only the
 "current file" CRC32, the tool-version marker, and the live edit - it
 never overwrites the saved pristine snapshot, so `reverse` always
 undoes ALL edits back to the true original, however many times you've
 rotated it since.
 
-Every `rotate` also runs a post-edit self-check before writing
+Every `rotate` and `flip` also runs a post-edit self-check before writing
 anything: it reverses its own freshly-produced output (not yet a file -
 see heic_rotate.core's "Byte sources") and confirms the result's CRC32
 matches the recorded original. If that
-check fails, `rotate` refuses to write the output file at all - you
+check fails, it refuses to write the output file at all - you
 never end up with a file this version of the tool claims to be able
 to reverse but actually can't.
 
@@ -215,8 +252,8 @@ and refused with a clear error rather than silently mis-editing the file:
     would silently discard any associations recorded in a second one.
     Likewise an 'iprp' holding any other box, or an 'ipco'/'ipma' with a
     64-bit size field: the provenance record couldn't restore it exactly.
-  - When `rotate` changes the size of 'meta' (always on a file's first
-    rotation, which adds the record), everything after 'meta' moves,
+  - When `rotate` or `flip` changes the size of 'meta' (always on a
+    file's first edit, which adds the record), everything after 'meta' moves,
     and only 'iloc''s offsets are updated to match. So if anything
     follows 'meta', the file is refused when it also has a top-level
     box that may refer to data by its file offset: 'moov' (image
@@ -230,6 +267,12 @@ and refused with a clear error rather than silently mis-editing the file:
     the primary item, isn't rotated - `rotate` prints a warning instead
     (HDR viewers may show it misaligned). None of the real photos tested
     has this.
+  - `flip` changes the primary item and those of its thumbnail, auxiliary
+    images and gain map that have the same rotation/mirror properties as
+    it. One that doesn't is left as it is, with a warning (viewers that
+    show it may show the old orientation). This includes the thumbnail
+    of a photo that had no 'irot' until `rotate` inserted one: `rotate`
+    gives the new 'irot' to the primary item and the gain map only.
   - The legacy embedded Exif Orientation sync only handles the Exif item
     being stored via an absolute file offset (iloc construction_method
     0) in the file itself (data_reference_index 0). If it's stored via
@@ -262,7 +305,8 @@ from .core import (
     ProvenanceError,
     SelfCheckError,
     recovery_advice,
-    rotate_source,
+    transform_source,
+    make_request,
     reverse_source,
     verify_reversible,
     gather_info,
@@ -300,6 +344,37 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.exit(EXIT_USAGE)
 
 
+def _flip_direction(value):
+    """argparse type for a flip direction: 'horizontal'/'vertical', or
+    their first letters."""
+    direction = {'h': 'horizontal', 'v': 'vertical'}.get(value.lower(),
+                                                         value.lower())
+    if direction not in ('horizontal', 'vertical'):
+        raise argparse.ArgumentTypeError(
+            f"invalid choice: {value!r} (choose from 'horizontal', "
+            f"'vertical', 'h', 'v')")
+    return direction
+
+
+def _add_edit_arguments(parser, what):
+    """The arguments `rotate` and `flip` share."""
+    parser.add_argument('input', help='input .heic file')
+    parser.add_argument('output', nargs='?',
+                        help="output .heic file (default: <input>_rotated.heic; "
+                             "or, if <input> ends with '_restored', that "
+                             "suffix is stripped instead of adding '_rotated')")
+    parser.add_argument('--no-exif-sync', action='store_true',
+                        help="don't sync the legacy embedded Exif Orientation tag")
+    parser.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS,
+                        help=f"do everything except write the output file: "
+                             f"verify the {what} can be performed, print "
+                             f"diagnostics, and set the exit code accordingly")
+    parser.add_argument('-f', '--force', action='store_true', default=argparse.SUPPRESS,
+                        help="overwrite the output file if it already exists")
+    parser.add_argument('-q', '--quiet', action='store_true', default=argparse.SUPPRESS,
+                        help="suppress informational stdout messages")
+
+
 def build_parser():
     ap = _ArgumentParser(
         description=__doc__,
@@ -319,14 +394,15 @@ def build_parser():
                           "errors an option overcame (the error a run "
                           "stops at is still reported on stderr)")
     ap.add_argument('--dry-run', action='store_true', default=False,
-                     help="for rotate/reverse: do everything except write "
+                     help="for rotate/flip/reverse: do everything except write "
                           "the output file (no effect on info, which "
                           "never writes a file anyway)")
     ap.add_argument('-f', '--force', action='store_true', default=False,
-                     help="for rotate/reverse: overwrite the output file "
+                     help="for rotate/flip/reverse: overwrite the output file "
                           "if it already exists (refused by default)")
 
-    sub = ap.add_subparsers(dest='cmd', required=True, metavar='{rotate,reverse,info}')
+    sub = ap.add_subparsers(dest='cmd', required=True,
+                            metavar='{rotate,flip,reverse,info}')
 
     rot = sub.add_parser(
         'rotate', help='apply a rotation (counter-clockwise)',
@@ -345,21 +421,32 @@ def build_parser():
                            "it only adds heic-lossless-rotate's tracking "
                            "metadata (and makes an implicit 0 deg "
                            "orientation explicit if no 'irot' exists yet).")
-    rot.add_argument('input', help='input .heic file')
-    rot.add_argument('output', nargs='?',
-                      help="output .heic file (default: <input>_rotated.heic; "
-                           "or, if <input> ends with '_restored', that "
-                           "suffix is stripped instead of adding '_rotated')")
-    rot.add_argument('--no-exif-sync', action='store_true',
-                      help="don't sync the legacy embedded Exif Orientation tag")
-    rot.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS,
-                      help="do everything except write the output file: "
-                           "verify the rotation can be performed, print "
-                           "diagnostics, and set the exit code accordingly")
-    rot.add_argument('-f', '--force', action='store_true', default=argparse.SUPPRESS,
-                      help="overwrite the output file if it already exists")
-    rot.add_argument('-q', '--quiet', action='store_true', default=argparse.SUPPRESS,
-                      help="suppress informational stdout messages")
+    rot.add_argument('--then-flip', type=_flip_direction, default=None,
+                      metavar='{horizontal,vertical}',
+                      help="after rotating, also flip the image: "
+                           "'horizontal' (or 'h') swaps left and right, "
+                           "'vertical' (or 'v') swaps top and bottom. The "
+                           "order matters: the flip applies to the image "
+                           "as it looks AFTER the rotation")
+    _add_edit_arguments(rot, 'rotation')
+
+    flp = sub.add_parser(
+        'flip', help='flip the image (mirror it)',
+        description='Losslessly flip (mirror) a HEIC/HEIF file, the same '
+                     "way `rotate` turns it: by changing its metadata (the "
+                     "'imir' mirror property), never the image data. To "
+                     'rotate and flip in one run, use `rotate <angle> '
+                     '--then-flip <direction>`.')
+    flp.add_argument('direction', type=_flip_direction,
+                      metavar='{horizontal,vertical}',
+                      help="'horizontal' (or 'h') swaps left and right - a "
+                           "mirror image; 'vertical' (or 'v') swaps top "
+                           "and bottom. Applied to the image as it is "
+                           "displayed NOW, on top of whatever rotation and "
+                           "mirroring the file already has: flipping the "
+                           "same way twice gives back what you started "
+                           "with.")
+    _add_edit_arguments(flp, 'flip')
 
     rev = sub.add_parser(
         'reverse', help='undo all heic-lossless-rotate edits, restoring the exact original file',
@@ -390,11 +477,12 @@ def build_parser():
                       help="suppress informational stdout messages")
 
     inf = sub.add_parser(
-        'info', help="report the rotation heic-lossless-rotate has applied, "
-                      "without the heavier checks `reverse` does",
+        'info', help="report the rotation and flipping heic-lossless-rotate "
+                      "has applied, without the heavier checks `reverse` does",
         description="Report what heic-lossless-rotate knows about a file: "
                      "whether it carries a provenance record, and - if "
-                     "so - the CUMULATIVE rotation this tool has added "
+                     "so - the CUMULATIVE rotation (and flip, if any) "
+                     "this tool has added "
                      "on top of whatever the file started with (not "
                      "just the file's absolute current orientation, "
                      "which may also include rotation the file already "
@@ -413,7 +501,11 @@ def build_parser():
                      "90/180/270 deg, or 4 if this tool's net "
                      "contribution is 0 deg (e.g. `rotate 0` was used "
                      "just to add tracking, or opposing rotations "
-                     "cancelled out). Errors exit 20 or above, so "
+                     "cancelled out). If the image was also flipped, "
+                     "the code is 4 higher: 5/6/7 for 90/180/270 deg "
+                     "followed by a horizontal flip (6 is the same as a "
+                     "vertical flip alone), 8 for a horizontal flip "
+                     "alone. Errors exit 20 or above, so "
                      "they're never mistaken for a result: 20-49 are "
                      "soft errors, which an option overcomes (here, 20: "
                      "metadata entries this release doesn't know, "
@@ -564,15 +656,21 @@ def _run(args, source):
 
     dry_run = args.dry_run
 
-    if args.cmd == 'rotate':
-        delta_turns = (args.rotation // 90) % 4
-        out = rotate_source(source, delta_turns, sync_exif=not args.no_exif_sync,
-                             verbose=not args.quiet)
+    if args.cmd in ('rotate', 'flip'):
+        # `rotate <angle> --then-flip <direction>` and `flip <direction>`
+        # are one kind of request: a rotation, then possibly a flip.
+        if args.cmd == 'rotate':
+            request = make_request((args.rotation // 90) % 4, args.then_flip)
+        else:
+            request = make_request(0, args.direction)
+        out = transform_source(source, request,
+                               sync_exif=not args.no_exif_sync,
+                               verbose=not args.quiet)
         verify_structure(out)
         if not args.quiet:
             print("[ok] output box structure is internally consistent")
 
-        # Post-rotate reversibility self-check: verify - before writing
+        # Post-edit reversibility self-check: verify - before writing
         # anything to disk - that reversing our own freshly-produced
         # output would reconstruct the true original. `out` isn't a
         # file yet, nor bytes in memory: it is the input file plus the
@@ -581,7 +679,7 @@ def _run(args, source):
         # verify_reversible() already raises if the reconstructed file's
         # CRC32 doesn't match the recorded original (or if anything about
         # the record is malformed) - we just need to make sure a failure
-        # here aborts the rotate instead of silently producing a file
+        # here aborts the edit instead of silently producing a file
         # that this tool claims to be able to reverse but actually can't.
         # Reached only if everything up to here succeeded. Any failure is
         # its own hard error (SelfCheckError), whatever the underlying
@@ -590,7 +688,7 @@ def _run(args, source):
             verify_reversible(out, proceed_unsafe=False, verbose=False)
         except HeicRotateError as e:
             raise SelfCheckError(
-                f"post-rotate reversibility self-check failed - refusing "
+                f"post-{args.cmd} reversibility self-check failed - refusing "
                 f"to write output: {e}") from e
         if not args.quiet:
             print("[ok] reversibility self-check passed - output can be "

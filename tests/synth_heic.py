@@ -28,7 +28,7 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
                           include_exif: bool = False, exif_orientation: int = 1,
                           exif_position: str = 'end', extra_mdat: bool = False,
                           imir_axis=None, imir_before_irot: bool = False,
-                          tmap=None) -> bytes:
+                          tmap=None, thumbnail=None) -> bytes:
     """Build a minimal, single-image synthetic HEIC file.
 
     layout: 'mdat_first' (ftyp, mdat, meta) or 'meta_first' (ftyp, meta, mdat)
@@ -77,6 +77,14 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
                                'irot' boxes (encoders de-duplicate them
                                when the primary is unrotated, so this
                                needs irot_value 0).
+    thumbnail: if not None, adds a thumbnail image item with a 'thmb'
+                  reference to the primary item and an 'ispe' of its own.
+                  Modes:
+                    'shared' - it has the primary's 'irot'/'imir'
+                               properties too (the very same boxes), as
+                               real encoders write it.
+                    'plain'  - it has no rotation/mirror properties,
+                               whatever the primary has.
     """
     item_id = 1
     exif_item_id = 2
@@ -122,8 +130,11 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
 
     gain_item_id = 3
     tmap_item_id = 4
+    thumb_item_id = 5
     if tmap not in (None, 'own', 'shared'):
         raise ValueError(f"unknown tmap mode {tmap!r}")
+    if thumbnail not in (None, 'shared', 'plain'):
+        raise ValueError(f"unknown thumbnail mode {thumbnail!r}")
 
     infe_items = [(item_id, b'hvc1')]
     if include_exif:
@@ -131,6 +142,8 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
     if tmap:
         infe_items.append((gain_item_id, b'hvc1'))
         infe_items.append((tmap_item_id, b'tmap'))
+    if thumbnail:
+        infe_items.append((thumb_item_id, b'hvc1'))
     infe_boxes = b''
     for iid, itype in infe_items:
         infe_content = struct.pack('>H', iid) + struct.pack('>H', 0) + itype + b'\x00'
@@ -179,6 +192,10 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
             tmap_irot = add_prop(_box(b'irot', b'\x00'))
             tmap_assocs = [(tmap_ispe, False), (tmap_irot, True)]
         item_assocs.append((tmap_item_id, tmap_assocs))
+    if thumbnail:
+        thumb_ispe = add_prop(_fullbox(b'ispe', 0, 0, struct.pack('>II', 10, 20)))
+        item_assocs.append((thumb_item_id, [(thumb_ispe, False)] + (
+            transforms if thumbnail == 'shared' else [])))
     ipco = _box(b'ipco', b''.join(props))
 
     ipma_entries = b''
@@ -190,10 +207,12 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
 
     iprp = _box(b'iprp', ipco + ipma)
 
-    iref = b''
+    refs = b''
     if tmap:
-        dimg = _box(b'dimg', struct.pack('>HHHH', tmap_item_id, 2, item_id, gain_item_id))
-        iref = _fullbox(b'iref', 0, 0, dimg)
+        refs += _box(b'dimg', struct.pack('>HHHH', tmap_item_id, 2, item_id, gain_item_id))
+    if thumbnail:
+        refs += _box(b'thmb', struct.pack('>HHH', thumb_item_id, 1, item_id))
+    iref = _fullbox(b'iref', 0, 0, refs) if refs else b''
 
     # iloc: version 1 (so construction_method field exists), one extent per
     # item. Per ISO/IEC 14496-12, for construction_method 0 the item's data
@@ -227,6 +246,9 @@ def build_synthetic_heic(layout: str = 'mdat_first', mdat_payload: bytes = b'FAK
                                                  main_item_abs_offset, 8)
             iloc_items_bytes += iloc_item_bytes(tmap_item_id, 0, 0,
                                                  main_item_abs_offset + 8, 8)
+        if thumbnail:
+            iloc_items_bytes += iloc_item_bytes(thumb_item_id, 0, 0,
+                                                 main_item_abs_offset + 16, 8)
         iloc = _fullbox(b'iloc', iloc_version, 0,
                          bytes([0x44]) + bytes([0x40]) + iloc_items + bytes(iloc_items_bytes))
         meta_content = hdlr + iinf + pitm + iref + iprp + iloc

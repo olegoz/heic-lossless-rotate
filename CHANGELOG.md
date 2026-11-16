@@ -6,7 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Flipping: `flip horizontal` and `flip vertical` mirror the image the
+  same lossless, reversible way `rotate` turns it, by metadata alone.
+  `rotate <angle> --then-flip <direction>` does both in one run.
+- `info` reports flips too, with exit codes `5`–`8` for a flipped
+  result.
+
 ### Changed
+- Releases before 3.0.0 can't open a file that has been flipped. The
+  metadata format is still 3.
 - Memory use no longer grows with file size: only the file's metadata
   is loaded into memory, and the image data is copied from the input
   file to the output file in chunks.

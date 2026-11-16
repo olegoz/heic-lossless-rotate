@@ -2,11 +2,11 @@
 
 Repository: https://github.com/olegoz/heic-lossless-rotate
 
-A Python 3 tool that **rotates HEIC/HEIF images** — the photo format used
-by default on recent iPhones and many Android phones — **losslessly**, by
-changing a small "which way is up" tag in the file's metadata, instead of
-decoding and re-encoding the image. It is also **fully reversible** back
-to the exact original file, byte for byte.
+A Python 3 tool that **rotates and flips HEIC/HEIF images** — the photo
+format used by default on recent iPhones and many Android phones —
+**losslessly**, by changing small "which way is up" and "mirrored" tags in
+the file's metadata, instead of decoding and re-encoding the image. It is
+also **fully reversible** back to the exact original file, byte for byte.
 
 > **Why "lossless" matters here:** HEIC, like JPEG, is a **lossy**
 > compression format — every time an image is decoded and re-encoded,
@@ -33,6 +33,7 @@ No third-party dependencies. Python 3 standard library only.
 - [Why this exists](#why-this-exists)
 - [How each command works](#how-each-command-works)
   - [`rotate`](#rotate)
+  - [`flip`](#flip)
   - [`reverse`](#reverse)
   - [`info`](#info)
 - [How rotation values map to the container format](#how-rotation-values-map-to-the-container-format)
@@ -50,11 +51,14 @@ No third-party dependencies. Python 3 standard library only.
   touched or re-compressed — only a small "which way is up" tag inside the
   file is changed, so there's zero quality loss, no matter how many times
   you rotate.
+- **Flips (mirrors) them the same way.** `flip` swaps left and right, or
+  top and bottom, again by changing only a tag in the file. A rotation
+  and a flip can be done in one run.
 - **Fully reversible.** `reverse` restores a file to be byte-for-byte
-  identical to the original, even after multiple rotations. `rotate`
-  itself also self-checks reversibility before writing anything - it
-  reverses its own output first and refuses to write if that
-  doesn't reconstruct the original exactly.
+  identical to the original, even after multiple rotations and flips.
+  `rotate` and `flip` also self-check reversibility before writing
+  anything: they reverse their own output first and refuse to write if
+  that doesn't reconstruct the original exactly.
 - **Light on memory, whatever the file size.** Only the file's metadata
   is loaded into memory. The image data is copied from the input file
   to the output file in chunks, so a file of hundreds of megabytes needs
@@ -238,6 +242,8 @@ published yet — for now, use Option 1 or one of the routes above.*
 
 ```
 heic-rotate rotate <0|90|180|270> <input.heic> [output.heic] [-f]
+heic-rotate rotate <0|90|180|270> --then-flip <horizontal|vertical> <input.heic> [output.heic] [-f]
+heic-rotate flip <horizontal|vertical> <input.heic> [output.heic] [-f]
 heic-rotate reverse <input.heic> [output.heic] [-f]
 heic-rotate info <input.heic>
 heic-rotate -V | --version
@@ -275,12 +281,13 @@ heic-rotate 90 photo.heic photo_rotated.heic
 heic-rotate rotate 90 photo.heic photo_rotated.heic
 ```
 
-If no output path is given, `rotate` writes to `<input>_rotated.heic` —
-unless `<input>` itself ends with `_restored` (i.e. it looks like
-`reverse`'s own default output), in which case `rotate` strips that suffix
-instead of adding `_rotated` (`photo_restored.heic` → `photo.heic`).
-`reverse` writes to `<input>_restored.heic`. By default, both refuse to
-overwrite an existing output file — pass `-f`/`--force` to allow it.
+If no output path is given, `rotate` and `flip` write to
+`<input>_rotated.heic` — unless `<input>` itself ends with `_restored`
+(i.e. it looks like `reverse`'s own default output), in which case they
+strip that suffix instead of adding `_rotated` (`photo_restored.heic` →
+`photo.heic`). `reverse` writes to `<input>_restored.heic`. By default,
+all three refuse to overwrite an existing output file — pass
+`-f`/`--force` to allow it.
 
 Run with no arguments, or with `-h`, for full help; `-h` also works on each
 subcommand (`heic-rotate rotate -h`, etc.) for its specific options.
@@ -291,6 +298,18 @@ subcommand (`heic-rotate rotate -h`, etc.) for its specific options.
 rotation the file already has, rather than setting an absolute angle —
 rotating 90° twice lands at 180°, not back at 90°, mirroring how you'd
 physically turn a printed photo in your hands.
+
+**Flipping:** `flip horizontal` swaps left and right, giving a mirror
+image; `flip vertical` swaps top and bottom. You can write `h` and `v`
+for short. Like a rotation, a flip applies to the image as it looks now,
+so flipping the same way twice gives back what you started with.
+
+To rotate and flip in one run, add `--then-flip` to `rotate`: the image
+is rotated first, and the result is then flipped. The order matters.
+Rotating by 90° and then flipping horizontally gives a different result
+from flipping first and rotating afterwards (the two differ by half a
+turn), which is why the option's name says which comes first. Every
+possible orientation can be reached this way.
 
 ### Examples
 
@@ -303,6 +322,15 @@ heic-rotate 90 IMG_0001.heic IMG_0001_rotated.heic
 
 # Rotate 90° clockwise instead (270° counter-clockwise == 90° clockwise)
 heic-rotate 270 IMG_0001.heic IMG_0001_rotated.heic
+
+# Mirror the image (swap left and right)
+heic-rotate flip horizontal IMG_0001.heic IMG_0001_flipped.heic
+
+# Turn it upside down as a reflection (swap top and bottom)
+heic-rotate flip v IMG_0001.heic IMG_0001_flipped.heic
+
+# Rotate 90° counter-clockwise, then mirror the result, in one run
+heic-rotate rotate 90 --then-flip horizontal IMG_0001.heic IMG_0001_fixed.heic
 
 # Preview what would happen without writing anything
 heic-rotate --dry-run 180 IMG_0001.heic
@@ -370,15 +398,16 @@ guaranteed lossless with respect to image content.
 
 ### `rotate`
 
-Applying a rotation stores a compact provenance record in a private
+Applying a rotation (or a flip, see [`flip`](#flip) below) stores a compact provenance record in a private
 top-level `uuid` box (the standard ISOBMFF mechanism for vendor-private
 data, silently skipped by compliant readers). The record holds the
 original state of only the item properties and associations the tool
-changed (the `irot` value, or the fact that there was none, and for HDR
+changed (the `irot` value, or the fact that there was none, the items a
+flip added a mirror property to or removed one from, and for HDR
 gain-map photos the `tmap` item's properties), the pristine `iloc`
 content and `meta` size field, the legacy Exif orientation byte if
-present, the total rotation you've asked the tool for (shown by
-`info`), CRC32 checksums used to detect if the file is modified by
+present, the total rotation and flipping you've asked the tool for
+(shown by `info`), CRC32 checksums used to detect if the file is modified by
 something else afterward, and the tool version that most recently
 updated the file (shown by `info`).
 
@@ -390,15 +419,15 @@ state captured on the very first edit is never overwritten, so `reverse`
 can always undo every edit made since, no matter how many times you've
 rotated the file.
 
-Before writing anything, `rotate` checks that its output can be
-reversed: it reverses the output and compares the result
+Before writing anything, `rotate` (and `flip`) checks that its output
+can be reversed: it reverses the output and compares the result
 with the original file's recorded checksum. If they don't match, it
 writes nothing (hard error `57`). So the same release's `reverse` can
-always restore a file `rotate` wrote, even if a later release can't
+always restore a file it wrote, even if a later release can't
 (see [`reverse`](#reverse) below), and a problem is found while you
 still have the input file, not later when you try to `reverse`.
 
-`rotate` and `reverse` write their output to a temporary file next to
+`rotate`, `flip` and `reverse` write their output to a temporary file next to
 the output file, and rename it into place only once it is complete. An
 interrupted run therefore never leaves a half-written output file, and
 the output file may be the input file itself (with `-f`).
@@ -414,6 +443,41 @@ for. If the original can't be restored, `rotate` writes nothing. Its
 error names the release to recover the original with (see
 [`reverse`](#reverse) below), and the combined angle to rotate it by
 with the latest release.
+
+### `flip`
+
+`flip` works like `rotate` in every respect described above: the same
+provenance record, the same self-check before writing, the same
+temporary file, and the same handling of files with a record in an older
+format (the original is restored, then given the earlier rotation and
+the flip in one edit). `rotate <angle> --then-flip <direction>` is one
+such edit too, not two.
+
+What it changes is the HEIF mirror property, `imir`. That property can't
+say "not mirrored", so a flip adds or removes it instead of changing its
+value:
+
+- If the image isn't mirrored yet, an `imir` is added as the last of its
+  properties, so it applies to the image as displayed. If the file
+  already holds an identical `imir` box, that one is used.
+- If the image is mirrored already, for example an iPhone front-camera
+  shot, its `imir` is taken off the image. The box itself stays in the
+  file, unused.
+
+The rotation value (`irot`) then makes up whatever rotation is still
+needed, and an `irot` is added before the `imir` if the image has none.
+The result is always a rotation followed by a mirror, which is the order
+iPhones write for mirrored photos. A flip on its own doesn't change the
+`irot` value of an unmirrored image.
+
+A photo's thumbnail, its auxiliary images (such as depth maps) and its
+HDR gain map normally carry the very same rotation and mirror properties
+as the main image. Those that do get the same changes, so they stay
+oriented like it. See [Known limitations](#known-limitations) for those
+that don't.
+
+The legacy Exif `Orientation` tag is kept in sync here too, using its
+mirrored values (2, 4, 5 and 7) when the result is mirrored.
 
 ### `reverse`
 
@@ -463,8 +527,8 @@ and run it as `python3 heic_rotate.py reverse ...`.
 
 ### `info`
 
-`info` is cheap and read-only: it reports the cumulative rotation *this
-tool* has added to a file, distinct from the file's absolute current
+`info` is cheap and read-only: it reports the cumulative rotation and
+flipping *this tool* has added to a file, distinct from the file's absolute current
 orientation (which may include rotation the file already had before you
 ever ran this script on it), plus which tool version most
 recently updated the file and the record's metadata format, e.g.
@@ -479,6 +543,13 @@ it wrongly (mirrored photos, before 2.0.0) can look different from what
 `info` reports. `info` then says the metadata is in an older format, and
 `rotate 0` brings the file up to date by re-applying the reported
 rotation with the latest release's code.
+
+If you have flipped the file, `info` reports the total as a rotation
+followed by a flip, the same form `rotate --then-flip` takes, so you can
+type it back in: for example `90 deg, then horizontal flip`. A total of
+180° followed by a horizontal flip is reported simply as `vertical
+flip`. For a file whose mirroring this tool changed, `info` also shows
+the file's own rotation and mirror properties, originally and now.
 
 `info` also labels the two kinds of photo releases before 2.0.0 rotated
 wrongly: mirrored photos (on the `irot` line) and HDR photos with a gain
@@ -525,9 +596,12 @@ format newer than the running release knows is refused outright, by
 format number, only the version of the release that last updated the
 file is read from it, so the error can name that release. The same
 applies to a record in a known format that a newer release extended
-(with entries this release doesn't know, or with mirroring). So once a
+(with entries this release doesn't know). So once a
 newer release has edited a file, use that release or a later one (`-V`
-lists the metadata formats a release is compatible with).
+lists the metadata formats a release is compatible with). Flipping is
+such an extension: it needed no new metadata format, but releases
+before 3.0.0 can't flip, and refuse a file that has been flipped
+(2.0.0 with hard error `54`).
 
 ## Options
 
@@ -536,9 +610,10 @@ lists the metadata formats a release is compatible with).
 | `-h`, `--help` | any | Show help and exit |
 | `-V`, `--version` | top-level | Show script version, current metadata format version, and compatible metadata formats (the ones `rotate`, `reverse` and `info` accept), then exit |
 | `-q`, `--quiet` | all | Suppress informational messages and warnings on stdout, and the stderr reports of soft errors an option overcame. The error a run stops at is still reported on stderr |
-| `--dry-run` | `rotate`, `reverse` | Do everything except write the output file |
-| `-f`, `--force` | `rotate`, `reverse` | Overwrite the output file if it already exists (otherwise soft error `22`) |
-| `--no-exif-sync` | `rotate` | Don't sync the legacy embedded Exif `Orientation` tag |
+| `--dry-run` | `rotate`, `flip`, `reverse` | Do everything except write the output file |
+| `-f`, `--force` | `rotate`, `flip`, `reverse` | Overwrite the output file if it already exists (otherwise soft error `22`) |
+| `--then-flip <horizontal\|vertical>` | `rotate` | After rotating, flip the result (`h` and `v` for short) |
+| `--no-exif-sync` | `rotate`, `flip` | Don't sync the legacy embedded Exif `Orientation` tag |
 | `--proceed-unsafe` | `reverse`, `info` | Overcome the soft errors about the input file, reporting each one on stderr unless `-q` is given (see [`--proceed-unsafe`](#--proceed-unsafe) below) |
 
 All top-level flags (`-q`, `--dry-run`, `-f`) may be given either before or
@@ -565,21 +640,27 @@ It never overcomes a hard error, for example:
 
 - `reverse`'s final check that the restored file matches the original
   file's checksum (`55`), so it still never writes a wrong file.
-- A newer metadata format, or a file mirrored by a newer release (`54`):
-  update heic-lossless-rotate instead.
-- Anything in `rotate`, which has no such option: it would have to drop
-  the unknown entries, so for `rotate` they are hard error `54`.
+- A newer metadata format, or a recorded change this release doesn't
+  understand (`54`): update heic-lossless-rotate instead.
+- Anything in `rotate` or `flip`, which have no such option: they would
+  have to drop the unknown entries, so for them these are hard error
+  `54`.
 
 ## Errors and exit codes
 
-On success, `rotate` and `reverse` exit `0`, and `info` exits with its
-result, so a script can branch on it without parsing text output:
+On success, `rotate`, `flip` and `reverse` exit `0`, and `info` exits
+with its result, so a script can branch on it without parsing text output:
 
 | Exit code | `info` result |
 |---|---|
 | `0` | No provenance record found — this tool has never touched the file |
 | `1` / `2` / `3` | This tool's cumulative contribution is `90°` / `180°` / `270°` |
-| `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. `rotate 0` was used just to add tracking, or opposing rotations cancelled out) |
+| `4` | File has a provenance record, but this tool's net contribution is `0°` (e.g. `rotate 0` was used just to add tracking, or opposing rotations or flips cancelled out) |
+| `5` / `6` / `7` | As `1` / `2` / `3`, followed by a horizontal flip: `90°` / `180°` / `270°`, then flipped. `6` is the same as a vertical flip alone |
+| `8` | This tool's cumulative contribution is a horizontal flip alone |
+
+So a code above `4` means the image was flipped, and the code's
+remainder when divided by 4 is the number of quarter turns.
 
 Every error exits with `20` or above, for every command, so it's never
 mistaken for a result. There are two kinds:
@@ -614,7 +695,7 @@ heic-rotate reverse photo.heic --proceed-unsafe 2>&1 >/dev/null | grep '^ERROR '
 |---|---|---|
 | `20` | `reverse`, `info`: the file's metadata has entries this release doesn't know, as a newer release may add | `--proceed-unsafe` |
 | `21` | `reverse`: the file was modified by something else since this tool's last edit | `--proceed-unsafe` |
-| `22` | `rotate`, `reverse`: the output file already exists | `-f`/`--force` |
+| `22` | `rotate`, `flip`, `reverse`: the output file already exists | `-f`/`--force` |
 
 **Hard errors:**
 
@@ -624,10 +705,10 @@ heic-rotate reverse photo.heic --proceed-unsafe 2>&1 >/dev/null | grep '^ERROR '
 | `51` | The input file can't be read, or the output file can't be written (an operating-system error, e.g. file not found or permission denied) |
 | `52` | Not a valid HEIF file, or one structured in a way this tool doesn't support (see [Known limitations](#known-limitations)) |
 | `53` | `reverse`: the file has no provenance record, so there's nothing to reverse |
-| `54` | A later release of this tool produced something in the file that this release doesn't support: a newer metadata format, mirroring, or (for `rotate`) metadata entries it doesn't know. The error names the release that last updated the file. Update heic-lossless-rotate |
+| `54` | A later release of this tool produced something in the file that this release doesn't support: a newer metadata format, a recorded change it doesn't understand, or (for `rotate` and `flip`) metadata entries it doesn't know. The error names the release that last updated the file. Update heic-lossless-rotate |
 | `55` | The provenance record is corrupt, or the original file can't be restored from it (e.g. the file was changed outside what the record restores). If another release last updated the file, the message names the release to recover the original with (see [`reverse`](#reverse)) |
 | `56` | Internal error: one of the tool's internal consistency checks failed, or something unexpected went wrong (the message is followed by a traceback). Nothing was written. Please report it |
-| `57` | `rotate`: the rotated file, reversed before writing it, didn't give back the original, so it wasn't written. The message says why |
+| `57` | `rotate`, `flip`: the edited file, reversed before writing it, didn't give back the original, so it wasn't written. The message says why |
 
 ## Known limitations
 
@@ -645,8 +726,8 @@ refused with a clear error rather than silently mis-editing the file:
   one — so it's refused instead of guessed. Likewise, an `iprp` holding
   any other box, or an `ipco`/`ipma` box with a 64-bit size field, is
   refused, since the provenance record couldn't restore it exactly.
-- When `rotate` changes the size of the `meta` box (always on a file's
-  first rotation, which adds the tool's record), everything after
+- When `rotate` or `flip` changes the size of the `meta` box (always on
+  a file's first edit, which adds the tool's record), everything after
   `meta` in the file moves, and only the image locations recorded in
   `meta` itself (`iloc`) are updated to match. So if anything follows
   `meta`, the file is refused when it also has a top-level box that may
@@ -659,6 +740,13 @@ refused with a clear error rather than silently mis-editing the file:
   isn't shared with the main image, the gain map isn't rotated: `rotate`
   prints a warning, and HDR viewers may show it misaligned. No phone
   photo tested is built like this.
+- `flip` changes the main image, and those of its thumbnail, auxiliary
+  images and gain map that have the same rotation and mirror properties
+  as it. One that doesn't is left as it is: `flip` prints a warning, and
+  a viewer that shows that image may show the old orientation. This
+  includes the thumbnail of a photo that had no rotation property until
+  `rotate` added one, since `rotate` gives the new property to the main
+  image and the gain map only.
 - The legacy embedded Exif `Orientation` sync only handles the Exif item
   being stored via an absolute file offset in the file itself. If it's
   stored via `idat`, another item's data or a data reference (`dref`,

@@ -28,7 +28,8 @@ Covers, in order:
      dry-run, and info's exit codes.
   4. Real-file tests, skipped automatically if the referenced files aren't
      present in testdata/ - see README-test.md for what to add. Also
-     writes 0/90/180/270 deg rotated copies of each real file to rotated/
+     writes 0/90/180/270 deg rotated (and three flipped) copies of each
+     real file to rotated/
      for manual visual inspection (structural checks alone can't confirm
      the pixels actually display right-side-up).
 
@@ -1151,10 +1152,10 @@ class TestProvenanceFormats(unittest.TestCase):
                         3, entries, original_turns, 0), (False, requested))
                     self.assertEqual(hr.requested_transform(
                         3, entries, None, None), (False, requested))
-                    mirrored = {b'REQT': hr.encode_requested_transform(
+                    flipped = {b'REQT': hr.encode_requested_transform(
                         (True, requested))}
-                    with self.assertRaises(hr.ProvenanceError):
-                        hr.requested_transform(3, mirrored, original_turns, 0)
+                    self.assertEqual(hr.requested_transform(
+                        3, flipped, original_turns, 0), (True, requested))
         with self.assertRaises(hr.ProvenanceError):
             hr.requested_transform(hr.FORMAT_VERSION + 1, {}, 0, 1)
 
@@ -1294,9 +1295,10 @@ class TestRequestedTransform(unittest.TestCase):
     image requested from heic-lossless-rotate, stored explicitly rather
     than inferred from 'irot'/'imir' - so that a v3 record can be
     replayed from the original by what was asked rather than by what the
-    release that wrote it did, and so that a later release can add
-    mirroring without a format bump. This release only rotates, and
-    refuses a record whose REQT includes mirroring in every command."""
+    release that wrote it did. It has had a mirror bit from the start,
+    so flipping (added after 2.0.0, see TestFlip) needed no format
+    bump; 2.0.0 itself only rotates, and refuses a record with that bit
+    set in every command."""
 
     CASES = (dict(include_irot=True, irot_value=1),
              dict(include_irot=False),
@@ -1346,50 +1348,13 @@ class TestRequestedTransform(unittest.TestCase):
                     info = hr.gather_info(data)
                     self.assertEqual(info['delta_quarter_turns'], total)
 
-    def test_mirroring_recorded_by_a_later_release_is_refused(self):
-        """A v3 record whose REQT includes mirroring - as a later release
-        that can mirror will write (simulated here by setting REQT
-        alone) - is refused by `rotate`, `reverse` and `info` alike
-        (CLI exit 56), saying this release doesn't support mirroring yet
-        and naming the release that did it."""
-        original = build_synthetic_heic(layout='mdat_first', include_irot=True,
-                                        irot_value=0)
-        rotated = hr.apply_rotation(original, 1, verbose=False)
-        _, entries = hr.parse_provenance(
-            rotated, hr.locate_structures(rotated)['provenance_hdr'])
-        entries[b'TVER'] = bytes(LATER_VERSION)
-        for request in ((True, 0), (True, 1), (True, 2)):
-            with self.subTest(request=request):
-                entries[b'REQT'] = hr.encode_requested_transform(request)
-                mirrored = _replace_record(rotated, 3, entries)
-                for name, call in (
-                        ('rotate', lambda: hr.apply_rotation(mirrored, 1,
-                                                             verbose=False)),
-                        ('reverse', lambda: hr.reverse_rotation(mirrored,
-                                                                verbose=False)),
-                        ('info', lambda: hr.gather_info(mirrored))):
-                    with self.subTest(command=name):
-                        with self.assertRaises(hr.NewerVersionError) as ctx:
-                            call()
-                        self.assertIn(
-                            f"this file was last updated by heic-lossless-"
-                            f"rotate {LATER_VERSION_STR} (this is "
-                            f"{hr.VERSION}): it was "
-                            f"mirrored, which this release doesn't support "
-                            f"yet", str(ctx.exception))
-        tmpdir = tempfile.mkdtemp()
-        try:
-            path = os.path.join(tmpdir, 'mirrored.heic')
-            with open(path, 'wb') as f:
-                f.write(mirrored)
-            for args in (('info', path), ('reverse', path),
-                         ('rotate', '90', path)):
-                with self.subTest(cli=args[0]):
-                    code, _, err = run_cli(*args)
-                    self.assertEqual(code, hr.EXIT_NEWER_RELEASE)
-                    self.assertIn("doesn't support yet", err)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+    def test_mirror_bit_is_decoded(self):
+        """Releases before 3.0.0 refused a REQT with the mirror bit set
+        ("mirrored, which this release doesn't support yet"); now it is
+        an ordinary request."""
+        for request in ((True, 0), (True, 1), (True, 2), (True, 3)):
+            self.assertEqual(hr.decode_requested_transform(
+                {b'REQT': hr.encode_requested_transform(request)}), request)
 
     def test_unknown_tag_is_refused_unless_proceed_unsafe(self):
         """A tag this release doesn't know - as a later release may add
@@ -1728,6 +1693,423 @@ class TestMirroringAndGainMaps(unittest.TestCase):
                             model.first_assoc(1, b'irot')[1])
 
 
+ALL_REQUESTS = [(flip, turns) for flip in (False, True) for turns in range(4)]
+
+
+def _apply(data, request):
+    return hr.apply_transform(data, request, verbose=False)
+
+
+def _model(data):
+    info = hr.locate_structures(data)
+    iprp = info['iprp_hdr']
+    return hr.IprpModel(data, iprp[0], iprp[2], iprp[3]), info
+
+
+def _related_transforms(data):
+    """{item id: transform} of the images that go with the primary item
+    (thumbnail, auxiliary images, gain map)."""
+    model, info = _model(data)
+    primary = info['primary_item_id']
+    body, end = info['meta_body_start'], info['meta_hdr'][3]
+    related = hr.find_related_items(
+        data, body, end, primary, hr.find_tmap_items(data, body, end, primary))
+    return {item_id: model.transform(item_id) for item_id in related}
+
+
+class TestFlip(unittest.TestCase):
+    """Flipping (mirroring) the image by metadata alone - `flip
+    horizontal|vertical` and `rotate <angle> --then-flip ...`. A request
+    is a (flip, turns) change to the DISPLAYED image, like a rotation:
+    relative to how the file displays now, recorded in REQT, checked
+    against the display transform, and fully reversible."""
+
+    def _fixtures(self):
+        for layout in ('mdat_first', 'meta_first'):
+            yield dict(layout=layout, include_irot=False, include_exif=True)
+            for irot in range(4):
+                yield dict(layout=layout, include_irot=True, irot_value=irot,
+                           include_exif=True)
+            for axis in (0, 1):
+                yield dict(layout=layout, include_irot=False, imir_axis=axis)
+                for irot in (0, 1):
+                    for before in (False, True):
+                        yield dict(layout=layout, include_irot=True,
+                                   irot_value=irot, imir_axis=axis,
+                                   imir_before_irot=before, include_exif=True)
+
+    def test_request_helpers(self):
+        self.assertEqual(hr.make_request(1), (False, 1))
+        self.assertEqual(hr.make_request(0, 'horizontal'), hr.FLIP_HORIZONTAL)
+        self.assertEqual(hr.make_request(0, 'vertical'), hr.FLIP_VERTICAL)
+        # a vertical flip is a horizontal flip plus a half turn, either order
+        self.assertEqual(hr.make_request(2, 'horizontal'), hr.FLIP_VERTICAL)
+        self.assertEqual(hr.compose_transforms((False, 2), hr.FLIP_HORIZONTAL),
+                         hr.FLIP_VERTICAL)
+        # the order matters for quarter turns: rotating and then flipping
+        # differs by a half turn from flipping first
+        rotate_then_flip = hr.make_request(1, 'horizontal')
+        flip_then_rotate = hr.compose_transforms((False, 1), hr.FLIP_HORIZONTAL)
+        self.assertNotEqual(rotate_then_flip, flip_then_rotate)
+        self.assertEqual(hr.compose_transforms((False, 2), rotate_then_flip),
+                         flip_then_rotate)
+        # same thing said two ways
+        self.assertEqual(hr.make_request(1, 'vertical'),
+                         hr.make_request(3, 'horizontal'))
+        seen = set()
+        for turns in range(4):
+            for flipped in (False, True):
+                request = hr.make_request(turns, 'horizontal' if flipped else None)
+                seen.add(request)
+                self.assertEqual(hr.rotate_then_flip(request), (turns, flipped))
+        self.assertEqual(seen, set(ALL_REQUESTS))
+        self.assertEqual(
+            [(hr.describe_transform(hr.make_request(t, d)),
+              hr.transform_command(hr.make_request(t, d)))
+             for t, d in ((0, None), (3, None), (0, 'horizontal'),
+                          (0, 'vertical'), (1, 'horizontal'), (1, 'vertical'))],
+            [('0 deg', 'rotate 0'), ('270 deg', 'rotate 270'),
+             ('horizontal flip', 'flip horizontal'),
+             ('vertical flip', 'flip vertical'),
+             ('90 deg, then horizontal flip', 'rotate 90 --then-flip horizontal'),
+             ('270 deg, then horizontal flip',
+              'rotate 270 --then-flip horizontal')])
+
+    def test_every_request_changes_the_display_by_exactly_that(self):
+        for kwargs in self._fixtures():
+            original = build_synthetic_heic(**kwargs)
+            t0 = _display_state(original)[0]
+            for request in ALL_REQUESTS:
+                with self.subTest(request=request, **kwargs):
+                    edited = _apply(original, request)
+                    hr.verify_structure(edited)
+                    t, _, _, _, exif = _display_state(edited)
+                    self.assertEqual(t, hr.compose_transforms(request, t0))
+                    if kwargs.get('include_exif') and request != (False, 0):
+                        self.assertEqual(exif, hr.transform_to_exif_orientation(t))
+                    self.assertEqual(_reqt(edited),
+                                     hr.encode_requested_transform(request))
+                    info = hr.gather_info(edited)
+                    turns, flipped = hr.rotate_then_flip(request)
+                    self.assertEqual((info['delta_quarter_turns'], info['flipped']),
+                                     (turns, flipped))
+                    self.assertEqual(hr.format_info(info)[1],
+                                     (turns or 4) + (4 if flipped else 0))
+                    hr.verify_reversible(edited)
+                    self.assertEqual(hr.reverse_rotation(edited, verbose=False),
+                                     original)
+
+    def test_rotation_only_requests_are_what_rotate_always_did(self):
+        for kwargs in self._fixtures():
+            original = build_synthetic_heic(**kwargs)
+            for turns in range(4):
+                self.assertEqual(_apply(original, (False, turns)),
+                                 hr.apply_rotation(original, turns, verbose=False))
+
+    def test_two_edits_equal_the_one_combined_edit(self):
+        """Edits compose like the transforms they request: for every
+        pair of requests, on top of any starting orientation, the
+        display and the recorded request are those of the single
+        combined request - and `reverse` still restores the original."""
+        for kwargs in (dict(include_irot=False),
+                       dict(layout='meta_first', include_irot=True,
+                            irot_value=3, include_exif=True),
+                       dict(include_irot=True, irot_value=1, imir_axis=1,
+                            include_exif=True),
+                       dict(layout='meta_first', include_irot=True,
+                            irot_value=0, imir_axis=0, imir_before_irot=True),
+                       dict(include_irot=False, imir_axis=0),
+                       dict(include_irot=True, irot_value=1, imir_axis=1,
+                            tmap='own', thumbnail='shared', include_exif=True)):
+            original = build_synthetic_heic(**kwargs)
+            t0 = _display_state(original)[0]
+            for first in ALL_REQUESTS:
+                step1 = _apply(original, first)
+                for second in ALL_REQUESTS:
+                    with self.subTest(first=first, second=second, **kwargs):
+                        step2 = _apply(step1, second)
+                        total = hr.compose_transforms(second, first)
+                        t, _, _, _, exif = _display_state(step2)
+                        self.assertEqual(t, hr.compose_transforms(total, t0))
+                        self.assertEqual(
+                            t, _display_state(_apply(original, total))[0])
+                        self.assertEqual(
+                            _reqt(step2), hr.encode_requested_transform(total))
+                        for related in _related_transforms(step2).values():
+                            self.assertEqual(related, t)
+                        self.assertEqual(
+                            hr.reverse_rotation(step2, verbose=False), original)
+
+    def test_same_request_gives_the_same_file_however_it_is_phrased(self):
+        original = build_synthetic_heic(include_irot=True, irot_value=1)
+        self.assertEqual(_apply(original, hr.make_request(2, 'horizontal')),
+                         _apply(original, hr.make_request(0, 'vertical')))
+        self.assertEqual(_apply(original, hr.make_request(1, 'vertical')),
+                         _apply(original, hr.make_request(3, 'horizontal')))
+
+    def test_properties_end_up_as_irot_then_imir(self):
+        """Whatever the request, an item that had at most one 'irot' and
+        one 'imir' ends up with an 'irot', followed by an 'imir' if it
+        is mirrored - the order iPhones write. Flipping an unmirrored
+        item adds an 'imir' as its last property; a flip alone leaves
+        the 'irot' value as it was."""
+        for kwargs in self._fixtures():
+            original = build_synthetic_heic(**kwargs)
+            for request in ALL_REQUESTS[4:]:
+                with self.subTest(request=request, **kwargs):
+                    model, info = _model(_apply(original, request))
+                    primary = info['primary_item_id']
+                    types = [model.child_type(i)
+                             for i in model.transform_indices(primary)]
+                    self.assertIn(types, ([b'irot'], [b'irot', b'imir']))
+                    if len(types) == 2:
+                        self.assertEqual(model.prop_types(primary)[-1], b'imir')
+        for irot in range(4):
+            original = build_synthetic_heic(include_irot=True, irot_value=irot)
+            for request, axis in ((hr.FLIP_HORIZONTAL, 1), (hr.FLIP_VERTICAL, 0)):
+                model, info = _model(_apply(original, request))
+                irot_index, imir_index = model.transform_indices(
+                    info['primary_item_id'])
+                self.assertEqual(model.payload_byte(irot_index), irot)
+                self.assertEqual(model.payload_byte(imir_index), axis)
+
+    def test_unmirroring_removes_the_association_and_flipping_back_reuses_the_box(self):
+        """An iPhone-style mirrored photo ('irot' then 'imir'): a flip
+        along the 'imir' axis just drops the association (the box stays
+        in 'ipco'), and the same flip again finds the box and puts the
+        association back - giving the original 'iprp', byte for byte."""
+        for axis, request in ((1, hr.FLIP_HORIZONTAL), (0, hr.FLIP_VERTICAL)):
+            for irot in range(4):
+                with self.subTest(axis=axis, irot=irot):
+                    original = build_synthetic_heic(
+                        include_irot=True, irot_value=irot, imir_axis=axis,
+                        thumbnail='shared')
+                    m0, info = _model(original)
+                    primary = info['primary_item_id']
+                    once = _apply(original, request)
+                    m1, _ = _model(once)
+                    self.assertEqual(m1.children, m0.children)
+                    self.assertEqual(m1.prop_types(primary),
+                                     [b'ispe', b'irot'])
+                    self.assertEqual(m1.transform(primary), (False, irot))
+                    twice = _apply(once, request)
+                    m2, _ = _model(twice)
+                    self.assertEqual(m2.build(), m0.build())
+                    self.assertEqual(_reqt(twice),
+                                     hr.encode_requested_transform((False, 0)))
+                    self.assertEqual(hr.format_info(hr.gather_info(twice))[1], 4)
+                    self.assertEqual(hr.reverse_rotation(twice, verbose=False),
+                                     original)
+
+    def _assert_related_consistent(self, data, expected):
+        transform, displayed, tmaps, gains, _ = _display_state(data)
+        self.assertEqual(transform, expected)
+        for tmap_ispe, tmap_transform in tmaps:
+            self.assertEqual(tmap_ispe, displayed,
+                             "tmap 'ispe' must equal the primary's displayed size")
+            self.assertEqual(tmap_transform, (False, 0),
+                             "tmap's own transform must stay identity")
+        related = _related_transforms(data)
+        self.assertTrue(related, "fixture sanity check: related items expected")
+        for item_id, item_transform in related.items():
+            self.assertEqual(item_transform, transform,
+                             f"item {item_id} must stay oriented like the primary")
+
+    def test_thumbnail_and_gain_map_follow_the_primary(self):
+        """The images that go with the primary item carry its very
+        'irot'/'imir' properties; a flip gives them the same changes, so
+        they stay oriented like it - also through later rotations, which
+        change the shared 'irot' in place. The 'tmap' item keeps its own
+        identity transform, and its 'ispe' the displayed size."""
+        for layout in ('mdat_first', 'meta_first'):
+            for kwargs in (dict(include_irot=False, thumbnail='shared'),
+                           dict(include_irot=False, thumbnail='plain'),
+                           dict(include_irot=True, irot_value=1,
+                                thumbnail='shared'),
+                           dict(include_irot=True, irot_value=3, imir_axis=1,
+                                thumbnail='shared'),
+                           dict(include_irot=False, tmap='own',
+                                thumbnail='shared'),
+                           dict(include_irot=False, tmap='shared',
+                                thumbnail='shared'),
+                           dict(include_irot=True, irot_value=0, tmap='shared',
+                                thumbnail='shared'),
+                           dict(include_irot=True, irot_value=0, imir_axis=1,
+                                tmap='shared', thumbnail='shared'),
+                           dict(include_irot=True, irot_value=1, imir_axis=0,
+                                tmap='own', thumbnail='shared')):
+                original = build_synthetic_heic(layout=layout, include_exif=True,
+                                                **kwargs)
+                t0 = _display_state(original)[0]
+                for request in ALL_REQUESTS[4:]:
+                    with self.subTest(layout=layout, request=request, **kwargs):
+                        flipped = _apply(original, request)
+                        hr.verify_structure(flipped)
+                        expected = hr.compose_transforms(request, t0)
+                        self._assert_related_consistent(flipped, expected)
+                        for turns in (1, 2):
+                            again = hr.apply_rotation(flipped, turns, verbose=False)
+                            self._assert_related_consistent(
+                                again, hr.compose_irot(expected, turns))
+                            self.assertEqual(
+                                hr.reverse_rotation(again, verbose=False), original)
+                        self.assertEqual(
+                            hr.reverse_rotation(flipped, verbose=False), original)
+
+    def test_related_item_with_other_properties_is_left_with_a_warning(self):
+        """A thumbnail that doesn't have the primary's rotation/mirror
+        properties (here: none at all, next to a rotated primary) can't
+        simply be given the same changes: it is left alone, and `flip`
+        says so."""
+        original = build_synthetic_heic(include_irot=True, irot_value=1,
+                                        thumbnail='plain')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            flipped = hr.apply_transform(original, hr.FLIP_HORIZONTAL)
+        self.assertIn("[warning] item 5, which goes with the primary item",
+                      out.getvalue())
+        self.assertIn("left unchanged", out.getvalue())
+        self.assertEqual(_related_transforms(flipped), {5: (False, 0)})
+        self.assertEqual(_display_state(flipped)[0],
+                         hr.compose_transforms(hr.FLIP_HORIZONTAL, (False, 1)))
+        self.assertEqual(hr.reverse_rotation(flipped, verbose=False), original)
+
+    def test_exif_orientation_follows_a_flip(self):
+        # consistent files: every Exif value x every request
+        for exif in range(1, 9):
+            mirrored = exif in hr.EXIF_MIRRORED_ORIENTATION_TO_TURNS
+            turns = (hr.EXIF_MIRRORED_ORIENTATION_TO_TURNS[exif] if mirrored
+                     else hr.EXIF_ORIENTATION_TO_IROT[exif])
+            # as HEIF properties: 'irot' then a left-right 'imir'
+            original = build_synthetic_heic(
+                include_irot=True, irot_value=(-turns) % 4 if mirrored else turns,
+                imir_axis=1 if mirrored else None,
+                include_exif=True, exif_orientation=exif)
+            self.assertEqual(hr.transform_to_exif_orientation(
+                _display_state(original)[0]), exif, "fixture sanity check")
+            for request in ALL_REQUESTS[4:]:
+                with self.subTest(exif=exif, request=request):
+                    t, _, _, _, new_exif = _display_state(_apply(original, request))
+                    self.assertEqual(new_exif, hr.transform_to_exif_orientation(t))
+                    self.assertEqual(mirrored, new_exif in
+                                     hr.EXIF_ORIENTATION_TO_IROT)
+        # a tag that says "mirrored" where the HEIF properties don't:
+        # the request applies to what the tag said, as for a rotation
+        original = build_synthetic_heic(include_irot=True, irot_value=0,
+                                        include_exif=True, exif_orientation=2)
+        self.assertEqual(_display_state(
+            _apply(original, hr.FLIP_HORIZONTAL))[4], 1)
+        self.assertEqual(_display_state(
+            _apply(original, hr.FLIP_VERTICAL))[4], 3)
+        # --no-exif-sync
+        untouched = hr.apply_transform(original, hr.FLIP_HORIZONTAL,
+                                       sync_exif=False, verbose=False)
+        self.assertEqual(_display_state(untouched)[4], 2)
+
+    def test_info_describes_a_flipped_file(self):
+        original = build_synthetic_heic(include_irot=False)
+        for request, text, code in (
+                (hr.make_request(0, 'horizontal'),
+                 "has added: horizontal flip\n", 8),
+                (hr.make_request(0, 'vertical'), "has added: vertical flip\n", 6),
+                (hr.make_request(1, 'horizontal'),
+                 "has added: 90 deg, then horizontal flip (the same as 270 "
+                 "deg, then vertical flip)\n", 5),
+                (hr.make_request(1, 'vertical'),
+                 "has added: 270 deg, then horizontal flip (the same as 90 "
+                 "deg, then vertical flip)\n", 7)):
+            with self.subTest(request=request):
+                info = hr.gather_info(_apply(original, request))
+                shown, exit_code = hr.format_info(info)
+                self.assertIn(text, shown)
+                self.assertEqual(exit_code, code)
+                self.assertIn("file's mirroring ('imir'): none originally -> ",
+                              shown)
+                self.assertEqual(info['original_mirror'], ())
+                self.assertEqual(len(info['current_mirror']), 1)
+        # mirroring unchanged by this tool: the lines `rotate` always gave
+        shown = hr.format_info(hr.gather_info(_apply(_apply(
+            original, hr.FLIP_VERTICAL), hr.FLIP_VERTICAL)))[0]
+        self.assertIn("has added: 0 deg\n", shown)
+        self.assertIn("file's rotation: 0 deg originally -> 0 deg now", shown)
+
+    def test_older_record_is_replayed_with_the_flip_added(self):
+        """A file rotated by an older release (v1/v2 record), then
+        flipped: the original is restored and edited once, by the old
+        rotation followed by the flip - the very bytes of doing that to
+        the original. If the original can't be restored, the error says
+        which single command to run on it once recovered."""
+        for make in (_make_v1_style_record, _make_v2_style_record):
+            for kwargs in (dict(include_irot=False),
+                           dict(include_irot=True, irot_value=1)):
+                for added in range(4):
+                    for request in ALL_REQUESTS[4:]:
+                        with self.subTest(make=make.__name__, added=added,
+                                          request=request, **kwargs):
+                            original = build_synthetic_heic(layout='mdat_first',
+                                                            **kwargs)
+                            old = make(original, hr.apply_rotation(
+                                original, added, verbose=False))
+                            self.assertEqual(
+                                _apply(old, request),
+                                _apply(original, hr.compose_transforms(
+                                    request, (False, added))))
+        original = build_synthetic_heic(layout='mdat_first')
+        old = _make_v2_style_record(
+            original, hr.apply_rotation(original, 3, verbose=False))
+        _, entries = hr.parse_provenance(
+            old, hr.locate_structures(old)['provenance_hdr'])
+        entries[b'TVER'] = bytes([1, 7, 1])
+        entries[b'PCRC'] = struct.pack(
+            '>I', struct.unpack('>I', entries[b'PCRC'])[0] ^ 1)
+        with self.assertRaises(hr.ProvenanceError) as ctx:
+            _apply(_replace_record(old, 2, entries), hr.FLIP_VERTICAL)
+        self.assertIn("Use that release to recover the original, then run "
+                      "`rotate 90 --then-flip horizontal` on it with the "
+                      "latest release (270 deg that release added + vertical "
+                      "flip requested now).", str(ctx.exception))
+
+    def test_flipped_records_replay_correctly_after_a_future_format_bump(self):
+        """As for rotations (see TestProvenanceFormats): once the format
+        is bumped, today's records are replayed from the original by the
+        request stored in REQT - flips included."""
+        for kwargs in (dict(include_irot=False, thumbnail='shared'),
+                       dict(include_irot=True, irot_value=1, imir_axis=1,
+                            include_exif=True),
+                       dict(include_irot=True, irot_value=0, imir_axis=1,
+                            tmap='shared')):
+            original = build_synthetic_heic(layout='mdat_first', **kwargs)
+            for first in ALL_REQUESTS[4:]:
+                for second in ((False, 1), hr.FLIP_VERTICAL):
+                    with self.subTest(first=first, second=second, **kwargs):
+                        v3 = _apply(original, first)
+                        with unittest.mock.patch.object(hr, 'FORMAT_VERSION', 4), \
+                                unittest.mock.patch.object(
+                                    hr, 'COMPATIBLE_FORMAT_VERSIONS',
+                                    (1, 2, 3, 4)):
+                            replayed = _apply(v3, second)
+                            expected = _apply(original, hr.compose_transforms(
+                                second, first))
+                        self.assertEqual(replayed, expected)
+
+    def test_unsupported_arrangement_is_refused(self):
+        """The same 'irot' box associated twice with the primary item
+        can't supply an odd number of quarter turns - refused rather
+        than guessed at (no real file is built like this)."""
+        original = bytearray(build_synthetic_heic(include_irot=True,
+                                                  irot_value=0, imir_axis=1))
+        model, info = _model(bytes(original))
+        primary = info['primary_item_id']
+        assocs = model.assocs(primary)
+        irot_index = model.first_assoc(primary, b'irot')[1]
+        assocs[-1] = (irot_index, True)   # the 'imir' slot: 'irot' again
+        iprp = info['iprp_hdr']
+        original[iprp[0]:iprp[3]] = model.build()
+        with self.assertRaises(hr.BoxParseError) as ctx:
+            _apply(bytes(original), hr.make_request(1, 'horizontal'))
+        self.assertIn("can't flip", str(ctx.exception))
+
+
 # ---------------------------------------------------------------------------
 # 3. CLI-level tests
 # ---------------------------------------------------------------------------
@@ -1951,6 +2333,132 @@ class TestCLI(unittest.TestCase):
         rc, _, _ = run_cli('info', out_path3, '-q')
         self.assertEqual(rc, 4, "touched but net 0 deg contribution -> exit 4, "
                                  "never conflated with 'never touched' (exit 0)")
+
+    def test_flip_command(self):
+        """`flip <direction>` gives exactly what the core does for that
+        request; `h`/`v` (any case) are the same as the full words."""
+        with open(self.input_path, 'rb') as f:
+            original = f.read()
+        for direction, spellings in (('horizontal', ('horizontal', 'h', 'H')),
+                                     ('vertical', ('vertical', 'v', 'Vertical'))):
+            expected = hr.apply_transform(
+                original, hr.FLIP_REQUESTS[direction], verbose=False)
+            for spelling in spellings:
+                with self.subTest(direction=spelling):
+                    out_path = os.path.join(self.tmpdir, f'flip_{spelling}.heic')
+                    rc, out, err = run_cli('flip', spelling, self.input_path,
+                                           out_path)
+                    self.assertEqual(rc, 0, err)
+                    self.assertIn('reversibility self-check passed', out)
+                    with open(out_path, 'rb') as f:
+                        self.assertEqual(f.read(), expected)
+        restored = os.path.join(self.tmpdir, 'flip_restored.heic')
+        rc, _, err = run_cli('reverse', out_path, restored, '-q')
+        self.assertEqual(rc, 0, err)
+        with open(restored, 'rb') as f:
+            self.assertEqual(f.read(), original)
+
+    def test_rotate_then_flip_option(self):
+        """`rotate <angle> --then-flip <direction>`: the rotation first,
+        then the flip - wherever the option is put on the command line."""
+        with open(self.input_path, 'rb') as f:
+            original = f.read()
+        expected = hr.apply_transform(
+            original, hr.make_request(1, 'horizontal'), verbose=False)
+        for n, args in enumerate((
+                ('rotate', '90', '--then-flip', 'horizontal', self.input_path),
+                ('rotate', '--then-flip', 'h', '90', self.input_path),
+                ('90', '--then-flip', 'h', self.input_path),
+                ('rotate', '270', '--then-flip', 'vertical', self.input_path))):
+            with self.subTest(args=args[:-1]):
+                out_path = os.path.join(self.tmpdir, f'combined{n}.heic')
+                rc, _, err = run_cli(*args, out_path, '-q')
+                self.assertEqual(rc, 0, err)
+                with open(out_path, 'rb') as f:
+                    self.assertEqual(f.read(), expected)
+        out_path = os.path.join(self.tmpdir, 'combined_last.heic')
+        rc, _, err = run_cli('rotate', '90', self.input_path, out_path,
+                             '--then-flip=h', '-q')
+        self.assertEqual(rc, 0, err)
+        with open(out_path, 'rb') as f:
+            self.assertEqual(f.read(), expected)
+        # one command gives the display of the two run one after the other
+        step1 = os.path.join(self.tmpdir, 'step1.heic')
+        step2 = os.path.join(self.tmpdir, 'step2.heic')
+        self.assertEqual(run_cli('rotate', '90', self.input_path, step1, '-q')[0], 0)
+        self.assertEqual(run_cli('flip', 'h', step1, step2, '-q')[0], 0)
+        with open(step2, 'rb') as f:
+            two_steps = f.read()
+        self.assertEqual(_display_state(two_steps)[0], _display_state(expected)[0])
+        self.assertEqual(_reqt(two_steps), _reqt(expected))
+        # `rotate 180 --then-flip horizontal` IS a vertical flip
+        a = os.path.join(self.tmpdir, 'a.heic')
+        b = os.path.join(self.tmpdir, 'b.heic')
+        self.assertEqual(run_cli('180', '--then-flip', 'h', self.input_path, a, '-q')[0], 0)
+        self.assertEqual(run_cli('flip', 'v', self.input_path, b, '-q')[0], 0)
+        with open(a, 'rb') as fa, open(b, 'rb') as fb:
+            self.assertEqual(fa.read(), fb.read())
+
+    def test_flip_default_output_name_and_overwrite_rules(self):
+        """`flip` names its output like `rotate` does (<input>_rotated),
+        refuses to overwrite without -f, and writes nothing with
+        --dry-run."""
+        default_out = os.path.join(self.tmpdir, 'input_rotated.heic')
+        rc, out, err = run_cli('flip', 'h', self.input_path, '--dry-run')
+        self.assertEqual(rc, 0, err)
+        self.assertIn('[dry-run] flip would succeed', out)
+        self.assertFalse(os.path.exists(default_out))
+        rc, _, err = run_cli('flip', 'h', self.input_path)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(default_out))
+        rc, _, err = run_cli('flip', 'h', self.input_path)
+        self.assertEqual(rc, hr.EXIT_OUTPUT_EXISTS)
+        rc, _, err = run_cli('flip', 'h', self.input_path, '-f', '-q')
+        self.assertEqual(rc, 0, err)
+        restored = os.path.join(self.tmpdir, 'input_restored.heic')
+        with open(self.input_path, 'rb') as src, open(restored, 'wb') as dst:
+            dst.write(src.read())
+        os.remove(self.input_path)
+        rc, _, err = run_cli('flip', 'v', restored, '-q')
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(self.input_path),
+                        "'_restored' is stripped, as for rotate")
+
+    def test_flip_usage_errors(self):
+        for args in (('flip', 'sideways', self.input_path),
+                     ('flip', self.input_path),
+                     ('flip', '90', self.input_path),
+                     ('rotate', '90', '--then-flip', 'diagonal', self.input_path),
+                     ('reverse', '--then-flip', 'h', self.input_path)):
+            with self.subTest(args=args[:-1]):
+                rc, _, err = run_cli(*args, os.path.join(self.tmpdir, 'no.heic'))
+                self.assertEqual(rc, hr.EXIT_USAGE, err)
+                self.assertIn(f'ERROR Hard {hr.EXIT_USAGE}', err)
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, 'no.heic')))
+
+    def test_info_exit_codes_for_flipped_files(self):
+        """A flipped result is the rotation's code plus 4: 5/6/7 for
+        90/180/270 deg then a horizontal flip, 8 for the flip alone - so
+        code % 4 is the quarter turns, and code > 4 means flipped."""
+        for angle, code, text in (
+                ('0', 8, 'has added: horizontal flip'),
+                ('90', 5, 'has added: 90 deg, then horizontal flip'),
+                ('180', 6, 'has added: vertical flip'),
+                ('270', 7, 'has added: 270 deg, then horizontal flip')):
+            with self.subTest(angle=angle):
+                out_path = os.path.join(self.tmpdir, f'f{angle}.heic')
+                self.assertEqual(run_cli('rotate', angle, '--then-flip', 'h',
+                                         self.input_path, out_path, '-q')[0], 0)
+                rc, out, err = run_cli('info', out_path, '-q')
+                self.assertEqual((rc, out), (code, ''), err)
+                rc, out, err = run_cli('info', out_path)
+                self.assertEqual(rc, code, err)
+                self.assertIn(text, out)
+        # flipping back: touched, net nothing
+        back = os.path.join(self.tmpdir, 'back.heic')
+        self.assertEqual(run_cli('flip', 'h', os.path.join(
+            self.tmpdir, 'f0.heic'), back, '-q')[0], 0)
+        self.assertEqual(run_cli('info', back, '-q')[0], 4)
 
     def test_reverse_dry_run_as_provenance_check(self):
         # untouched file -> reverse --dry-run fails (nothing to reverse)
@@ -2275,13 +2783,57 @@ class TestRealFiles(unittest.TestCase):
                 self.assertEqual(zlib.crc32(restored) & 0xffffffff,
                                   zlib.crc32(original) & 0xffffffff)
 
+    def test_flips_of_every_file_in_testdata(self):
+        """Every request with a flip, on every real file: the primary's
+        display changes by exactly the request, the thumbnail, auxiliary
+        images and gain map stay oriented like it, a 'tmap' item keeps
+        its own transform and the displayed size, a second edit on top
+        composes, and `reverse` restores the exact original."""
+        files = _discover_real_test_files()
+        if not files:
+            self.skipTest("no .heic files in testdata/ - see README-test.md")
+        for fname in files:
+            with open(os.path.join(TESTDATA, fname), 'rb') as f:
+                original = f.read()
+            t0, _, tmaps0, _, _ = _display_state(original)
+            related0 = _related_transforms(original)
+            for request in ALL_REQUESTS[4:]:
+                with self.subTest(file=fname, request=request):
+                    flipped = hr.apply_transform(original, request, verbose=False)
+                    hr.verify_structure(flipped)
+                    self._check(flipped, hr.compose_transforms(request, t0),
+                                t0, related0, tmaps0)
+                    again = hr.apply_transform(flipped, (True, 1), verbose=False)
+                    self._check(again, hr.compose_transforms(
+                        (True, 1), hr.compose_transforms(request, t0)),
+                        t0, related0, tmaps0)
+                    for data in (flipped, again):
+                        self.assertEqual(
+                            hr.reverse_rotation(data, verbose=False), original)
+
+    def _check(self, data, expected, t0, related0, tmaps0):
+        t, displayed, tmaps, _, exif = _display_state(data)
+        self.assertEqual(t, expected)
+        if exif is not None:
+            self.assertEqual(exif, hr.transform_to_exif_orientation(t))
+        for item_id, transform in _related_transforms(data).items():
+            # every real test file's related items start out oriented
+            # like the primary
+            self.assertEqual(related0[item_id], t0, "test file sanity check")
+            self.assertEqual(transform, t, f"item {item_id}")
+        for (ispe, transform), (_, transform0) in zip(tmaps, tmaps0):
+            self.assertEqual(transform, transform0)
+            self.assertEqual(ispe, displayed)
+
     def test_write_all_rotations_for_visual_inspection(self):
         """Structural round-tripping (above) proves the bytes reconstruct
         exactly, but it can't prove the pixels actually LOOK rotated - no
         HEIC decoder is available in this sandbox to check that
         automatically. This writes real output files to rotated/ (0, 90,
         180, 270 deg, one set per file in testdata/) so a human can open
-        each one in an image viewer and confirm it displays correctly.
+        each one in an image viewer and confirm it displays correctly -
+        plus three flipped ones per file (horizontal, vertical, and 90
+        deg then horizontal).
         This is exactly the kind of check that caught the real
         provenance-insertion bug documented in heic_rotate.py's module
         docstring - structural checks alone missed it.
@@ -2312,6 +2864,16 @@ class TestRealFiles(unittest.TestCase):
                     out_path = os.path.join(ROTATED_DIR, f"{stem}_rot{angle}{ext}")
                     with open(out_path, 'wb') as out_f:
                         out_f.write(rotated)
+                    self.assertTrue(os.path.exists(out_path))
+            for label, request in (
+                    ('flipH', hr.FLIP_HORIZONTAL), ('flipV', hr.FLIP_VERTICAL),
+                    ('rot90_flipH', hr.make_request(1, 'horizontal'))):
+                with self.subTest(file=fname, flip=label):
+                    flipped = hr.apply_transform(original, request, verbose=False)
+                    hr.verify_structure(flipped)
+                    out_path = os.path.join(ROTATED_DIR, f"{stem}_{label}{ext}")
+                    with open(out_path, 'wb') as out_f:
+                        out_f.write(flipped)
                     self.assertTrue(os.path.exists(out_path))
 
         print(f"\n[visual check] wrote rotated test files to {ROTATED_DIR} "
