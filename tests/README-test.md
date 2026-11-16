@@ -239,11 +239,40 @@ same as heic-lossless-rotate itself. Requires Python 3.
      not tested against an actual fixture with two.
    - `TestSameFileInputOutput` - `rotate`/`reverse` with an explicit
      output path equal to the input path (a natural way to ask for "edit
-     this file in place") isn't exercised anywhere else in the suite.
-     It's currently correct only as a side effect of the whole input
-     file being read into memory before any output is written, which
-     makes it an easy property to accidentally break in a future change
-     to the write path - worth pinning down directly.
+     this file in place"). The input file is never read into memory as
+     a whole - the output is streamed from it - so it can't be written
+     over while that's going on: every output goes to a temporary file
+     next to its destination, renamed into place once complete. Checks
+     that this works (also for a file large enough to be streamed in
+     several chunks, rotated onto itself repeatedly), leaves no
+     temporary file behind whether the run succeeds or fails, keeps the
+     overwritten file's permissions, and writes through a symlink.
+   - `TestStreaming` - the file is never held in memory:
+     `rotate_source()`/`reverse_source()` take it as a `ByteSource` and
+     return the result as another, reading into memory only its
+     metadata and streaming the rest in chunks. `apply_rotation()`/
+     `reverse_rotation()`, which the rest of the suite calls, are those
+     same functions over bytes in memory - so these check what differs
+     for a real file: that results are byte-identical at any chunk size
+     (from 1 byte up, so a chunk boundary falls on and inside every
+     edit), that no read of the file is ever larger than a chunk and
+     `info` reads only the metadata, that peak memory (`tracemalloc`)
+     stays far below the file size across `rotate`/`reverse` runs, and
+     the pieces underneath: `PatchedSource` against plain splicing for
+     random edits, the header-only top-level scan against buffer
+     parsing, a file that shrinks while being read, a box smaller than
+     its own header (which used to loop forever), a provenance box
+     something else moved away from `meta`, and a record missing a
+     required entry.
+   - `TestUnsupportedLayoutsRefused` - when an edit moves the data
+     after `meta`, only `iloc` is updated, so a top-level box that may
+     refer to data by file offset (`moov`, an unknown or foreign `uuid`
+     box, a second `meta`, before or after `meta`) is refused with `52`,
+     and so is an item located through a data reference (`dref`) whose
+     offset would have to move. Also checks what must keep working:
+     `free`/`skip`/Samsung's `sefd` after `meta`, anything at all when
+     `meta` is last in the file (nothing moves), and an Exif item
+     located through a data reference being left unsynced and untouched.
    - `TestDryRunSizeReport` - checks `--dry-run`'s reported size and
      vs-input delta against a real `apply_rotation()` result, since
      nothing else in the suite verifies those numbers are actually
@@ -258,8 +287,8 @@ same as heic-lossless-rotate itself. Requires Python 3.
 6. **Correctness of the lighter-weight reversibility check used by
    `rotate`'s self-check.** `verify_reversible()` computes the same
    pass/fail determination as `reverse_rotation()` - and the identical
-   underlying CRC32 when both succeed - without allocating a second
-   full-file buffer (see its docstring in `core.py`). Since the
+   underlying CRC32 when both succeed - without keeping the
+   reconstructed file (see its docstring in `core.py`). Since the
    post-rotate self-check trusts it exclusively, a bug that made it
    silently diverge from `reverse_rotation()` would defeat the very
    thing the self-check exists to catch:
@@ -274,17 +303,16 @@ same as heic-lossless-rotate itself. Requires Python 3.
      regression test confirming `verify_reversible()` doesn't allocate
      memory proportional to file size - the whole reason it exists.
    - `TestSharedReconstructionCode` - goes a step further than just
-     checking agreement: both functions call the exact same
-     `_prepare_reversal()` and `_iter_reconstructed_chunks()` to produce
-     the reconstructed bytes (the latter is the single piece of code
-     that decides what those bytes are and in what order; each caller
-     only differs in what it does with the resulting chunks -
-     concatenate them into real output, or feed them straight into a
-     CRC32 and discard). Verifies this two ways: a static check that
-     each function's own bytecode references both shared helpers by
-     name, and a dynamic check that wraps `_iter_reconstructed_chunks`
-     to record the literal chunk sequence each function consumes for
-     the same input, confirming they're byte-for-byte identical.
+     checking agreement: both functions are the exact same
+     `reverse_source()` (the single piece of code that decides what the
+     reconstructed bytes are and whether they match the original; each
+     caller only differs in what it does with the result - return its
+     bytes, or discard it). Verifies this two ways: a static check that
+     each function's own bytecode references `reverse_source` by name
+     and does no reconstructing or CRC checking of its own, and a
+     dynamic check that wraps `reverse_source` to record the literal
+     chunk sequence its result consists of for the same input,
+     confirming they're byte-for-byte identical.
    - `TestReturnTypeAvoidsExtraCopy` - `apply_rotation()` and
      `reverse_rotation()` return the `bytearray` they already built
      rather than wrapping it in `bytes()` first; pinned directly since

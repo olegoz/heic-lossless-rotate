@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Changed
+- Memory use no longer grows with file size: only the file's metadata
+  is loaded into memory, and the image data is copied from the input
+  file to the output file in chunks.
+- The output file is written through a temporary file, so an
+  interrupted run never leaves a half-written one, and the output may
+  be the input file itself.
+
+### Fixed
+- A file with a top-level box that may refer to data an edit moves
+  (such as `moov`) is refused (`52`), instead of being written with
+  that box pointing at the wrong place. A file with Exif data inside
+  the `meta` box is refused up front (`52`, was `57`).
+- Smaller fixes: a possible hang on a malformed box, Exif data in
+  another file no longer synced, and a clearer error for an incomplete
+  record.
+
+See [docs/releases/v3.0.0.md](docs/releases/v3.0.0.md) for full details.
+
 ## [2.0.0] - 2026-11-09
 ### Fixed
 - Mirrored photos (e.g. iPhone front-camera shots) were rotated in the

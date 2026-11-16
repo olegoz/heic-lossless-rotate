@@ -9,10 +9,16 @@ private provenance ('uuid') box format, and the top-level apply_rotation
 / reverse_rotation / gather_info / format_info / verify_structure
 operations the CLI (heic_rotate.cli) drives.
 
-It has no knowledge of argv, subcommands, or file I/O paths - it takes
-and returns `bytes`, and raises BoxParseError/ProvenanceError on
-malformed input. See heic_rotate.cli for the command-line interface and
-its own module docstring for user-facing usage/design documentation.
+It has no knowledge of argv, subcommands, or file paths. A file is
+handed to it as a ByteSource (see "Byte sources" below) - a
+random-access view of its bytes - and an edited file comes back as
+another one, so that only the file's metadata ('meta' and the
+provenance box) is ever held in memory: everything else, the image
+data in 'mdat' above all, is streamed through in chunks. apply_rotation
+/ reverse_rotation are the same operations on whole files held in
+memory as `bytes`. Raises BoxParseError/ProvenanceError on malformed
+input. See heic_rotate.cli for the command-line interface and its own
+module docstring for user-facing usage/design documentation.
 """
 import struct
 import sys
@@ -116,10 +122,168 @@ class InternalError(HeicRotateError):
 
 
 class SelfCheckError(HeicRotateError):
-    """`rotate`'s finished output, reversed in memory, didn't give back
-    the original file, so it wasn't written. Whatever the underlying
+    """`rotate`'s finished output, reversed before writing it, didn't
+    give back the original file, so it wasn't written. Whatever the underlying
     reason (in the message), this is always a hard error of its own."""
     exit_code = EXIT_SELF_CHECK_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Byte sources: random-access, read-only views of a whole file's bytes
+# ---------------------------------------------------------------------------
+#
+# Nothing here ever needs a whole file in memory. The only bytes read
+# into memory are the ones this tool parses or edits: the top-level box
+# headers, the 'meta' box, the provenance box and a few bytes of the
+# embedded Exif item (see load_span, find_exif_orientation_field).
+# Everything else is only ever STREAMED, in chunks, into a CRC32 or
+# into the output file. An edited file is itself a ByteSource - a
+# PatchedSource over the file it was made from - so `rotate` can check
+# that its output reverses to the original (verify_reversible) before a
+# single byte of it has been written anywhere.
+
+CHUNK_SIZE = 1 << 20    # bytes read from a file at a time when streaming
+
+
+class ByteSource:
+    """A file's bytes: `size`, read(start, end) for the small ranges
+    that are parsed, and chunks(start, end) to stream a large range
+    without holding it. 0 <= start <= end <= size for both."""
+    size = 0
+
+    def chunks(self, start, end):
+        """Yield the bytes of [start, end), in order, as bytes-like
+        chunks of bounded size (or zero-copy views of bytes that are in
+        memory anyway)."""
+        raise NotImplementedError
+
+    def read(self, start, end):
+        """The bytes of [start, end), as `bytes`."""
+        return b''.join(self.chunks(start, end))
+
+
+class BytesSource(ByteSource):
+    """A file held in memory as bytes/bytearray. Never copies it."""
+
+    def __init__(self, data):
+        self._data = data
+        self.size = len(data)
+
+    def chunks(self, start, end):
+        if start < end:
+            yield memoryview(self._data)[start:end]
+
+    def read(self, start, end):
+        return bytes(self._data[start:end])
+
+
+class FileSource(ByteSource):
+    """An open, seekable binary file - read on demand, never as a
+    whole. Its size is taken once, here: a file that turns out shorter
+    while it's being read raises OSError."""
+
+    def __init__(self, f):
+        self._f = f
+        self.size = f.seek(0, 2)
+
+    def read(self, start, end):
+        self._f.seek(start)
+        data = self._f.read(end - start)
+        if len(data) != end - start:
+            raise OSError(
+                f"unexpected end of file: wanted bytes {start}-{end}, got "
+                f"{len(data)} of {end - start} (file changed while reading?)")
+        return data
+
+    def chunks(self, start, end):
+        while start < end:
+            chunk = self.read(start, min(start + CHUNK_SIZE, end))
+            yield chunk
+            start += len(chunk)
+
+
+class PatchedSource(ByteSource):
+    """`base` with some byte ranges replaced: `patches` is a list of
+    (start, end, replacement), [start, end) being a range of `base` and
+    `replacement` the bytes that take its place - of any length, so
+    this is also how bytes are inserted or removed. The ranges must not
+    overlap. Nothing is copied: the replaced ranges are simply never
+    read from `base`, the rest is streamed from it on demand."""
+
+    def __init__(self, base, patches):
+        self._base = base
+        # (start, end, base_start, replacement) for each run of this
+        # source's bytes: `replacement` if not None, else the bytes of
+        # `base` from base_start
+        self._pieces = []
+        size = base_pos = 0
+        for start, end, replacement in sorted(patches, key=lambda p: p[:2]):
+            if not base_pos <= start <= end <= base.size:
+                raise InternalError(
+                    f"internal error: edits overlap or fall outside the "
+                    f"file (bytes {start}-{end}, after {base_pos}, of "
+                    f"{base.size})")
+            if start > base_pos:
+                self._pieces.append(
+                    (size, size + start - base_pos, base_pos, None))
+                size += start - base_pos
+            if len(replacement):
+                self._pieces.append(
+                    (size, size + len(replacement), None, replacement))
+                size += len(replacement)
+            base_pos = end
+        if base.size > base_pos:
+            self._pieces.append((size, size + base.size - base_pos, base_pos, None))
+            size += base.size - base_pos
+        self.size = size
+
+    def chunks(self, start, end):
+        for p_start, p_end, base_start, replacement in self._pieces:
+            lo, hi = max(start, p_start), min(end, p_end)
+            if lo >= hi:
+                continue
+            if replacement is None:
+                yield from self._base.chunks(base_start + lo - p_start,
+                                             base_start + hi - p_start)
+            else:
+                yield memoryview(replacement)[lo - p_start:hi - p_start]
+
+
+def as_source(data):
+    """`data` as a ByteSource: itself if it is one, else (bytes,
+    bytearray) wrapped in a BytesSource."""
+    return data if isinstance(data, ByteSource) else BytesSource(data)
+
+
+def crc32_of_chunks(chunks, crc=0):
+    """CRC32 of the concatenation of `chunks`, continuing from `crc`."""
+    for chunk in chunks:
+        crc = zlib.crc32(chunk, crc)
+    return crc & 0xffffffff
+
+
+def materialize(source):
+    """All of `source`'s bytes, as one bytearray."""
+    out = bytearray()
+    for chunk in source.chunks(0, source.size):
+        out += chunk
+    return out
+
+
+# Top-level boxes an edit may move (when 'meta' changes size and
+# something follows it): ones that hold no file offsets of their own,
+# nor anything another box refers to by file offset - except 'mdat',
+# which 'iloc' refers to and which is patched to match (see
+# patch_iloc_offsets_at_threshold). Any other top-level box - 'moov'
+# (whose 'stco'/'co64' hold file offsets), 'moof', 'sidx', a second
+# 'meta', or one this tool doesn't know - may refer to data by file
+# offset, so a file with one is refused when an edit would move data
+# (see _check_nothing_unsupported_moves).
+#   'sefd': Samsung's trailer (Galaxy phones). Its own directory
+#     ('SEFH') locates its entries by distance back from itself, so it
+#     can move as a whole.
+MOVABLE_TOP_LEVEL_BOXES = frozenset(
+    (b'ftyp', b'mdat', b'free', b'skip', b'wide', b'sefd'))
 
 
 # The provenance format version every record is WRITTEN in. Older
@@ -184,24 +348,52 @@ PROVENANCE_UUID = uuid_mod.uuid5(uuid_mod.NAMESPACE_URL,
 # Generic ISOBMFF box reading helpers (read-only, operate on `bytes`/`bytearray`)
 # ---------------------------------------------------------------------------
 
-def read_box_header(data, pos):
-    """Return (start, header_len, content_start, content_end, boxtype) or None at EOF."""
-    if pos + 8 > len(data):
+def _parse_box_header(buf, buf_pos, pos, total):
+    """Parse the header at buf[buf_pos:] of a box that starts at `pos`
+    of a file (or buffer) `total` bytes long. Return (start, header_len,
+    content_start, content_end, boxtype) or None at EOF."""
+    avail = min(len(buf) - buf_pos, total - pos)
+    if avail < 8:
         return None
-    size, boxtype = struct.unpack_from('>I4s', data, pos)
+    size, boxtype = struct.unpack_from('>I4s', buf, buf_pos)
     header_len = 8
     if size == 1:
-        if pos + 16 > len(data):
+        if avail < 16:
             raise BoxParseError("truncated 64-bit box size")
-        size = struct.unpack_from('>Q', data, pos + 8)[0]
+        size = struct.unpack_from('>Q', buf, buf_pos + 8)[0]
         header_len = 16
     elif size == 0:
-        size = len(data) - pos  # extends to EOF
+        size = total - pos  # extends to EOF
+    if size < header_len:
+        # (also what keeps iter_boxes from looping forever on a 64-bit
+        # size of 0)
+        raise BoxParseError(f"box {boxtype} at {pos} claims size {size}, "
+                             f"smaller than its own header")
     content_start = pos + header_len
     content_end = pos + size
-    if content_end > len(data):
+    if content_end > total:
         raise BoxParseError(f"box {boxtype} at {pos} claims size {size} beyond EOF")
     return pos, header_len, content_start, content_end, boxtype
+
+
+def read_box_header(data, pos):
+    """Return (start, header_len, content_start, content_end, boxtype) or None at EOF."""
+    return _parse_box_header(data, pos, pos, len(data))
+
+
+def scan_top_level(source):
+    """The header of each top-level box of `source` (a ByteSource), as
+    iter_boxes() gives them for a buffer - reading only the headers
+    themselves, 16 bytes per box, never any box's content."""
+    top = []
+    pos = 0
+    while True:
+        hdr = _parse_box_header(
+            source.read(pos, min(pos + 16, source.size)), 0, pos, source.size)
+        if hdr is None:
+            return top
+        top.append(hdr)
+        pos = hdr[3]
 
 
 def iter_boxes(data, start, end):
@@ -476,7 +668,8 @@ def build_iloc_content(iloc):
 
 def patch_iloc_offsets_at_threshold(data, iloc_hdr, threshold, delta):
     """Shift every absolute-offset iloc extent that points at or past
-    `threshold` by `delta`. Returns (new_iloc_content_or_None, any_changed).
+    `threshold` - an absolute offset of the FILE, wherever in it `data`
+    starts - by `delta`. Returns (new_iloc_content_or_None, any_changed).
 
     Deliberately patches at the EXTENT level only, and never touches
     base_offset - the standard allows any split between base_offset and
@@ -500,6 +693,16 @@ def patch_iloc_offsets_at_threshold(data, iloc_hdr, threshold, delta):
             continue  # idat-relative or item-relative: not a file offset
         for ext in it['extents']:
             if it['base_offset'] + ext[1] >= threshold:
+                if delta and it['data_ref_index'] != 0:
+                    # An offset into the file 'dinf'/'dref' names - this
+                    # file or another one, which this tool doesn't
+                    # read. Shifting it would be wrong for another file,
+                    # not shifting it wrong for this one.
+                    raise BoxParseError(
+                        f"item {it['item_id']}'s data is located through a "
+                        f"data reference ('dref' entry {it['data_ref_index']}), "
+                        f"and this edit would move data it may refer to - "
+                        f"not supported")
                 ext[1] += delta
                 any_changed = True
     if not any_changed:
@@ -966,44 +1169,64 @@ def find_exif_item_location(data, meta_body_start, meta_c_end):
         return None
     iloc = parse_iloc(data, iloc_hdr[2], iloc_hdr[3])
     it = next((i for i in iloc['items'] if i['item_id'] == exif_item_id), None)
-    if it is None or it['constr_method'] != 0 or not it['extents']:
-        return None  # only handle the simple/common absolute-offset case
+    if (it is None or it['constr_method'] != 0 or it['data_ref_index'] != 0
+            or not it['extents']):
+        # only handle the simple/common case: an absolute offset of THIS
+        # file (data reference 0), not of a file 'dinf'/'dref' names
+        return None
     ext_offset, ext_length = it['extents'][0][1], it['extents'][0][2]
     abs_start = it['base_offset'] + ext_offset
     return exif_item_id, abs_start, ext_length
 
 
-def find_exif_orientation_field(data, meta_body_start, meta_c_end):
+def find_exif_orientation_field(data, meta_body_start, meta_c_end, file=None):
     """Return (abs_offset_of_2byte_value, byte_order_char, current_value) or
-    None if there's no embedded Exif item / no Orientation tag in it."""
+    None if there's no embedded Exif item / no Orientation tag in it.
+
+    `data` holds the 'meta' box. The Exif item's own bytes normally sit
+    in 'mdat', at an absolute offset of the file: they're read from
+    `file` (a ByteSource; default: `data` itself is the whole file) -
+    only the TIFF header and IFD0, never the whole item - and the offset
+    returned is an offset of that file."""
     loc = find_exif_item_location(data, meta_body_start, meta_c_end)
     if loc is None:
         return None
     _, abs_start, length = loc
-    blob = data[abs_start:abs_start + length]
-    if len(blob) < 12:
+    if file is None:
+        file = BytesSource(data)
+    blob_len = min(length, file.size - abs_start)
+
+    def blob(start, end):
+        """The item's bytes [start, end), cut off where the item ends -
+        what slicing the whole item would give."""
+        end = min(end, blob_len)
+        if start >= end:
+            return b''
+        return file.read(abs_start + start, abs_start + end)
+
+    if blob_len < 12:
         return None
-    tiff_header_offset = struct.unpack('>I', blob[0:4])[0]
+    tiff_header_offset = struct.unpack('>I', blob(0, 4))[0]
     tiff_start_in_blob = 4 + tiff_header_offset
-    tiff = blob[tiff_start_in_blob:]
-    if len(tiff) < 8 or tiff[:2] not in (b'II', b'MM'):
+    tiff_len = blob_len - tiff_start_in_blob
+    tiff_header = blob(tiff_start_in_blob, tiff_start_in_blob + 8)
+    if len(tiff_header) < 8 or tiff_header[:2] not in (b'II', b'MM'):
         return None
-    byte_order = '<' if tiff[:2] == b'II' else '>'
-    ifd0_offset = struct.unpack(byte_order + 'I', tiff[4:8])[0]
-    if ifd0_offset + 2 > len(tiff):
+    byte_order = '<' if tiff_header[:2] == b'II' else '>'
+    ifd0_offset = struct.unpack(byte_order + 'I', tiff_header[4:8])[0]
+    if ifd0_offset + 2 > tiff_len:
         return None
-    num_entries = struct.unpack(byte_order + 'H', tiff[ifd0_offset:ifd0_offset + 2])[0]
+    ifd0_start = tiff_start_in_blob + ifd0_offset
+    num_entries = struct.unpack(byte_order + 'H', blob(ifd0_start, ifd0_start + 2))[0]
     pos = ifd0_offset + 2
-    for _ in range(num_entries):
-        entry = tiff[pos:pos + 12]
-        if len(entry) < 12:
-            break
-        tag, typ, count = struct.unpack(byte_order + 'HHI', entry[:8])
+    # every complete 12-byte entry (at most 65535 of them)
+    ifd = blob(tiff_start_in_blob + pos, tiff_start_in_blob + pos + 12 * num_entries)
+    for i in range(len(ifd) // 12):
+        tag, typ, count = struct.unpack_from(byte_order + 'HHI', ifd, 12 * i)
         if tag == 0x0112:  # Orientation
-            value = struct.unpack(byte_order + 'H', entry[8:10])[0]
-            abs_value_offset = abs_start + tiff_start_in_blob + pos + 8
+            value = struct.unpack_from(byte_order + 'H', ifd, 12 * i + 8)[0]
+            abs_value_offset = abs_start + tiff_start_in_blob + pos + 12 * i + 8
             return abs_value_offset, byte_order, value
-        pos += 12
     return None
 
 
@@ -1012,20 +1235,17 @@ def find_exif_orientation_field(data, meta_body_start, meta_c_end):
 # ---------------------------------------------------------------------------
 
 def crc32_excluding_range(data, excl_start, excl_end):
-    """CRC32 of `data` with the byte range [excl_start, excl_end) removed -
-    used so a provenance box's own CRC field isn't hashing itself.
+    """CRC32 of `data` (a ByteSource, or a whole file as bytes) with the
+    byte range [excl_start, excl_end) removed - used so a provenance
+    box's own CRC field isn't hashing itself.
 
-    Computed as two incremental passes over zero-copy `memoryview` slices
-    instead of slicing both halves and concatenating them, which would
-    allocate three near-full-size temporaries (prefix copy, suffix copy,
-    joined copy) for what's conceptually a single pass. `zlib.crc32`
-    supports incremental continuation via its second argument, so this
-    produces the identical result without ever materializing a second
-    buffer."""
-    view = memoryview(data)
-    crc = zlib.crc32(view[:excl_start])
-    crc = zlib.crc32(view[excl_end:], crc)
-    return crc & 0xffffffff
+    Computed as two incremental passes over the bytes before and after
+    the range, streamed in chunks (`zlib.crc32` continues from a
+    previous value via its second argument), so nothing is ever copied
+    or held."""
+    source = as_source(data)
+    crc = crc32_of_chunks(source.chunks(0, excl_start))
+    return crc32_of_chunks(source.chunks(excl_end, source.size), crc)
 
 
 def find_provenance_box(data):
@@ -1089,7 +1309,8 @@ def newer_version_error(problem, entries, advice=None, cls=NewerVersionError):
 
 
 def recovery_advice(data, then=''):
-    """When this release can't restore a file's original: if another
+    """When this release can't restore a file's original (`data`: a
+    ByteSource, or the whole file as bytes): if another
     release last updated the file, and nothing else has modified it
     since (its CCRC matches), the advice to recover the original with
     that release - which checked, before writing the file, that it
@@ -1101,13 +1322,15 @@ def recovery_advice(data, then=''):
     can't restore it: `reverse` (cli.py), `rotate` on an older record
     (_replay_from_original), and any later one."""
     try:
-        hdr = find_provenance_box(data)
+        source = as_source(data)
+        base, span = load_span(source)
+        hdr = find_provenance_box(span)
         if hdr is None:
             return None
-        _, entries = parse_provenance(data, hdr)
+        _, entries = parse_provenance(span, hdr)
         ccrc = entries.get(b'CCRC')
         if (ccrc is None or len(ccrc) != 4 or struct.unpack('>I', ccrc)[0]
-                != crc32_excluding_range(data, hdr[0], hdr[3])):
+                != crc32_excluding_range(source, base + hdr[0], base + hdr[3])):
             return None
     except HeicRotateError:
         return None
@@ -1250,6 +1473,39 @@ def locate_structures(data):
         'iprp_hdr': iprp_hdr, 'iloc_hdr': iloc_hdr,
         'provenance_hdr': provenance_hdr,
     }
+
+
+def load_span(source):
+    """Read into memory the one part of `source` (a ByteSource) this
+    tool ever parses or rewrites: its top-level 'meta' box and, if the
+    file has one, the provenance box - which apply_rotation always
+    puts right after 'meta'. Returns (base, span): `span` is a
+    bytearray of the file's bytes from offset `base` on, holding
+    exactly those boxes.
+
+    Box parsing is header-driven, not position-driven, so everything
+    that works on a whole file in a buffer - locate_structures() and
+    all the box editing built on it - works on `span` unchanged, with
+    offsets relative to `base`. Only two things refer to absolute file
+    offsets, and both get them: the 'iloc' extents compared against a
+    threshold (see patch_iloc_offsets_at_threshold) and the embedded
+    Exif item (see find_exif_orientation_field).
+
+    If something else has moved the provenance box away from 'meta',
+    the span is everything from the first of the two to the end of the
+    last - in memory, whatever lies between them; the file is then
+    handled exactly as if it had been read whole."""
+    top = scan_top_level(source)
+    meta_hdr = next((h for h in top if h[4] == b'meta'), None)
+    if meta_hdr is None:
+        raise BoxParseError("no top-level 'meta' box found - not a valid HEIF file?")
+    start, end = meta_hdr[0], meta_hdr[3]
+    for hdr in top:
+        if (hdr[4] == b'uuid' and hdr[3] - hdr[2] >= 16
+                and source.read(hdr[2], hdr[2] + 16) == PROVENANCE_UUID):
+            start, end = min(start, hdr[0]), max(end, hdr[3])
+            break
+    return start, bytearray(source.read(start, end))
 
 
 def _rotation_from_iprp_range(data, iprp_c_start, iprp_c_end, primary_item_id):
@@ -1423,11 +1679,12 @@ def _plan_iprp_edit(data, struct_info, existing_provenance, delta_turns, tmap_it
             'notes': notes, 'warnings': warnings}
 
 
-def _splice_iprp(data, struct_info, new_iprp_box, verbose, label):
+def _splice_iprp(data, struct_info, new_iprp_box, verbose, label, base=0):
     """Return (out, delta): a copy of `data` with its 'iprp' box replaced
     by `new_iprp_box` (which may differ in size by `delta` bytes), with
     'meta''s size field and - if 'meta' precedes 'mdat' - every affected
-    absolute 'iloc' offset patched to match."""
+    absolute 'iloc' offset patched to match. `data` starts at offset
+    `base` of the file (see load_span)."""
     meta_start = struct_info['meta_hdr'][0]
     iprp_start, _, _, iprp_c_end, _ = struct_info['iprp_hdr']
     iloc_hdr = struct_info['iloc_hdr']
@@ -1436,7 +1693,7 @@ def _splice_iprp(data, struct_info, new_iprp_box, verbose, label):
 
     iloc_patch_op = None
     new_iloc_content, any_changed = patch_iloc_offsets_at_threshold(
-        data, iloc_hdr, iprp_start, delta)
+        data, iloc_hdr, base + iprp_start, delta)
     if any_changed:
         iloc_c_start, iloc_c_end = iloc_hdr[2], iloc_hdr[3]
         iloc_patch_op = (iloc_c_start, iloc_c_end, new_iloc_content)
@@ -1579,16 +1836,16 @@ def _mirrored_after_rotation(data):
 
 def _recorded_rotation(data, record_version, entries, original=None):
     """The rotation (0-3 quarter turns) requested_transform() says was
-    requested for `data`, a file with a format `record_version`
-    provenance record holding `entries`. The original 'irot' value (only
-    needed for formats that don't store the request) is read from
-    `original` (the restored original file) if given, otherwise straight
-    from the record - so it is known even if the original can't be
-    restored."""
+    requested for `data` (see load_span), a file with a format
+    `record_version` provenance record holding `entries`. The original
+    'irot' value (only needed for formats that don't store the request)
+    is read from `original` (the restored original file, a ByteSource)
+    if given, otherwise straight from the record - so it is known even
+    if the original can't be restored."""
     if record_version >= 3:
         original_turns = None
     elif original is not None:
-        original_turns = get_current_rotation(original)
+        original_turns = get_current_rotation(load_span(original)[1])
     else:
         info = locate_structures(data)
         original_turns = get_rotation_from_iprp_snapshot(
@@ -1597,9 +1854,10 @@ def _recorded_rotation(data, record_version, entries, original=None):
                                get_current_rotation(data))[1]
 
 
-def _replay_from_original(data, record_version, entries, delta_turns,
+def _replay_from_original(source, data, record_version, entries, delta_turns,
                           sync_exif, verbose):
-    """apply_rotation() for a file whose provenance record is in an OLDER
+    """rotate_source() for a file (`source`; `data` is its load_span())
+    whose provenance record is in an OLDER
     format than FORMAT_VERSION: rather than carrying forward (and having
     to repair) state written by an older release, restore the original
     file with `reverse` - which verifies it against the recorded
@@ -1614,7 +1872,7 @@ def _replay_from_original(data, record_version, entries, delta_turns,
     rotate it with the latest release (see recovery_advice)."""
     delta_turns %= 4
     try:
-        original = reverse_rotation(data, verbose=False)
+        original = reverse_source(source, verbose=False)
     except NewerVersionError:
         raise
     except (ProvenanceError, BoxParseError) as e:
@@ -1634,7 +1892,7 @@ def _replay_from_original(data, record_version, entries, delta_turns,
         message = (f"cannot upgrade this file's metadata (format "
                    f"v{record_version}): restoring the original file "
                    f"failed: {str(e).rstrip('.')}.")
-        advice = recovery_advice(data, then)
+        advice = recovery_advice(source, then)
         raise ProvenanceError(f"{message} {advice}" if advice else message
                               ) from None
     added = _recorded_rotation(data, record_version, entries, original)
@@ -1645,10 +1903,35 @@ def _replay_from_original(data, record_version, entries, delta_turns,
               f"rotating it by {total * 90} deg - the {added * 90} deg the "
               f"earlier release added, plus the {delta_turns * 90} deg "
               f"requested now")
-    return apply_rotation(original, total, sync_exif, verbose)
+    return rotate_source(original, total, sync_exif, verbose)
 
 
 def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
+    """rotate_source() for a whole file held in memory: takes its bytes,
+    returns the whole rotated file as a bytearray."""
+    return materialize(rotate_source(BytesSource(data), delta_turns,
+                                     sync_exif, verbose))
+
+
+def _check_nothing_unsupported_moves(source, base, span_end, delta):
+    """Raise BoxParseError if replacing `source`'s bytes [base,
+    span_end) - its 'meta' and provenance boxes - with `delta` more
+    bytes would move data that a top-level box this tool doesn't update
+    may refer to by file offset (see MOVABLE_TOP_LEVEL_BOXES). Nothing
+    moves if the size doesn't change, or nothing follows the span."""
+    if delta == 0 or span_end >= source.size:
+        return
+    for hdr in scan_top_level(source):
+        if base <= hdr[0] < span_end or hdr[4] in MOVABLE_TOP_LEVEL_BOXES:
+            continue
+        boxtype = hdr[4].decode('ascii', 'replace')
+        raise BoxParseError(
+            f"this file has a top-level '{boxtype}' box, which may refer to "
+            f"data in the file by its position, and this edit would move "
+            f"the data after the 'meta' box - not supported")
+
+
+def rotate_source(source, delta_turns: int, sync_exif=True, verbose=True):
     """Rotate the image by `delta_turns` quarter-turns ON TOP OF whatever
     rotation is already recorded (0 if none) - NOT to an absolute angle.
     This means the person applying a rotation never needs to know or
@@ -1656,9 +1939,20 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     "turn it another quarter turn from however it looks now", exactly
     like rotating a physical photo in your hands. delta_turns=0 is a
     genuine no-op for the visual orientation (see angle-0 handling below)
-    and can be used purely to add tracking metadata."""
+    and can be used purely to add tracking metadata.
+
+    `source` is the file, as a ByteSource; the rotated file is returned
+    as another (a PatchedSource over it), nothing written or copied.
+    Only the 'meta' box and the provenance box are edited, in memory
+    (`data`/`out` below - see load_span - whose offsets are relative to
+    `base`); the rest of the file is read only to compute the CRC32s
+    recorded in the provenance box, in chunks. The one edit outside
+    that span is the 2-byte embedded Exif Orientation value, which
+    normally sits in 'mdat': it is a patch of its own."""
     delta_turns &= 0x3
 
+    base, data = load_span(source)
+    span_end = base + len(data)
     struct_info = locate_structures(data)
     meta_hdr = struct_info['meta_hdr']
     meta_start = meta_hdr[0]
@@ -1702,7 +1996,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
             data, struct_info['provenance_hdr'])
         check_known_entries(record_version, existing_provenance, 'rotate')
         if record_version < FORMAT_VERSION:
-            return _replay_from_original(data, record_version,
+            return _replay_from_original(source, data, record_version,
                                          existing_provenance, delta_turns,
                                          sync_exif, verbose)
         prior_request = decode_requested_transform(existing_provenance)
@@ -1718,10 +2012,17 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     pristine_iloc_content = None
     if iloc_hdr is not None:
         pristine_iloc_content = bytes(data[iloc_hdr[2]:iloc_hdr[3]])
-    exif_field = find_exif_orientation_field(data, meta_body_start, meta_c_end)
+    exif_field = find_exif_orientation_field(data, meta_body_start,
+                                             meta_c_end, source)
     pristine_exif_orientation = None
     if exif_field is not None:
-        _, byte_order, cur_value = exif_field
+        exif_offset, byte_order, cur_value = exif_field
+        if exif_offset + 2 > base and exif_offset < span_end:
+            # `reverse` has never been able to restore this (see
+            # _prepare_reversal), so the self-check always refused it.
+            raise BoxParseError(
+                "the embedded Exif item is stored inside the 'meta' box "
+                "itself (at an absolute file offset) - not supported")
         pristine_exif_orientation = struct.pack(byte_order + 'H', cur_value)
 
     # Which way does the DISPLAYED image turn when the primary's 'irot'
@@ -1772,7 +2073,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
             for msg in plan['notes']:
                 print(f"[tmap path] {msg}")
         out, _ = _splice_iprp(data, struct_info, new_iprp_box, verbose,
-                              '[tmap path]')
+                              '[tmap path]', base)
     for prop_index, essential in ([] if plan is not None else primary_entry[1]):
         if 1 <= prop_index <= len(ipco_children):
             child = ipco_children[prop_index - 1]
@@ -1793,7 +2094,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
                         print(f"[fast path] existing 'irot' = {current_turns * 90} "
                               f"deg, + {delta_turns * 90} deg delta -> "
                               f"{new_turns * 90} deg, patched in place at "
-                              f"offset {irot_data_pos}")
+                              f"offset {base + irot_data_pos}")
                 break
 
     # ---- SLOW PATH: no irot property associated with primary item; insert one ----
@@ -1834,7 +2135,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         new_iprp_box = struct.pack('>I4s', len(new_iprp_content) + 8, b'iprp') + new_iprp_content
 
         out, delta = _splice_iprp(data, struct_info, new_iprp_box,
-                                  verbose, '[slow path]')
+                                  verbose, '[slow path]', base)
 
         if verbose:
             print(f"[slow path] inserted new 'irot' property (index "
@@ -1844,15 +2145,12 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
     # Only when the effective orientation actually changed - if the delta
     # left it at the same value it already had (delta 0, most commonly),
     # nothing that represents displayed orientation should be touched.
+    # The tag isn't in `out`: it is patched where it sits in `source`
+    # (exif_offset), as part of the result returned below.
+    exif_patches = []
     if sync_exif and new_turns != current_turns:
-        # re-locate fresh against the (possibly resized) output buffer;
-        # meta_c_end may have shifted in the slow path so re-derive it
-        info_now = locate_structures(out)
-        exif_field_now = find_exif_orientation_field(
-            out, info_now['meta_body_start'], info_now['meta_hdr'][3])
-        if exif_field_now is not None:
-            abs_value_offset, byte_order, _cur = exif_field_now
-            iprp_now = info_now['iprp_hdr']
+        if exif_field is not None:
+            iprp_now = locate_structures(out)['iprp_hdr']
             model_now = IprpModel(out, iprp_now[0], iprp_now[2], iprp_now[3])
             if b'imir' in model_now.prop_types(primary_item_id):
                 # A mirrored HEIF transform: 'irot' alone no longer
@@ -1862,12 +2160,13 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
                     model_now.transform(primary_item_id))
             else:
                 new_exif_orientation = exif_orientation_after_rotation(
-                    _cur, new_turns, delta_turns)
-            struct.pack_into(byte_order + 'H', out, abs_value_offset, new_exif_orientation)
+                    cur_value, new_turns, delta_turns)
+            exif_patches.append((exif_offset, exif_offset + 2, struct.pack(
+                byte_order + 'H', new_exif_orientation)))
             if verbose:
                 print(f"[exif sync] embedded legacy Exif Orientation tag "
                       f"updated to {new_exif_orientation} (offset "
-                      f"{abs_value_offset})")
+                      f"{exif_offset} of the input file)")
         elif verbose:
             print("[exif sync] no embedded legacy Exif Orientation tag found "
                   "- nothing to sync")
@@ -1890,7 +2189,8 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         if pristine_exif_orientation is not None:
             entries[b'OEXO'] = pristine_exif_orientation
         # PCRC: crc32 of the truly original file (no provenance box existed yet)
-        entries[b'PCRC'] = struct.pack('>I', zlib.crc32(data) & 0xffffffff)
+        entries[b'PCRC'] = struct.pack('>I', crc32_of_chunks(
+            source.chunks(0, source.size)))
     else:
         pristine_iprp = _pristine_iprp_bytes(data, struct_info, existing_provenance)
         # keep the true-original snapshots untouched
@@ -1978,7 +2278,7 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
         # (if any) - that one does not cover this box.
         iloc_hdr_now = info_now['iloc_hdr']
         new_iloc_content, any_changed = patch_iloc_offsets_at_threshold(
-            out, iloc_hdr_now, old_prov_end, prov_delta)
+            out, iloc_hdr_now, base + old_prov_end, prov_delta)
         if any_changed:
             iloc_c_start, iloc_c_end = iloc_hdr_now[2], iloc_hdr_now[3]
             out[iloc_c_start:iloc_c_end] = new_iloc_content
@@ -1991,11 +2291,22 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
             print(f"[provenance] existing record resized in place "
                   f"({old_prov_size} -> {new_prov_size} bytes)")
 
-    # Now compute the REAL CCRC over the file as it will be immediately
-    # BEFORE the provenance box is (re)written - i.e. with iloc already
-    # patched above if needed, and the provenance box itself excluded -
-    # exactly the "excluded" state CCRC is defined to cover.
-    ccrc = crc32_excluding_range(out, old_prov_start, old_prov_end)
+    # Now compute the REAL CCRC over the whole file as it will be - `out`
+    # with iloc already patched above if needed, everything around it
+    # streamed from `source` (with the Exif patch, if any) - with the
+    # provenance box itself excluded: exactly the "excluded" state CCRC
+    # is defined to cover. The box goes in with its placeholder CCRC
+    # first, so that the range to exclude is the one it really occupies.
+    out[old_prov_start:old_prov_end] = placeholder_prov_box
+    new_prov_end = old_prov_start + new_prov_size
+    _check_nothing_unsupported_moves(source, base, span_end,
+                                     len(out) - (span_end - base))
+
+    def result():
+        return PatchedSource(source, [(base, span_end, out)] + exif_patches)
+
+    ccrc = crc32_excluding_range(result(), base + old_prov_start,
+                                 base + new_prov_end)
     entries[b'CCRC'] = struct.pack('>I', ccrc)
     new_prov_box = build_provenance_box(FORMAT_VERSION, entries)
     if len(new_prov_box) != new_prov_size:
@@ -2003,14 +2314,14 @@ def apply_rotation(data: bytes, delta_turns: int, sync_exif=True, verbose=True):
             "internal error: provenance box size changed between "
             "placeholder and real CCRC - CCRC should always be a "
             "fixed 4 bytes")
-    out[old_prov_start:old_prov_end] = new_prov_box
+    out[old_prov_start:new_prov_end] = new_prov_box
 
     if verbose:
         print(f"[provenance] {'updated' if existing_provenance else 'created'} "
               f"provenance record (format v{FORMAT_VERSION}, "
               f"{len(new_prov_box)} bytes)")
 
-    return out
+    return result()
 
 
 # ---------------------------------------------------------------------------
@@ -2152,31 +2463,24 @@ def _pristine_iprp_bytes(data, info, entries, verbose=False):
 
 
 def _restore_meta_provenance_span(span, entries, verbose=False):
-    """Given `span` = data[meta_start:prov_end] for some file
-    heic-lossless-rotate has rotated - a standalone buffer whose only
-    two top-level boxes are the file's 'meta' box immediately followed
-    by the provenance ('uuid') box and nothing else (apply_rotation
-    always inserts the provenance box as 'meta''s immediate next
-    sibling - see its own provenance-insertion comments, and
-    reverse_rotation's docstring for why nothing else can fall between
-    them) - restores 'meta' to its pristine pre-rotation state (iprp/
-    ipma, meta's own size field, iloc content) and removes the
-    provenance box. Mutates and returns `span`.
+    """Given `span`, the load_span() of some file heic-lossless-rotate
+    has rotated - a standalone buffer whose only two top-level boxes
+    are the file's 'meta' box immediately followed by the provenance
+    ('uuid') box and nothing else (apply_rotation always inserts the
+    provenance box as 'meta''s immediate next sibling - see its own
+    provenance-insertion comments, and reverse_source's docstring for
+    why nothing else can fall between them) - restores 'meta' to its
+    pristine pre-rotation state (iprp/ipma, meta's own size field, iloc
+    content) and removes the provenance box. Mutates and returns `span`.
 
-    This is reverse_rotation's own restoration logic, factored out so it
-    has exactly one implementation shared by two callers: reverse_
-    rotation() (which slices this out of, and splices the result back
-    into, the full file buffer, since it needs actual output bytes to
-    write to disk) and verify_reversible() (which never needs a
-    full-file buffer at all, since 'mdat' - the only thing excluded from
-    this span - never has anything about it that this restoration step
-    touches; only the separate, optional embedded-Exif 2-byte patch
-    reaches into 'mdat', and each caller applies that themselves against
-    whichever buffer they actually have that contains it). Box parsing
-    is header-driven, not position-driven (see locate_structures), so
-    operating on this standalone slice - where 'meta' starts at local
-    position 0 rather than wherever it sits in the real file - needs no
-    special-casing here at all.
+    This never needs anything outside the span: 'mdat' - the bulk of
+    the file - has nothing about it that this restoration step touches;
+    only the separate, optional embedded-Exif 2-byte patch reaches into
+    it (see _prepare_reversal). Box parsing is header-driven, not
+    position-driven (see locate_structures), so operating on this
+    standalone buffer - where 'meta' starts at local position 0 rather
+    than wherever it sits in the real file - needs no special-casing
+    here at all.
     """
     info = locate_structures(span)
     iprp_start, _, _, iprp_c_end, _ = info['iprp_hdr']
@@ -2211,22 +2515,22 @@ def _restore_meta_provenance_span(span, entries, verbose=False):
     return span
 
 
-def _prepare_reversal(data, proceed_unsafe, verbose):
-    """All of the setup shared by reverse_rotation() and
-    verify_reversible(), up to (but not including) actually assembling
-    the reconstructed file's bytes: locate the provenance record, check
-    its format version, run the tamper check, restore the meta+
-    provenance span, and determine the embedded-Exif patch (if any).
+def _prepare_reversal(source, proceed_unsafe, verbose):
+    """Everything about reversing `source` (a ByteSource) except the
+    final check of the result: locate the provenance record, check its
+    format version, run the tamper check, restore the meta+provenance
+    span, and determine the embedded-Exif patch (if any).
 
-    Returns (entries, meta_start, prov_end, span, exif_patch) - entries
-    for the final PCRC comparison each caller makes itself, and the
-    rest to hand straight to _iter_reconstructed_chunks(). Raises the
-    same ProvenanceError conditions either caller would need to raise
-    on its own otherwise - having this in exactly one place means
-    reverse_rotation() and verify_reversible() can't drift apart on
-    what counts as a valid/tampered/malformed record, only on what they
-    each do with the reconstructed bytes afterward.
+    Returns (entries, restored): `entries` for the final PCRC
+    comparison, and `restored`, the reconstructed file - a PatchedSource
+    over `source`, so nothing but the span is in memory. This is the
+    SINGLE piece of code that decides what bytes the reconstructed file
+    consists of; reverse_source() is its only caller, and everything
+    that reverses a file - `reverse`, `rotate`'s self-check
+    (verify_reversible), replaying an older record - goes through that.
     """
+    base, data = load_span(source)
+    span_end = base + len(data)
     info = locate_structures(data)
     prov_hdr = info['provenance_hdr']
     if prov_hdr is None:
@@ -2250,9 +2554,15 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
                                   report=verbose)
     if b'REQT' in entries:
         check_request_supported(entries)
+    for tag, length in ((b'CCRC', 4), (b'PCRC', 4), (b'OMSZ', 4)):
+        if len(entries.get(tag, b'')) != length:
+            raise ProvenanceError(
+                f"corrupt provenance record: {tag.decode('ascii')} entry "
+                f"missing or not {length} bytes")
 
     prov_start, _, _, prov_end, _ = prov_hdr
-    current_ccrc = crc32_excluding_range(data, prov_start, prov_end)
+    current_ccrc = crc32_excluding_range(source, base + prov_start,
+                                         base + prov_end)
     stored_ccrc = struct.unpack('>I', entries[b'CCRC'])[0]
     if current_ccrc != stored_ccrc:
         msg = (f"file appears to have been modified by something else since "
@@ -2265,41 +2575,37 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
         report_overridden(ModifiedSinceEditError(msg + " Proceeding anyway."),
                           report=verbose)
 
-    # 'mdat' - excluded from this span in both supported layouts, since
-    # the provenance box is always inserted as 'meta''s immediate next
+    # 'mdat' - outside the span in both supported layouts, since the
+    # provenance box is always inserted as 'meta''s immediate next
     # sibling (see _restore_meta_provenance_span's docstring) - is never
     # touched by the restoration itself, only (optionally) by the
     # Exif-Orientation patch below.
-    meta_start = info['meta_hdr'][0]
-    span = _restore_meta_provenance_span(
-        bytearray(data[meta_start:prov_end]), entries, verbose=verbose)
+    patches = [(base, span_end, _restore_meta_provenance_span(
+        bytearray(data), entries, verbose=verbose))]
 
     # The Exif patch, if any, lands inside 'mdat' - read its CURRENT
-    # position and value directly off `data` as-is. Reversing never
+    # position and value directly off `source` as-is. Reversing never
     # moves 'mdat''s own bytes, it only removes/shrinks the meta+
-    # provenance span - so `data`'s own (current, valid) iloc already
+    # provenance span - so the file's own (current, valid) iloc already
     # points at exactly the physical bytes the fully reconstructed file
-    # will too, just via a different absolute file offset if the span's
-    # shrinkage happens to fall before 'mdat' in this file's layout
-    # (handled by _iter_reconstructed_chunks, purely in terms of where
-    # this offset falls relative to meta_start/prov_end - never relative
-    # to any assembled output buffer, since one may never be built).
-    exif_patch = None
+    # will have too, just at a different absolute file offset if the
+    # span's shrinkage happens to fall before 'mdat' in this file's
+    # layout. A patch is a range of `source`, so that never matters.
     if b'OEXO' in entries:
         exif_field = find_exif_orientation_field(
-            data, info['meta_body_start'], info['meta_hdr'][3])
+            data, info['meta_body_start'], info['meta_hdr'][3], source)
         if exif_field is not None:
             abs_offset = exif_field[0]
-            if meta_start <= abs_offset < prov_end:
-                # Should be structurally impossible (see
-                # reverse_rotation's docstring) for any file this tool
-                # itself produced - fail loudly rather than silently
-                # risk reconstructing the wrong bytes.
+            if abs_offset + 2 > base and abs_offset < span_end:
+                # Should be structurally impossible (see reverse_source's
+                # docstring) for any file this tool itself produced -
+                # fail loudly rather than silently risk reconstructing
+                # the wrong bytes.
                 raise InternalError(
                     "internal error: embedded Exif Orientation field "
                     "unexpectedly falls inside the meta/provenance span "
                     "- refusing to guess at the reconstructed bytes")
-            exif_patch = (abs_offset, entries[b'OEXO'])
+            patches.append((abs_offset, abs_offset + 2, entries[b'OEXO']))
             if verbose:
                 print("[reverse] restoring pristine legacy Exif Orientation tag")
         elif verbose:
@@ -2307,46 +2613,16 @@ def _prepare_reversal(data, proceed_unsafe, verbose):
                   "but couldn't relocate the field to restore it - the "
                   "final CRC check below will catch any resulting mismatch")
 
-    return entries, meta_start, prov_end, span, exif_patch
+    return entries, PatchedSource(source, patches)
 
 
-def _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
-    """Yields the reconstructed file's bytes, in file order, as a
-    handful of chunks: zero-copy `memoryview` slices of `data` for
-    everything passed through unchanged, real bytes only for the
-    restored meta+provenance span and (if applicable) the 2-byte Exif
-    patch. This is the SINGLE piece of code that decides what bytes the
-    reconstructed file actually consists of and in what order -
-    reverse_rotation() concatenates these chunks (to produce real
-    output bytes to return/write) while ALSO feeding each one into a
-    running CRC32 as it goes; verify_reversible() feeds them into that
-    same kind of running CRC32 without ever concatenating them. Either
-    way, which bytes make up the result is decided here and only here -
-    not re-derived independently by each caller."""
-    view = memoryview(data)
-    if exif_patch is not None and exif_patch[0] < meta_start:
-        patch_offset, patch_bytes = exif_patch
-        yield view[:patch_offset]
-        yield patch_bytes
-        yield view[patch_offset + 2:meta_start]
-    else:
-        yield view[:meta_start]
-
-    yield span
-
-    if exif_patch is not None and exif_patch[0] >= prov_end:
-        patch_offset, patch_bytes = exif_patch
-        yield view[prov_end:patch_offset]
-        yield patch_bytes
-        yield view[patch_offset + 2:]
-    else:
-        yield view[prov_end:]
-
-
-def reverse_rotation(data: bytes, proceed_unsafe=False, verbose=True):
+def reverse_source(source, proceed_unsafe=False, verbose=True):
     """Undo heic-lossless-rotate's own edit(s), reconstructing the exact
     original file (verified by CRC32 against the PCRC recorded on the
-    file's first-ever edit).
+    file's first-ever edit). `source` is the rotated file, as a
+    ByteSource; the original is returned as another (a PatchedSource
+    over it) - nothing is written or copied, and the file's bulk is only
+    read in chunks: once for the tamper check, once for the final check.
 
     `proceed_unsafe` (the CLI's --proceed-unsafe) proceeds past checks
     that would otherwise refuse - the file was modified by something
@@ -2355,38 +2631,28 @@ def reverse_rotation(data: bytes, proceed_unsafe=False, verbose=True):
     via report_overridden() if `verbose`. The final PCRC check is never
     skipped.
 
-    Structural fact this relies on, and that verify_reversible() below
-    also depends on: every edit made here falls either inside the
-    contiguous span [meta_start, prov_end) - covering 'meta' itself
-    (iprp/ipma, meta's own size field, iloc) and the provenance box
-    that immediately follows it - or, for at most one 2-byte patch,
-    inside 'mdat' (restoring an embedded legacy Exif Orientation tag).
-    Nothing outside those two regions is ever touched. This holds
-    regardless of which supported box layout the file uses ('mdat'
-    before or after 'meta'), since apply_rotation always inserts the
-    provenance box as 'meta''s immediate next sibling - so 'mdat' can
-    never fall between them, only strictly before meta_start or at/after
-    prov_end.
+    Structural fact this relies on: every edit made here falls either
+    inside the contiguous span load_span() reads into memory - covering
+    'meta' itself (iprp/ipma, meta's own size field, iloc) and the
+    provenance box that immediately follows it - or, for at most one
+    2-byte patch, inside 'mdat' (restoring an embedded legacy Exif
+    Orientation tag). Nothing outside those two regions is ever
+    touched. This holds regardless of which supported box layout the
+    file uses ('mdat' before or after 'meta'), since apply_rotation
+    always inserts the provenance box as 'meta''s immediate next
+    sibling - so 'mdat' can never fall between them, only strictly
+    before the span or after it.
 
-    Shares its actual reconstruction logic with verify_reversible() -
-    both call _prepare_reversal() then _iter_reconstructed_chunks() -
-    so the two can never silently disagree on what the reconstructed
-    file's bytes are: only on what each does with them afterward (here,
-    concatenate into real output bytes; there, feed straight into a
-    CRC32 and discard).
+    This is the one implementation of reversal: reverse_rotation()
+    returns its result's bytes, verify_reversible() discards them. The
+    two can never disagree on what the reconstructed file's bytes are,
+    or on whether they match the original.
     """
-    entries, meta_start, prov_end, span, exif_patch = _prepare_reversal(
-        data, proceed_unsafe, verbose)
-
-    out = bytearray()
-    crc = None
-    for chunk in _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
-        out += chunk
-        crc = zlib.crc32(chunk) if crc is None else zlib.crc32(chunk, crc)
+    entries, restored = _prepare_reversal(source, proceed_unsafe, verbose)
 
     # Final sanity check: the reconstructed file's CRC32 must match the
     # pristine-original CRC32 we recorded on the very first edit.
-    final_crc = crc & 0xffffffff
+    final_crc = crc32_of_chunks(restored.chunks(0, restored.size))
     expected_pcrc = struct.unpack('>I', entries[b'PCRC'])[0]
     if final_crc != expected_pcrc:
         raise ProvenanceError(
@@ -2398,49 +2664,26 @@ def reverse_rotation(data: bytes, proceed_unsafe=False, verbose=True):
         print(f"[ok] reconstructed file CRC32 matches the recorded original "
               f"({final_crc:#010x}) - byte-identical to the true original")
 
-    return out
+    return restored
+
+
+def reverse_rotation(data: bytes, proceed_unsafe=False, verbose=True):
+    """reverse_source() for a whole file held in memory: takes its
+    bytes, returns the whole original file as a bytearray."""
+    return materialize(reverse_source(BytesSource(data), proceed_unsafe,
+                                      verbose))
 
 
 def verify_reversible(data, proceed_unsafe=False, verbose=False):
-    """Equivalent, in terms of pass/fail and the error(s) raised, to
-    calling reverse_rotation(data, proceed_unsafe, verbose) and
-    discarding the result - but computes the final CRC32 comparison
-    without ever materializing a second full-file buffer. Intended for
-    rotate's post-edit self-check (see cli.py), which only needs to know
-    whether reversing its own freshly-produced output would reconstruct
-    the true original - it never needs the actual reconstructed bytes,
-    so there's no reason to pay for a full bytearray(data) copy just to
-    throw the result away.
+    """Whether reversing `data` (a ByteSource, or a whole file as bytes)
+    reconstructs the true original: passes, or raises, exactly as
+    reverse_source() does - it IS reverse_source(), with the result
+    discarded. That result is only a view of `data`, checked by
+    streaming it into a CRC32, so this never holds or copies the file.
 
-    This isn't a second implementation that happens to agree with
-    reverse_rotation() - it calls the exact same _prepare_reversal() and
-    _iter_reconstructed_chunks() reverse_rotation() does, and computes
-    its CRC32 over the exact same sequence of chunks those yield. The
-    only difference is what happens to each chunk once produced:
-    reverse_rotation() concatenates them into real output bytes (and
-    also feeds them into a running CRC32 as it goes); this function
-    feeds them into that same kind of running CRC32 and nothing else -
-    it is never possible for the two to reconstruct different bytes,
-    only for one to additionally keep a copy of them.
-    """
-    entries, meta_start, prov_end, span, exif_patch = _prepare_reversal(
-        data, proceed_unsafe, verbose)
-
-    crc = None
-    for chunk in _iter_reconstructed_chunks(data, meta_start, prov_end, span, exif_patch):
-        crc = zlib.crc32(chunk) if crc is None else zlib.crc32(chunk, crc)
-
-    final_crc = crc & 0xffffffff
-    expected_pcrc = struct.unpack('>I', entries[b'PCRC'])[0]
-    if final_crc != expected_pcrc:
-        raise ProvenanceError(
-            f"reconstruction mismatch: rebuilt file CRC32 {final_crc:#010x} "
-            f"does not match recorded original CRC32 {expected_pcrc:#010x}. "
-            f"Do not trust this output - this indicates a bug or an "
-            f"inconsistent provenance record.")
-    elif verbose:
-        print(f"[ok] reconstructed file CRC32 matches the recorded original "
-              f"({final_crc:#010x}) - byte-identical to the true original")
+    For rotate's post-edit self-check (see cli.py), which runs this on
+    the rotated file before any of it has been written."""
+    reverse_source(as_source(data), proceed_unsafe, verbose)
 
 
 # ---------------------------------------------------------------------------
@@ -2451,7 +2694,9 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
     """Read-only summary of heic-lossless-rotate provenance state and the file's
     live rotation. Does none of the "heavy" work reverse/rotate do (no
     byte-level reconstruction, no final CRC-of-reconstructed-file check) -
-    just parses what's already sitting in the file. `proceed_unsafe`
+    just parses what's already sitting in the file (`data`: a
+    ByteSource, or the whole file as bytes), reading nothing of it but
+    its 'meta' and provenance boxes (see load_span). `proceed_unsafe`
     ignores record entries this release doesn't know instead of
     refusing, reporting it via report_overridden() unless not `verbose`
     (see check_known_entries).
@@ -2507,6 +2752,7 @@ def gather_info(data, proceed_unsafe=False, verbose=True):
                                  from the primary item (see
                                  find_tmap_items)
     """
+    _, data = load_span(as_source(data))
     current_quarter_turns = get_current_rotation(data)
     result = {
         'current_quarter_turns': current_quarter_turns,
@@ -2655,33 +2901,41 @@ def format_info(result, quiet=False):
 # ---------------------------------------------------------------------------
 
 def verify_structure(data):
-    def check_container(start, c_start, c_end, label):
+    """`data` is a ByteSource, or a whole file as bytes. Reads the
+    top-level box headers and the 'meta' box, nothing else."""
+    def check_container(buf, origin, c_start, c_end, label):
         pos = c_start
         while pos < c_end:
-            hdr = read_box_header(data, pos)
+            hdr = read_box_header(buf, pos)
             if hdr is None:
-                raise BoxParseError(f"{label}: truncated box at {pos}")
+                raise BoxParseError(f"{label}: truncated box at {origin + pos}")
             b_start, header_len, cc_start, cc_end, boxtype = hdr
             if cc_end > c_end:
                 raise BoxParseError(
-                    f"{label}: child '{boxtype}' at {b_start} overflows "
-                    f"container end ({cc_end} > {c_end})")
+                    f"{label}: child '{boxtype}' at {origin + b_start} overflows "
+                    f"container end ({origin + cc_end} > {origin + c_end})")
             pos = cc_end
         if pos != c_end:
-            raise BoxParseError(f"{label}: children end at {pos}, expected {c_end}")
+            raise BoxParseError(f"{label}: children end at {origin + pos}, "
+                                 f"expected {origin + c_end}")
 
-    top = list(iter_boxes(data, 0, len(data)))
-    check_container(0, 0, len(data), "top-level")
+    source = as_source(data)
+    top = scan_top_level(source)
+    top_end = top[-1][3] if top else 0
+    if top_end != source.size:
+        raise BoxParseError(f"top-level: truncated box at {top_end}")
     for hdr in top:
         if hdr[4] == b'meta':
-            meta_start, _, meta_c_start, meta_c_end, _ = hdr
-            check_container(meta_start, meta_c_start + 4, meta_c_end, "meta")
-            for child in iter_boxes(data, meta_c_start + 4, meta_c_end):
+            origin = hdr[0]
+            meta = source.read(hdr[0], hdr[3])
+            _, _, meta_c_start, meta_c_end, _ = read_box_header(meta, 0)
+            check_container(meta, origin, meta_c_start + 4, meta_c_end, "meta")
+            for child in iter_boxes(meta, meta_c_start + 4, meta_c_end):
                 if child[4] == b'iprp':
-                    check_container(child[0], child[2], child[3], "iprp")
-                    for gc in iter_boxes(data, child[2], child[3]):
+                    check_container(meta, origin, child[2], child[3], "iprp")
+                    for gc in iter_boxes(meta, child[2], child[3]):
                         if gc[4] == b'ipco':
-                            check_container(gc[0], gc[2], gc[3], "ipco")
+                            check_container(meta, origin, gc[2], gc[3], "ipco")
     return True
 
 

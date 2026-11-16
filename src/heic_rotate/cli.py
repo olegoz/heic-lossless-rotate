@@ -103,8 +103,14 @@ sync with the new 'irot' value, since some non-HEIF-spec-strict software
 reads that instead of 'irot'.
 
 Only container/box bytes are ever touched. The 'mdat' payload (the
-actual compressed image data) is never read or rewritten, so every edit
-here is guaranteed lossless with respect to image content.
+actual compressed image data) is never interpreted or changed, so every
+edit here is guaranteed lossless with respect to image content. It is
+never loaded into memory either: only the file's metadata is ('meta'
+and this tool's own record), the rest is copied from the input file to
+the output file in chunks, so memory use doesn't grow with file size.
+The output is written to a temporary file next to its destination and
+renamed into place once complete - also when the output file is the
+input file itself.
 
 REVERSIBILITY
 -------------
@@ -175,8 +181,9 @@ undoes ALL edits back to the true original, however many times you've
 rotated it since.
 
 Every `rotate` also runs a post-edit self-check before writing
-anything: it reverses its own freshly-produced output in memory and
-confirms the result's CRC32 matches the recorded original. If that
+anything: it reverses its own freshly-produced output (not yet a file -
+see heic_rotate.core's "Byte sources") and confirms the result's CRC32
+matches the recorded original. If that
 check fails, `rotate` refuses to write the output file at all - you
 never end up with a file this version of the tool claims to be able
 to reverse but actually can't.
@@ -208,15 +215,31 @@ and refused with a clear error rather than silently mis-editing the file:
     would silently discard any associations recorded in a second one.
     Likewise an 'iprp' holding any other box, or an 'ipco'/'ipma' with a
     64-bit size field: the provenance record couldn't restore it exactly.
+  - When `rotate` changes the size of 'meta' (always on a file's first
+    rotation, which adds the record), everything after 'meta' moves,
+    and only 'iloc''s offsets are updated to match. So if anything
+    follows 'meta', the file is refused when it also has a top-level
+    box that may refer to data by its file offset: 'moov' (image
+    sequences: 'stco'/'co64'), a second 'meta', or any top-level box
+    other than 'ftyp', 'mdat', 'free', 'skip', 'wide' and Samsung's
+    'sefd' (see core.MOVABLE_TOP_LEVEL_BOXES). Likewise an item 'iloc'
+    locates through a data reference ('dref', possibly another file)
+    whose offset would have to move. Files with 'meta' last aren't
+    affected.
   - An HDR gain map with a rotation property of its own, not shared with
     the primary item, isn't rotated - `rotate` prints a warning instead
     (HDR viewers may show it misaligned). None of the real photos tested
     has this.
   - The legacy embedded Exif Orientation sync only handles the Exif item
     being stored via an absolute file offset (iloc construction_method
-    0). If it's stored via 'idat' (construction_method 1) or another
-    item's data (construction_method 2), the sync is silently skipped -
-    safe (nothing is corrupted), just incomplete.
+    0) in the file itself (data_reference_index 0). If it's stored via
+    'idat' (construction_method 1), another item's data
+    (construction_method 2) or a data reference ('dref', possibly
+    another file), the sync is silently skipped -
+    safe (nothing is corrupted), just incomplete. If that absolute
+    offset points inside the 'meta' box itself, rather than at the image
+    data, the file is refused, also with --no-exif-sync: `reverse`
+    couldn't restore the original Exif value there.
 
 No third-party dependencies - Python 3 standard library only.
 """
@@ -224,9 +247,13 @@ No third-party dependencies - Python 3 standard library only.
 import sys
 import os
 import argparse
+import shutil
+import tempfile
 import traceback
 
 from .core import (
+    FileSource,
+    as_source,
     BoxParseError,
     HeicRotateError,
     ModifiedSinceEditError,
@@ -235,8 +262,8 @@ from .core import (
     ProvenanceError,
     SelfCheckError,
     recovery_advice,
-    apply_rotation,
-    reverse_rotation,
+    rotate_source,
+    reverse_source,
     verify_reversible,
     gather_info,
     format_info,
@@ -446,8 +473,25 @@ def main():
 
     try:
         with open(args.input, 'rb') as f:
-            data = f.read()
-        _run(args, data)
+            before = os.fstat(f.fileno())
+            pending = _run(args, FileSource(f))
+            after = os.fstat(f.fileno())
+        # The input file is closed by now: it may be the very file the
+        # output replaces.
+        if pending is not None:
+            tmp_path, out_path, message = pending
+            try:
+                if (before.st_size, before.st_mtime_ns) != \
+                        (after.st_size, after.st_mtime_ns):
+                    raise OSError(
+                        f"'{args.input}' changed while it was being "
+                        f"processed - nothing written")
+                os.replace(tmp_path, out_path)
+            except BaseException:
+                _remove_quietly(tmp_path)
+                raise
+            if message:
+                print(message)
     except HeicRotateError as e:
         _report_error(e.exit_code, e)
         sys.exit(e.exit_code)
@@ -462,9 +506,56 @@ def main():
         sys.exit(EXIT_INTERNAL)
 
 
-def _run(args, data):
+def _remove_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _write_temp(result, out_path):
+    """Stream `result` (a ByteSource) into a new temporary file in
+    `out_path`'s directory, for the caller to os.replace() onto it.
+    Returns (tmp_path, final_path).
+
+    Never written straight to `out_path`: `result` is still being read
+    from the input file while it is written, and `out_path` may be that
+    very file - and this way an interrupted run leaves no half-written
+    output behind either. The temporary file gets the permissions the
+    output file has if it exists, else a new file's usual ones; an
+    `out_path` that is a symlink keeps pointing at the file written."""
+    final_path = os.path.realpath(out_path) if os.path.islink(out_path) else out_path
+    directory, name = os.path.split(final_path)
+    fd, tmp_path = tempfile.mkstemp(dir=directory or '.', prefix=f'.{name}.',
+                                    suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            for chunk in result.chunks(0, result.size):
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(final_path):
+            shutil.copymode(final_path, tmp_path)
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp_path, 0o666 & ~umask)
+    except BaseException:
+        _remove_quietly(tmp_path)
+        raise
+    return tmp_path, final_path
+
+
+def _run(args, source):
+    """Run the command on `source`, the input file (a ByteSource, or
+    its bytes). `info` exits with its result code. `rotate`/`reverse`
+    return None if there is nothing to write (--dry-run), else
+    (tmp_path, out_path, message): the complete output file, written
+    as `tmp_path`, for main() to rename to `out_path` once the input
+    file is closed, then print `message` (None with -q)."""
+    source = as_source(source)
     if args.cmd == 'info':
-        result = gather_info(data, proceed_unsafe=args.proceed_unsafe,
+        result = gather_info(source, proceed_unsafe=args.proceed_unsafe,
                              verbose=not args.quiet)
         text, exit_code = format_info(result, quiet=args.quiet)
         if text is not None:
@@ -475,24 +566,23 @@ def _run(args, data):
 
     if args.cmd == 'rotate':
         delta_turns = (args.rotation // 90) % 4
-        out = apply_rotation(data, delta_turns, sync_exif=not args.no_exif_sync,
-                              verbose=not args.quiet)
+        out = rotate_source(source, delta_turns, sync_exif=not args.no_exif_sync,
+                             verbose=not args.quiet)
         verify_structure(out)
         if not args.quiet:
             print("[ok] output box structure is internally consistent")
 
-        # Post-rotate reversibility self-check: verify - in memory, before
-        # writing anything to disk - that reversing our own freshly-
-        # produced output would reconstruct the true original.
+        # Post-rotate reversibility self-check: verify - before writing
+        # anything to disk - that reversing our own freshly-produced
+        # output would reconstruct the true original. `out` isn't a
+        # file yet, nor bytes in memory: it is the input file plus the
+        # edits to make to it (see core's "Byte sources"), and reversing
+        # it is checked the same way, by streaming.
         # verify_reversible() already raises if the reconstructed file's
         # CRC32 doesn't match the recorded original (or if anything about
         # the record is malformed) - we just need to make sure a failure
         # here aborts the rotate instead of silently producing a file
         # that this tool claims to be able to reverse but actually can't.
-        # (Uses verify_reversible() rather than reverse_rotation() here
-        # since only the pass/fail matters - the reconstructed bytes
-        # themselves are never used, so there's no reason to pay for a
-        # second full-file copy just to discard it.)
         # Reached only if everything up to here succeeded. Any failure is
         # its own hard error (SelfCheckError), whatever the underlying
         # reason given in the message.
@@ -518,14 +608,14 @@ def _run(args, data):
                 out_path = in_stem + '_rotated.heic'
     else:
         try:
-            out = reverse_rotation(data, proceed_unsafe=args.proceed_unsafe,
-                                    verbose=not args.quiet)
+            out = reverse_source(source, proceed_unsafe=args.proceed_unsafe,
+                                  verbose=not args.quiet)
         except (NoProvenanceError, ModifiedSinceEditError, NewerVersionError):
             raise
         except (ProvenanceError, BoxParseError) as e:
             # This release can't restore it: point to the release that
             # wrote the record, if that one is guaranteed to.
-            advice = recovery_advice(data)
+            advice = recovery_advice(source)
             if advice is None:
                 raise
             raise type(e)(f"{str(e).rstrip('.')}. {advice}") from e
@@ -544,16 +634,14 @@ def _run(args, data):
             f"{'would overwrite' if dry_run else 'overwriting'} it"),
             '-f/--force', report=not args.quiet)
 
+    size_report = (f"{out_path} ({out.size} bytes, "
+                   f"{out.size - source.size:+d} vs input)")
     if dry_run:
         if not args.quiet:
             print(f"[dry-run] {args.cmd} would succeed - would write "
-                  f"{out_path} ({len(out)} bytes, {len(out) - len(data):+d} "
-                  f"vs input). No file written.")
-        return
+                  f"{size_report}. No file written.")
+        return None
 
-    with open(out_path, 'wb') as f:
-        f.write(out)
-    if not args.quiet:
-        print(f"[ok] wrote {out_path} ({len(out)} bytes, "
-              f"{len(out) - len(data):+d} vs input)")
-
+    tmp_path, final_path = _write_temp(out, out_path)
+    return (tmp_path, final_path,
+            None if args.quiet else f"[ok] wrote {size_report}")

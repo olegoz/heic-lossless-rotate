@@ -53,8 +53,12 @@ No third-party dependencies. Python 3 standard library only.
 - **Fully reversible.** `reverse` restores a file to be byte-for-byte
   identical to the original, even after multiple rotations. `rotate`
   itself also self-checks reversibility before writing anything - it
-  reverses its own output in memory first and refuses to write if that
+  reverses its own output first and refuses to write if that
   doesn't reconstruct the original exactly.
+- **Light on memory, whatever the file size.** Only the file's metadata
+  is loaded into memory. The image data is copied from the input file
+  to the output file in chunks, so a file of hundreds of megabytes needs
+  no more memory than a small one.
 
 ## Requirements
 
@@ -387,12 +391,17 @@ can always undo every edit made since, no matter how many times you've
 rotated the file.
 
 Before writing anything, `rotate` checks that its output can be
-reversed: it reverses the output in memory and compares the result
+reversed: it reverses the output and compares the result
 with the original file's recorded checksum. If they don't match, it
 writes nothing (hard error `57`). So the same release's `reverse` can
 always restore a file `rotate` wrote, even if a later release can't
 (see [`reverse`](#reverse) below), and a problem is found while you
 still have the input file, not later when you try to `reverse`.
+
+`rotate` and `reverse` write their output to a temporary file next to
+the output file, and rename it into place only once it is complete. An
+interrupted run therefore never leaves a half-written output file, and
+the output file may be the input file itself (with `-f`).
 
 If the file's record was written in an older metadata format, `rotate N`
 instead first restores the original file (checked against the recorded
@@ -618,7 +627,7 @@ heic-rotate reverse photo.heic --proceed-unsafe 2>&1 >/dev/null | grep '^ERROR '
 | `54` | A later release of this tool produced something in the file that this release doesn't support: a newer metadata format, mirroring, or (for `rotate`) metadata entries it doesn't know. The error names the release that last updated the file. Update heic-lossless-rotate |
 | `55` | The provenance record is corrupt, or the original file can't be restored from it (e.g. the file was changed outside what the record restores). If another release last updated the file, the message names the release to recover the original with (see [`reverse`](#reverse)) |
 | `56` | Internal error: one of the tool's internal consistency checks failed, or something unexpected went wrong (the message is followed by a traceback). Nothing was written. Please report it |
-| `57` | `rotate`: the rotated file, reversed in memory, didn't give back the original, so it wasn't written. The message says why |
+| `57` | `rotate`: the rotated file, reversed before writing it, didn't give back the original, so it wasn't written. The message says why |
 
 ## Known limitations
 
@@ -636,14 +645,28 @@ refused with a clear error rather than silently mis-editing the file:
   one — so it's refused instead of guessed. Likewise, an `iprp` holding
   any other box, or an `ipco`/`ipma` box with a 64-bit size field, is
   refused, since the provenance record couldn't restore it exactly.
+- When `rotate` changes the size of the `meta` box (always on a file's
+  first rotation, which adds the tool's record), everything after
+  `meta` in the file moves, and only the image locations recorded in
+  `meta` itself (`iloc`) are updated to match. So if anything follows
+  `meta`, the file is refused when it also has a top-level box that may
+  refer to data by its position in the file: a `moov` box (as in image
+  sequences), a second `meta`, or any top-level box other than `ftyp`,
+  `mdat`, `free`, `skip`, `wide` and Samsung's `sefd`. The same goes for
+  an image located through a data reference (`dref`), which may point
+  into another file. Files with `meta` at the end aren't affected.
 - If an HDR photo's gain map has a rotation property of its own that
   isn't shared with the main image, the gain map isn't rotated: `rotate`
   prints a warning, and HDR viewers may show it misaligned. No phone
   photo tested is built like this.
 - The legacy embedded Exif `Orientation` sync only handles the Exif item
-  being stored via an absolute file offset. If it's stored via `idat` or
-  another item's data, the sync is silently skipped — safe, just
-  incomplete.
+  being stored via an absolute file offset in the file itself. If it's
+  stored via `idat`, another item's data or a data reference (`dref`,
+  possibly another file), the sync is silently skipped — safe, just
+  incomplete. If that absolute offset points inside the `meta` box
+  itself, rather than at the image data, the file is refused (error
+  `52`), also with `--no-exif-sync`: `reverse` couldn't restore the
+  original Exif value there.
 
 ## Development install
 

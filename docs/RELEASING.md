@@ -6,10 +6,17 @@ that anything irreversible (the actual PyPI upload) happens last, after
 everything that can still be caught and fixed has been.
 
 Per the project's versioning policy: `VERSION` in `src/heic_rotate/_version.py`
-is the single source of truth. It is not bumped while a release is being
-prepared, and is bumped exactly once, at the point of merging to `main`.
-A released `VERSION` always maps to exactly one immutable, tagged, published
-state of the code.
+is the single source of truth. A released `VERSION` always maps to exactly
+one immutable, tagged, published state of the code.
+
+A larger release may be prepared as a series of internal versions, each a
+finished round of changes with `VERSION` bumped for it (for example 2.1.0,
+then 2.2.0), and then published together under one version number (3.0.0).
+Internal versions are never tagged or published, and `CHANGELOG.md` lists
+their changes under `[Unreleased]` until the release, when that section
+becomes the release's own. Files rotated with an internal version record
+that version as the one that last updated them, so keep such files to
+testing.
 
 **If `.github/workflows/release.yml` is set up**, pushing a version tag
 (step 4) automatically performs steps 5–7 for you — building the wheel,

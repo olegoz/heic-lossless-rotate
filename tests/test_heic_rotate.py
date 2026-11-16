@@ -67,6 +67,14 @@ TESTDATA = os.path.join(HERE, 'testdata')
 ROTATED_DIR = os.path.join(HERE, 'rotated')
 
 
+# A release later than the running one, for records "written by a later
+# release": derived from VERSION so it stays later whatever the running
+# version is (a fixed example version stops being later once VERSION
+# reaches it).
+LATER_VERSION = (hr._version_tuple()[0] + 1, 0, 0)
+LATER_VERSION_STR = '.'.join(map(str, LATER_VERSION))
+
+
 def run_cli(*args, cwd=None):
     """Run the heic_rotate CLI as a subprocess (`python -m heic_rotate`),
     return (returncode, stdout, stderr). Runs against the src/ checkout
@@ -499,8 +507,8 @@ class TestSyntheticRoundTrips(unittest.TestCase):
 class TestVerifyReversibleMatchesReverseRotation(unittest.TestCase):
     """verify_reversible() computes the same pass/fail determination as
     reverse_rotation() - and, when both succeed, the identical
-    underlying CRC32 - via an independent code path (see its own
-    docstring). rotate's post-edit self-check (cli.py) relies on
+    underlying CRC32 - without keeping the reconstructed bytes (see its
+    own docstring). rotate's post-edit self-check (cli.py) relies on
     verify_reversible() exclusively, so a bug that made it silently
     diverge from reverse_rotation() would be a serious hidden failure
     mode: the self-check exists specifically to catch exactly this kind
@@ -703,32 +711,34 @@ class TestSharedReconstructionCode(unittest.TestCase):
     reverse_rotation() and verify_reversible() AGREE. These go a step
     further and check that they run the literal same code to get there,
     not two independent implementations that happen to agree on every
-    case this suite happens to think of. Both call _prepare_reversal()
-    then _iter_reconstructed_chunks() - the latter is the single piece
-    of code that decides what bytes the reconstructed file consists of
-    and in what order; each caller only differs in what it does with the
-    chunks afterward (concatenate vs. feed straight into a CRC32)."""
+    case this suite happens to think of. Both are reverse_source() -
+    the single piece of code that decides what bytes the reconstructed
+    file consists of and whether they match the original; each caller
+    only differs in what it does with the result afterward (return its
+    bytes vs. discard it)."""
 
     def test_both_functions_call_the_shared_helpers(self):
         """Static check: each function's own bytecode must reference
-        _prepare_reversal and _iter_reconstructed_chunks directly - not
-        some similarly-named function, and not a private
-        reimplementation of either."""
+        reverse_source directly, and do no reconstructing or CRC
+        checking of its own."""
         for fn in (hr.reverse_rotation, hr.verify_reversible):
             names = fn.__code__.co_names
-            self.assertIn('_prepare_reversal', names,
-                           f"{fn.__name__} must call _prepare_reversal()")
-            self.assertIn('_iter_reconstructed_chunks', names,
-                           f"{fn.__name__} must call _iter_reconstructed_chunks()")
+            self.assertIn('reverse_source', names,
+                           f"{fn.__name__} must call reverse_source()")
+            for own in ('_prepare_reversal', 'PatchedSource', 'zlib',
+                        'crc32_of_chunks', 'crc32'):
+                self.assertNotIn(own, names,
+                                  f"{fn.__name__} must leave that to "
+                                  f"reverse_source()")
 
     def test_both_consume_the_identical_chunk_sequence(self):
-        """Dynamic check: wraps _iter_reconstructed_chunks to record the
-        exact sequence of chunks (as bytes) it yields on each call, then
-        confirms reverse_rotation() and verify_reversible() are handed
-        byte-for-byte identical chunk sequences, in the same order, for
-        the same input - using a fixture with a mid-stream embedded Exif
-        item specifically, since that's what makes the chunk sequence
-        have more than the trivial two pieces."""
+        """Dynamic check: wraps reverse_source to record the exact
+        sequence of chunks (as bytes) its result consists of on each
+        call, then confirms reverse_rotation() and verify_reversible()
+        are handed byte-for-byte identical chunk sequences, in the same
+        order, for the same input - using a fixture with a mid-stream
+        embedded Exif item specifically, since that's what makes the
+        chunk sequence have more than the trivial three pieces."""
         original = build_synthetic_heic(
             layout='meta_first', include_irot=False, include_exif=True,
             exif_position='middle', exif_orientation=1,
@@ -736,19 +746,19 @@ class TestSharedReconstructionCode(unittest.TestCase):
         rotated = hr.apply_rotation(original, 1, sync_exif=True, verbose=False)
 
         captured = []
-        real_iter = hr._iter_reconstructed_chunks
+        real_reverse = hr.reverse_source
 
         def spy(*args, **kwargs):
-            chunks = [bytes(c) for c in real_iter(*args, **kwargs)]
-            captured.append(chunks)
-            yield from chunks
+            restored = real_reverse(*args, **kwargs)
+            captured.append([bytes(c) for c in restored.chunks(0, restored.size)])
+            return restored
 
-        with unittest.mock.patch.object(hr, '_iter_reconstructed_chunks', spy):
+        with unittest.mock.patch.object(hr, 'reverse_source', spy):
             hr.reverse_rotation(rotated, verbose=False)
             hr.verify_reversible(rotated, verbose=False)
 
         self.assertEqual(len(captured), 2)  # fixture sanity check
-        self.assertGreater(len(captured[0]), 2,
+        self.assertGreater(len(captured[0]), 3,
                             "fixture sanity check: the mid-stream Exif item "
                             "should make this a multi-chunk sequence, not "
                             "just the trivial prefix/span/suffix split")
@@ -756,6 +766,7 @@ class TestSharedReconstructionCode(unittest.TestCase):
                           "reverse_rotation and verify_reversible must be "
                           "handed the exact same sequence of chunks, in the "
                           "same order, for the same input")
+        self.assertEqual(b''.join(captured[0]), original)
 
 
 
@@ -924,6 +935,8 @@ class TestProvenanceVersionAndSelfCheck(unittest.TestCase):
             self.assertFalse(os.path.exists(out_path),
                               "rotate must not write output if the "
                               "post-rotate self-check fails")
+            self.assertEqual(os.listdir(tmpdir), ['input.heic'],
+                              "not even a temporary file")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1194,9 +1207,9 @@ class TestProvenanceFormats(unittest.TestCase):
                             + b'\xff\x00garbage, not entries')
         framed = with_body(
             hr.build_provenance_box(hr.FORMAT_VERSION + 1, {
-                b'TVER': bytes([2, 1, 0]), b'ZNEW': b'anything'})[8:])
+                b'TVER': bytes(LATER_VERSION), b'ZNEW': b'anything'})[8:])
         for data, writer in ((garbage, 'a newer heic-lossless-rotate release'),
-                             (framed, 'heic-lossless-rotate 2.1.0')):
+                             (framed, f'heic-lossless-rotate {LATER_VERSION_STR}')):
             for name, call in (
                     ('rotate', lambda: hr.apply_rotation(data, 1, verbose=False)),
                     ('reverse', lambda: hr.reverse_rotation(data, verbose=False)),
@@ -1216,7 +1229,8 @@ class TestProvenanceFormats(unittest.TestCase):
                 f.write(framed)
             code, _, err = run_cli('info', path)
             self.assertEqual(code, hr.EXIT_NEWER_RELEASE)
-            self.assertIn('last updated by heic-lossless-rotate 2.1.0', err)
+            self.assertIn(f'last updated by heic-lossless-rotate '
+                          f'{LATER_VERSION_STR}', err)
             self.assertIn('newer than this release supports', err)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1343,7 +1357,7 @@ class TestRequestedTransform(unittest.TestCase):
         rotated = hr.apply_rotation(original, 1, verbose=False)
         _, entries = hr.parse_provenance(
             rotated, hr.locate_structures(rotated)['provenance_hdr'])
-        entries[b'TVER'] = bytes([2, 1, 0])
+        entries[b'TVER'] = bytes(LATER_VERSION)
         for request in ((True, 0), (True, 1), (True, 2)):
             with self.subTest(request=request):
                 entries[b'REQT'] = hr.encode_requested_transform(request)
@@ -1359,7 +1373,8 @@ class TestRequestedTransform(unittest.TestCase):
                             call()
                         self.assertIn(
                             f"this file was last updated by heic-lossless-"
-                            f"rotate 2.1.0 (this is {hr.VERSION}): it was "
+                            f"rotate {LATER_VERSION_STR} (this is "
+                            f"{hr.VERSION}): it was "
                             f"mirrored, which this release doesn't support "
                             f"yet", str(ctx.exception))
         tmpdir = tempfile.mkdtemp()
@@ -2602,17 +2617,14 @@ class TestMultipleTopLevelMdatBoxes(unittest.TestCase):
 
 class TestSameFileInputOutput(unittest.TestCase):
     """`rotate`/`reverse` with an explicit output path equal to the input
-    path (a natural way to ask for "rotate this file in place") isn't
-    exercised anywhere else in the suite. cli.py never checks for this
-    case explicitly, so it's only correct as a side effect of main()
-    reading the entire input file into memory before _run() computes the
-    full output and only THEN opens out_path for writing - overwriting
-    the input file at that point can't corrupt anything still being
-    read, since nothing is still being read by then. That's a real but
-    easy-to-break property (any future change to the write path that
-    starts reading from the input file later, e.g. for a second pass or
-    incremental processing, could silently corrupt this exact scenario),
-    so it's worth pinning down directly as its own regression test."""
+    path (a natural way to ask for "rotate this file in place"). The
+    input file is never read into memory as a whole: the output is
+    streamed from it, so it must not be written over while that's going
+    on. cli.py writes every output to a temporary file next to its
+    destination and renames it into place only once it is complete and
+    the input file is closed - which is what these pin down, along with
+    what that mechanism must not change: no temporary file left behind,
+    and the overwritten file's permissions kept."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -2649,6 +2661,429 @@ class TestSameFileInputOutput(unittest.TestCase):
         self.assertEqual(result, self.original,
                           "reversing a file onto itself must still "
                           "reconstruct the exact true original")
+        self.assertEqual(sorted(os.listdir(self.tmpdir)),
+                          ['photo.heic', 'rotated.heic'])
+
+    def test_large_file_rotated_onto_itself_repeatedly(self):
+        """Big enough to be streamed in several chunks, in both layouts
+        (the bulk of the file before the edit, and after it)."""
+        for layout in ('mdat_first', 'meta_first'):
+            with self.subTest(layout=layout):
+                original = build_synthetic_heic(
+                    layout=layout, include_exif=True, exif_position='middle',
+                    mdat_payload=os.urandom(3 * hr.CHUNK_SIZE + 12345))
+                with open(self.path, 'wb') as f:
+                    f.write(original)
+                for _ in range(3):
+                    rc, _, err = run_cli('rotate', '90', self.path, self.path,
+                                         '-f', '-q')
+                    self.assertEqual(rc, 0, err)
+                with open(self.path, 'rb') as f:
+                    rotated = f.read()
+                self.assertEqual(
+                    rotated, hr.apply_rotation(hr.apply_rotation(
+                        hr.apply_rotation(original, 1, verbose=False),
+                        1, verbose=False), 1, verbose=False))
+                rc, _, err = run_cli('reverse', self.path, self.path, '-f', '-q')
+                self.assertEqual(rc, 0, err)
+                with open(self.path, 'rb') as f:
+                    self.assertEqual(f.read(), original)
+                self.assertEqual(os.listdir(self.tmpdir), ['photo.heic'])
+
+    @unittest.skipIf(os.name == 'nt', "POSIX permissions and symlinks")
+    def test_overwriting_keeps_permissions_and_follows_symlinks(self):
+        os.chmod(self.path, 0o640)
+        link = os.path.join(self.tmpdir, 'link.heic')
+        os.symlink('photo.heic', link)
+        rc, _, err = run_cli('rotate', '90', self.path, link, '-f', '-q')
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o640)
+        with open(self.path, 'rb') as f:
+            self.assertEqual(f.read(),
+                             hr.apply_rotation(self.original, 1, verbose=False))
+
+    @unittest.skipIf(os.name == 'nt', "POSIX permissions")
+    def test_new_output_file_gets_default_permissions(self):
+        out_path = os.path.join(self.tmpdir, 'new.heic')
+        rc, _, err = run_cli('rotate', '90', self.path, out_path, '-q')
+        self.assertEqual(rc, 0, err)
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(os.stat(out_path).st_mode & 0o777, 0o666 & ~umask)
+
+    def test_failed_write_leaves_nothing_behind(self):
+        out_path = os.path.join(self.tmpdir, 'no_such_dir', 'out.heic')
+        rc, _, err = run_cli('rotate', '90', self.path, out_path, '-q')
+        self.assertEqual(rc, hr.EXIT_FILE_ERROR, err)
+        self.assertEqual(os.listdir(self.tmpdir), ['photo.heic'])
+        with open(self.path, 'rb') as f:
+            self.assertEqual(f.read(), self.original)
+
+
+class _RecordingFile(io.BytesIO):
+    """A file object that records the size of every read made of it."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.read_sizes = []
+
+    def read(self, size=-1):
+        data = super().read(size)
+        self.read_sizes.append(len(data))
+        return data
+
+
+class TestStreaming(unittest.TestCase):
+    """The file is never held in memory: rotate_source()/reverse_source()
+    take it as a ByteSource and return the result as another, reading
+    into memory only its metadata (the top-level box headers, 'meta',
+    the provenance box, a few bytes of the embedded Exif item) and
+    streaming everything else in chunks of CHUNK_SIZE. apply_rotation()/
+    reverse_rotation(), which the rest of this suite calls, are those
+    same functions over a BytesSource - so what's checked here is what
+    differs for a real file: the chunked reads, wherever chunk
+    boundaries happen to fall, and that nothing reads more than it
+    should."""
+
+    FIXTURES = [dict(layout=layout, include_irot=include_irot, **extra)
+                for layout in ('mdat_first', 'meta_first')
+                for include_irot in (False, True)
+                for extra in (dict(),
+                              dict(include_exif=True, exif_orientation=6),
+                              dict(include_exif=True, exif_position='middle',
+                                   extra_mdat=True),
+                              dict(imir_axis=1, include_exif=True,
+                                   exif_orientation=5),
+                              dict(tmap='own'))]
+
+    def test_file_results_match_in_memory_results_at_any_chunk_size(self):
+        """Chunk sizes from 1 byte up, so that a chunk boundary falls on
+        and inside every edit, the 2-byte Exif patch included."""
+        for kwargs in self.FIXTURES:
+            original = build_synthetic_heic(**kwargs)
+            expected = hr.apply_rotation(original, 1, verbose=False)
+            expected2 = hr.apply_rotation(expected, 2, verbose=False)
+            for chunk_size in (1, 2, 3, 7, 64, 1000, hr.CHUNK_SIZE):
+                with self.subTest(chunk_size=chunk_size, **kwargs), \
+                        unittest.mock.patch.object(hr, 'CHUNK_SIZE', chunk_size):
+                    rotated = hr.rotate_source(
+                        hr.FileSource(io.BytesIO(original)), 1, verbose=False)
+                    hr.verify_structure(rotated)
+                    hr.verify_reversible(rotated)
+                    self.assertEqual(rotated.size, len(expected))
+                    self.assertEqual(hr.materialize(rotated), expected)
+                    # an edit of an edit, never materialized in between
+                    rotated2 = hr.rotate_source(rotated, 2, verbose=False)
+                    hr.verify_reversible(rotated2)
+                    self.assertEqual(hr.materialize(rotated2), expected2)
+                    restored = hr.reverse_source(
+                        hr.FileSource(io.BytesIO(bytes(expected2))), verbose=False)
+                    self.assertEqual(hr.materialize(restored), original)
+                    self.assertEqual(
+                        hr.gather_info(hr.FileSource(io.BytesIO(bytes(expected2))),
+                                       verbose=False),
+                        hr.gather_info(bytes(expected2), verbose=False))
+
+    def test_old_record_is_replayed_without_materializing_anything(self):
+        original = build_synthetic_heic(layout='mdat_first', include_exif=True,
+                                         exif_position='middle')
+        old_style = _make_v2_style_record(
+            original, hr.apply_rotation(original, 3, verbose=False))
+        expected = hr.apply_rotation(original, 0, verbose=False)
+        with unittest.mock.patch.object(hr, 'CHUNK_SIZE', 5), \
+                unittest.mock.patch.object(
+                    hr, 'materialize', side_effect=AssertionError):
+            replayed = hr.rotate_source(
+                hr.FileSource(io.BytesIO(old_style)), 1, verbose=False)
+            hr.verify_reversible(replayed)
+            self.assertEqual(b''.join(bytes(c) for c in replayed.chunks(
+                0, replayed.size)), expected)
+
+    def test_no_read_is_larger_than_a_chunk(self):
+        """Every read of the file, for every command, is either a chunk
+        being streamed or a piece of metadata - never anything that
+        grows with the image data."""
+        chunk_size = 64 * 1024
+        payload = os.urandom(40 * chunk_size + 321)
+        for layout in ('mdat_first', 'meta_first'):
+            original = build_synthetic_heic(
+                layout=layout, include_exif=True, exif_position='middle',
+                mdat_payload=payload)
+            rotated = bytes(hr.apply_rotation(original, 1, verbose=False))
+            with self.subTest(layout=layout), \
+                    unittest.mock.patch.object(hr, 'CHUNK_SIZE', chunk_size):
+                f = _RecordingFile(original)
+                result = hr.rotate_source(hr.FileSource(f), 1, verbose=False)
+                hr.verify_structure(result)
+                hr.verify_reversible(result)
+                self.assertEqual(
+                    hr.crc32_of_chunks(result.chunks(0, result.size)),
+                    zlib.crc32(rotated))
+                self.assertLessEqual(max(f.read_sizes), chunk_size)
+
+                f = _RecordingFile(rotated)
+                result = hr.reverse_source(hr.FileSource(f), verbose=False)
+                hr.verify_structure(result)
+                self.assertEqual(
+                    hr.crc32_of_chunks(result.chunks(0, result.size)),
+                    zlib.crc32(original))
+                self.assertLessEqual(max(f.read_sizes), chunk_size)
+
+                # info reads the metadata and nothing else
+                f = _RecordingFile(rotated)
+                hr.gather_info(hr.FileSource(f), verbose=False)
+                self.assertLess(sum(f.read_sizes), 4096)
+
+    def test_memory_use_does_not_grow_with_file_size(self):
+        import tracemalloc
+
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        path = os.path.join(tmpdir, 'big.heic')
+        payload_size = 24 * 1024 * 1024
+        with open(path, 'wb') as f:
+            f.write(build_synthetic_heic(
+                layout='meta_first', include_exif=True, exif_position='middle',
+                mdat_payload=os.urandom(1024 * 1024) * 24))
+
+        def cli(*argv):
+            with unittest.mock.patch.object(sys, 'argv', ['heic-rotate', *argv]):
+                hr_cli.main()
+
+        tracemalloc.start()
+        try:
+            cli('-q', 'rotate', '90', path, path, '-f')
+            cli('-q', 'rotate', '180', path, path, '-f')
+            cli('-q', 'reverse', path, path, '-f')
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, payload_size // 6,
+                         f"peak {peak} bytes for a {payload_size}-byte payload")
+
+    def test_patched_source_matches_plain_splicing(self):
+        import random
+        rng = random.Random(1)
+        base = bytes(rng.randrange(256) for _ in range(300))
+        for _ in range(300):
+            cuts = sorted(rng.sample(range(len(base) + 1), rng.randrange(0, 9)))
+            patches = [(a, b, bytes(rng.randrange(256)
+                                    for _ in range(rng.randrange(0, 6))))
+                       for a, b in zip(cuts[::2], cuts[1::2])]
+            if rng.random() < 0.3:      # a pure insertion
+                at = rng.choice(cuts) if cuts else 0
+                if not any(a < at < b or a == at for a, b, _ in patches):
+                    patches.append((at, at, b'INS'))
+            expected = bytearray(base)
+            for a, b, replacement in sorted(patches, reverse=True):
+                expected[a:b] = replacement
+            rng.shuffle(patches)
+            with unittest.mock.patch.object(hr, 'CHUNK_SIZE', rng.randrange(1, 40)):
+                patched = hr.PatchedSource(hr.FileSource(io.BytesIO(base)), patches)
+                self.assertEqual(patched.size, len(expected))
+                self.assertEqual(hr.materialize(patched), expected)
+                a, b = sorted((rng.randrange(patched.size + 1),
+                               rng.randrange(patched.size + 1)))
+                self.assertEqual(patched.read(a, b), expected[a:b])
+                self.assertEqual(
+                    hr.crc32_excluding_range(patched, a, b),
+                    zlib.crc32(expected[:a] + expected[b:]))
+
+    def test_patched_source_refuses_overlapping_edits(self):
+        base = hr.BytesSource(bytes(100))
+        for patches in ([(10, 20, b'x'), (19, 30, b'y')],
+                        [(10, 20, b'x'), (15, 15, b'y')],
+                        [(90, 101, b'x')]):
+            with self.subTest(patches=patches):
+                with self.assertRaises(hr.InternalError):
+                    hr.PatchedSource(base, patches)
+
+    def test_file_shorter_than_expected_is_a_file_error(self):
+        f = io.BytesIO(bytes(100))
+        source = hr.FileSource(f)
+        f.truncate(50)
+        with self.assertRaises(OSError):
+            source.read(40, 60)
+        with self.assertRaises(OSError):
+            list(source.chunks(0, 100))
+
+    def test_top_level_scan_matches_buffer_parsing(self):
+        for kwargs in self.FIXTURES:
+            data = bytes(hr.apply_rotation(build_synthetic_heic(**kwargs), 1,
+                                           verbose=False))
+            with self.subTest(**kwargs):
+                f = _RecordingFile(data)
+                self.assertEqual(hr.scan_top_level(hr.FileSource(f)),
+                                 list(hr.iter_boxes(data, 0, len(data))))
+                self.assertLessEqual(max(f.read_sizes), 16)
+                base, span = hr.load_span(hr.BytesSource(data))
+                info = hr.locate_structures(data)
+                self.assertEqual(base, info['meta_hdr'][0])
+                self.assertEqual(span, data[base:info['provenance_hdr'][3]])
+
+    def test_box_smaller_than_its_header_is_refused_not_looped_on(self):
+        """A 64-bit box size of 0 used to make the box iteration loop
+        forever; any size smaller than the header is refused."""
+        ftyp = struct.pack('>I4s', 16, b'ftyp') + b'heicmif1'
+        for bad in (struct.pack('>I4sQ', 1, b'mdat', 0),
+                    struct.pack('>I4sQ', 1, b'mdat', 15),
+                    struct.pack('>I4s', 7, b'mdat') + bytes(8)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(hr.BoxParseError):
+                    list(hr.iter_boxes(ftyp + bad, 0, len(ftyp + bad)))
+                with self.assertRaises(hr.BoxParseError):
+                    hr.scan_top_level(hr.BytesSource(ftyp + bad))
+
+    def test_provenance_box_moved_away_from_meta_still_reverses(self):
+        """Something else moving the provenance box (to the end of the
+        file, say) leaves a file `reverse` can still restore exactly:
+        the span worked on is then everything from 'meta' to that box."""
+        for layout in ('mdat_first', 'meta_first'):
+            original = build_synthetic_heic(layout=layout)
+            rotated = bytes(hr.apply_rotation(original, 1, verbose=False))
+            p_start, _, _, p_end, _ = hr.locate_structures(rotated)['provenance_hdr']
+            m_start = hr.locate_structures(rotated)['meta_hdr'][0]
+            box = rotated[p_start:p_end]
+            rest = rotated[:p_start] + rotated[p_end:]
+            for name, moved in (('to the end', rest + box),
+                                ('before meta', rest[:m_start] + box + rest[m_start:])):
+                with self.subTest(layout=layout, moved=name):
+                    restored = hr.reverse_source(
+                        hr.FileSource(io.BytesIO(moved)), proceed_unsafe=True,
+                        verbose=False)
+                    self.assertEqual(hr.materialize(restored), original)
+
+    def test_record_missing_a_required_entry_is_a_record_error(self):
+        original = build_synthetic_heic(layout='mdat_first')
+        rotated = hr.apply_rotation(original, 1, verbose=False)
+        _, entries = hr.parse_provenance(
+            rotated, hr.locate_structures(rotated)['provenance_hdr'])
+        for tag in (b'CCRC', b'PCRC', b'OMSZ'):
+            with self.subTest(tag=tag):
+                broken = _replace_record(rotated, hr.FORMAT_VERSION, {
+                    t: v for t, v in entries.items() if t != tag})
+                with self.assertRaises(hr.ProvenanceError):
+                    hr.reverse_rotation(broken, proceed_unsafe=True, verbose=False)
+
+
+def _top_box(boxtype, content=b''):
+    return struct.pack('>I4s', len(content) + 8, boxtype) + content
+
+
+def _with_data_ref(data, item_id, data_ref_index):
+    """`data` with item `item_id`'s 'iloc' data_reference_index changed
+    (same size, so nothing else moves)."""
+    info = hr.locate_structures(data)
+    iloc_hdr = info['iloc_hdr']
+    iloc = hr.parse_iloc(data, iloc_hdr[2], iloc_hdr[3])
+    next(i for i in iloc['items'] if i['item_id'] == item_id)[
+        'data_ref_index'] = data_ref_index
+    out = bytearray(data)
+    out[iloc_hdr[2]:iloc_hdr[3]] = hr.build_iloc_content(iloc)
+    return bytes(out)
+
+
+class TestUnsupportedLayoutsRefused(unittest.TestCase):
+    """When an edit changes the size of 'meta' (or inserts the
+    provenance box), everything after it moves, and only 'iloc''s
+    offsets are patched to match. So a file with something else that
+    may refer to data by its file offset - a 'moov' box ('stco'/'co64'),
+    a second 'meta', any top-level box this tool doesn't know, or an
+    item located through a data reference - is refused when the edit
+    would move data, and accepted when it wouldn't (the moved data is
+    only ever what follows 'meta')."""
+
+    def test_unknown_top_level_box_after_meta_is_refused(self):
+        original = build_synthetic_heic(layout='meta_first')
+        for box in (_top_box(b'moov', _top_box(b'mvhd', bytes(100))),
+                    _top_box(b'uuid', bytes(range(16)) + b'other vendor'),
+                    _top_box(b'zzzz', b'unknown'),
+                    _top_box(b'meta', bytes(4))):
+            with self.subTest(box=box[4:8]):
+                with self.assertRaises(hr.BoxParseError) as ctx:
+                    hr.apply_rotation(original + box, 1, verbose=False)
+                self.assertIn(f"top-level '{box[4:8].decode()}' box",
+                              str(ctx.exception))
+                self.assertEqual(ctx.exception.exit_code,
+                                 hr.EXIT_UNSUPPORTED_FILE)
+
+    def test_box_before_meta_that_could_refer_past_it_is_refused(self):
+        """Not moved itself, but it could refer to the data that is."""
+        original = build_synthetic_heic(layout='meta_first')
+        ftyp_end = hr.read_box_header(original, 0)[3]
+        moov = _top_box(b'moov', bytes(16))
+        # stays a valid file: the inserted box shifts 'meta' and 'mdat'
+        # alike, so re-point 'iloc' by its size
+        info = hr.locate_structures(original)
+        new_iloc, _ = hr.patch_iloc_offsets_at_threshold(
+            original, info['iloc_hdr'], ftyp_end, len(moov))
+        patched = bytearray(original)
+        patched[info['iloc_hdr'][2]:info['iloc_hdr'][3]] = new_iloc
+        data = bytes(patched[:ftyp_end]) + moov + bytes(patched[ftyp_end:])
+        with self.assertRaises(hr.BoxParseError):
+            hr.apply_rotation(data, 1, verbose=False)
+
+    def test_known_movable_boxes_after_meta_are_fine(self):
+        """'sefd' is the Samsung trailer real Galaxy files carry."""
+        original = build_synthetic_heic(layout='meta_first', include_exif=True)
+        trailer = (_top_box(b'free', bytes(10)) + _top_box(b'skip', b'x') +
+                   _top_box(b'sefd', b'data' + b'SEFH' + bytes(12) + b'SEFT'))
+        data = original + trailer
+        rotated = hr.apply_rotation(data, 1, verbose=False)
+        self.assertTrue(bytes(rotated).endswith(trailer))
+        self.assertEqual(hr.reverse_rotation(rotated, verbose=False), data)
+
+    def test_nothing_is_refused_when_no_data_moves(self):
+        """'meta' last in the file (the 'mdat'-first layout): whatever
+        else is there stays where it is, 'moov' included."""
+        original = build_synthetic_heic(layout='mdat_first')
+        meta_start = hr.locate_structures(original)['meta_hdr'][0]
+        data = (original[:meta_start] + _top_box(b'moov', bytes(16)) +
+                _top_box(b'zzzz') + original[meta_start:])
+        rotated = hr.apply_rotation(data, 1, verbose=False)
+        rotated = hr.apply_rotation(rotated, 2, verbose=False)
+        self.assertEqual(hr.reverse_rotation(rotated, verbose=False), data)
+
+    def test_item_located_through_a_data_reference(self):
+        """Refused if its offset would have to shift, untouched if not."""
+        for layout, refused in (('meta_first', True), ('mdat_first', False)):
+            with self.subTest(layout=layout):
+                data = _with_data_ref(build_synthetic_heic(layout=layout), 1, 1)
+                if refused:
+                    with self.assertRaises(hr.BoxParseError) as ctx:
+                        hr.apply_rotation(data, 1, verbose=False)
+                    self.assertIn("data reference", str(ctx.exception))
+                else:
+                    rotated = hr.apply_rotation(data, 1, verbose=False)
+                    self.assertEqual(
+                        hr.reverse_rotation(rotated, verbose=False), data)
+
+    def test_exif_item_in_another_file_is_not_synced(self):
+        """An Exif item located through a data reference may be in
+        another file: its offset says nothing about this one."""
+        data = _with_data_ref(build_synthetic_heic(
+            layout='mdat_first', include_exif=True, exif_orientation=1), 2, 1)
+        info = hr.locate_structures(data)
+        self.assertIsNone(hr.find_exif_orientation_field(
+            data, info['meta_body_start'], info['meta_hdr'][3]))
+        rotated = bytes(hr.apply_rotation(data, 1, verbose=False))
+        meta_start = info['meta_hdr'][0]
+        self.assertEqual(rotated[:meta_start], data[:meta_start],
+                         "the bytes the offset happens to name are untouched")
+        self.assertEqual(hr.reverse_rotation(rotated, verbose=False), data)
+
+    def test_cli_refuses_with_52_and_writes_nothing(self):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        path = os.path.join(tmpdir, 'seq.heic')
+        with open(path, 'wb') as f:
+            f.write(build_synthetic_heic(layout='meta_first') +
+                    _top_box(b'moov', bytes(16)))
+        rc, _, err = run_cli('rotate', '90', path, path, '-f')
+        self.assertEqual(rc, hr.EXIT_UNSUPPORTED_FILE, err)
+        self.assertIn(f'ERROR Hard {hr.EXIT_UNSUPPORTED_FILE}:', err)
+        self.assertEqual(os.listdir(tmpdir), ['seq.heic'])
 
 
 class TestDryRunSizeReport(unittest.TestCase):
