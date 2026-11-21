@@ -12,4 +12,4 @@ it in isolation at build time, without needing the rest of the package
 first.
 """
 
-VERSION = '2.2.0'
+VERSION = '3.0.0'
